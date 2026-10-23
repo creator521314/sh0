@@ -1,0 +1,19 @@
+[package]
+name = "sh0-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ratatui frontend for sh0"
+
+[dependencies]
+sh0-core = { workspace = true }
+sh0-ipc = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
