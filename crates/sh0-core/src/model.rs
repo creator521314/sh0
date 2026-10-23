@@ -128,4 +128,10 @@ pub struct SessionSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub reconnect_count: u32,
+    /// 最近一次连接/传输失败的原因。
+    ///
+    /// 断线重连期间调用方最想知道的就是"到底为什么连不上"，
+    /// 只靠日志的话 AI 拿不到（它只能走 IPC）。因此把它放进快照。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }

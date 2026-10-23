@@ -7,23 +7,23 @@
 - **原生为 AI 设计**：所有能力以结构化子命令暴露，AI Agent 通过命令行即可操作远程主机，
   并受内置风险分级引擎约束。
 
-## 当前进度：M0「骨架与连通」已完成
-
-已落地的能力：
+## 当前进度：M1「终端与会话」已完成
 
 | 能力 | 说明 |
 | --- | --- |
-| workspace 骨架 | 8 个 crate，依赖方向受控（core 不依赖 TUI / SSH 细节） |
-| 配置层 | TOML 配置 + 主机清单，自动落盘到平台配置目录 |
-| SSH 连接 | russh 0.64，支持密码 / 私钥（含 passphrase）/ ssh-agent（Unix）与 Pageant（Windows） |
-| 主机密钥 | known_hosts 校验 + 首次信任（TOFU），密钥变更直接拒绝 |
-| daemon | 常驻进程持有全部会话，前端一律通过本机 IPC 接入 |
-| IPC | loopback TCP + 一次性令牌，JSON Lines 帧格式 |
-| AI 接口 | `sh0 ai host list`、`sh0 ai session list`、`sh0 ai ping`，默认纯文本 + `--json` |
-| TUI | 最小终端视图：键盘 → 远端 → 回显闭环（尚未做终端仿真） |
+| 终端仿真 | `vte` 解析器 + 字符网格（256 色 / truecolor / 粗斜体下划线反显），CJK 双宽与 emoji、组合字符 |
+| 滚动缓冲 | 默认 10000 行环形缓冲 + 全局内存预算淘汰，PageUp / PageDown 回看 |
+| TUI 布局 | 左侧主机树 + 顶部标签栏 + 主区终端 + 底部状态栏，主题配色 |
+| 主机管理 | 增删改查表单、分组折叠、模糊搜索，写回 `hosts.toml` |
+| 会话状态机 | connecting / ready / reconnecting / closed，断线检测 + 指数退避重连（带抖动），重连保留历史输出并插入分隔线 |
+| 保活 | SSH keepalive，间隔可在配置里改 |
+| resize | 窗口变化同步到远端（`window_change`），本地网格同步重建 |
+| 按键编码 | 方向键 / F1-F12 / Ctrl-Alt 组合编码，键位映射三套预设（default / vim / xshell） |
+| 文本选择与剪贴板 | 选择模式（Alt+V）方向键扩选，Enter/y 复制，OSC 52 写父终端剪贴板 |
+| AI 接口 | `ai host list`、`ai session open/close/list/status/reconnect/clear/resize`、`ai screen read`、`ai input send`、`ai ping`，默认纯文本 + `--json` |
 
-尚未实现（后续里程碑）：终端仿真与滚动缓冲（M1）、命令执行与读屏注入（M2）、
-批量与广播（M3）、SFTP（M4）、主题键位与导入导出（M5）。
+尚未实现（后续里程碑）：命令执行与风险分级引擎（M2）、批量与广播（M3）、SFTP（M4）、
+主题与键位自定义、导入导出（M5）。
 
 ## 快速开始
 
@@ -36,7 +36,10 @@ sh0 tui                           # 首次运行会生成示例主机条目
 sh0 tui <主机名>                  # 进入终端视图，Ctrl+Q 退出
 
 sh0 ai host list --json           # AI 接口：列出主机
-sh0 ai session list --json        # AI 接口：列出活跃会话
+sh0 ai session open --host web-01 --json
+sh0 ai session list --json        # 列出活跃会话（含 state 与 last_error）
+sh0 ai screen read --session <id> --json
+sh0 ai input send --session <id> --data "uptime" --enter --json
 sh0 ai ping --json                # 检查 daemon 连通性
 
 sh0 daemon stop                   # 优雅停止后台 daemon
@@ -94,7 +97,7 @@ key_file = { path = "/home/u/.ssh/id_ed25519" }    # 无 passphrase
 crates/
 ├── sh0-core/    领域模型：Host / Credential / SessionState / RiskLevel
 ├── sh0-ssh/     russh 封装（唯一接触 SSH 协议的地方）
-├── sh0-term/    终端仿真（M0 留空，M1 落地）
+├── sh0-term/    终端仿真：vte 解析 + 网格 + 滚动缓冲 + 按键编码
 ├── sh0-store/   TOML 配置与平台路径（SQLite 审计在 M2）
 ├── sh0-ipc/     本机 IPC 协议与传输
 ├── sh0-ai/      `sh0 ai` 子命令层
@@ -112,11 +115,33 @@ docs/
 - `docs/architecture.md` —— 架构设计、AI 子命令契约、错误码表
 - `docs/development-plan.md` —— 里程碑分解、工时估算、三条排期路线
 
-## 已知限制（M0）
+## 键盘（default 预设）
 
-- TUI 不做终端仿真：ANSI 转义被剥离后显示，不支持 `vim` / `htop` 这类全屏程序
-- 不支持窗口 resize 同步（M1）
-- `keyboard-interactive` / 2FA 与系统钥匙串未实现（M1 / M2）
+| 按键 | 作用 |
+| --- | --- |
+| Ctrl+Q | 退出 |
+| Ctrl+T / Ctrl+W | 新建 / 关闭会话 |
+| Alt+← / Alt+→ | 切换会话 |
+| Ctrl+B | 焦点在主机树与终端间切换 |
+| Ctrl+F | 搜索主机 |
+| Ctrl+N | 新建主机 |
+| PageUp / PageDown | 回看历史输出 |
+| Alt+G / Ctrl+PageUp | 回到顶部 |
+| Alt+V | 进入/退出文本选择模式 |
+| Alt+C | 复制选区 |
+| Alt+R | 手动重连 |
+| Ctrl+L | 清屏 |
+
+选择模式内：方向键或 hjkl 扩选，Enter / y 复制，p 粘贴回会话，Esc 取消。
+键位可在 `config.toml` 里改，`keymap = "vim"` / `"xshell"` 切换预设。
+
+## 已知限制（M1）
+
+- 复制走 OSC 52，需要父终端支持（Windows Terminal / iTerm2 / kitty / Alacritty 均支持）；
+  不支持时内容仍会留在 `sh0` 内部，可用 `p` 粘回会话
+- `keyboard-interactive` / 2FA 与系统钥匙串未实现（M2）
 - TUI raw mode 下无法交互式输入口令，请使用 `agent` 或 `env`
-- 私钥路径不支持 `~` 展开，请写绝对路径（M1 补）
-- 后台 daemon 的日志尚未写入文件（M1 改为 `runtime_dir/daemon.log`）
+- 私钥路径不支持 `~` 展开，请写绝对路径
+- 审计日志与输出归档未落盘（M2 的 SQLite）
+- 尚未在真实 SSH 服务端做过端到端验证（开发机上没有可用 SSH 服务），
+  终端仿真与重连是用 mock 传输层 + 23 条 golden 用例覆盖的

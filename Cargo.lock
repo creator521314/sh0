@@ -141,6 +141,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2447,6 +2453,7 @@ dependencies = [
  "sh0-ipc",
  "sh0-ssh",
  "sh0-store",
+ "sh0-term",
  "sh0-tui",
  "thiserror 2.0.21",
  "tokio",
@@ -2472,9 +2479,12 @@ dependencies = [
 name = "sh0-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "serde",
+ "sh0-term",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "ulid",
 ]
@@ -2522,8 +2532,12 @@ dependencies = [
 name = "sh0-term"
 version = "0.1.0"
 dependencies = [
+ "crossterm",
+ "serde",
  "thiserror 2.0.21",
  "tracing",
+ "unicode-width",
+ "vte",
 ]
 
 [[package]]
@@ -2536,6 +2550,8 @@ dependencies = [
  "serde_json",
  "sh0-core",
  "sh0-ipc",
+ "sh0-store",
+ "sh0-term",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3209,6 +3225,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
 
 [[package]]
 name = "vtparse"

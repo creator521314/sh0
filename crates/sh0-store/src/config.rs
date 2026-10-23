@@ -1,5 +1,7 @@
 //! TOML 配置：全局偏好 + 主机清单（需求 FR-9.1 / FR-1.1）
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StoreError};
@@ -26,6 +28,36 @@ pub struct AppConfig {
     pub cols: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+    /// 全部会话共享的 scrollback 内存预算（MB，0 表示不限制）。
+    /// 这是 AC-2「20 会话 ≤ 120 MB」的真正约束——行数上限只是软的。
+    #[serde(default = "default_budget_mb")]
+    pub memory_budget_mb: usize,
+    /// 键位预设：default / vim / xshell（需求 FR-3.6）
+    #[serde(default = "default_keymap")]
+    pub keymap: String,
+    /// 键位覆盖表，形如 `quit = "ctrl+x"`，优先级高于预设
+    #[serde(default)]
+    pub keys: HashMap<String, String>,
+    /// 断线重连行为（需求 FR-2.5 / FR-2.6）
+    #[serde(default)]
+    pub reconnect: ReconnectConfig,
+}
+
+/// 重连策略的可持久化形式
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconnectConfig {
+    /// 最大尝试次数，null 表示无限重试
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: Option<u32>,
+    #[serde(default = "default_base_ms")]
+    pub base_ms: u64,
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+    #[serde(default = "default_jitter")]
+    pub jitter: bool,
+    /// 重连成功后是否在历史输出里插入分隔线（AC-3）
+    #[serde(default = "default_mark")]
+    pub mark: bool,
 }
 
 fn default_version() -> u32 {
@@ -46,6 +78,39 @@ fn default_cols() -> u16 {
 fn default_rows() -> u16 {
     32
 }
+fn default_budget_mb() -> usize {
+    64
+}
+fn default_keymap() -> String {
+    "default".to_string()
+}
+fn default_max_attempts() -> Option<u32> {
+    Some(10)
+}
+fn default_base_ms() -> u64 {
+    500
+}
+fn default_max_delay_ms() -> u64 {
+    30_000
+}
+fn default_jitter() -> bool {
+    true
+}
+fn default_mark() -> bool {
+    true
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            base_ms: default_base_ms(),
+            max_delay_ms: default_max_delay_ms(),
+            jitter: default_jitter(),
+            mark: default_mark(),
+        }
+    }
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -56,6 +121,10 @@ impl Default for AppConfig {
             keepalive_secs: default_keepalive(),
             cols: default_cols(),
             rows: default_rows(),
+            memory_budget_mb: default_budget_mb(),
+            keymap: default_keymap(),
+            keys: HashMap::new(),
+            reconnect: ReconnectConfig::default(),
         }
     }
 }

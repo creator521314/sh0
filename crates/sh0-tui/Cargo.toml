@@ -8,7 +8,7 @@ authors.workspace = true
 description = "ratatui frontend for sh0"
 
 [dependencies]
-sh0-core = { workspace = true }
+sh0-core.workspace = true
 sh0-ipc = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -17,3 +17,5 @@ crossterm = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+sh0-store.workspace = true
+sh0-term.workspace = true

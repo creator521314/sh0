@@ -6,7 +6,18 @@
 pub mod error;
 pub mod ids;
 pub mod model;
+pub mod session;
+pub mod transport;
+
+#[cfg(feature = "mock")]
+pub mod mock;
 
 pub use error::{CoreError, Result};
 pub use ids::{HostId, SessionId, new_host_id, new_session_id};
 pub use model::{CredentialRef, Host, RiskLevel, SecretRef, SessionSnapshot, SessionState};
+pub use session::{
+    ReconnectPolicy, SessionConfig, SessionEvent, SessionHandle, spawn_session,
+};
+pub use transport::{
+    SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
+};

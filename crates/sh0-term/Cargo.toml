@@ -8,5 +8,9 @@ authors.workspace = true
 description = "Terminal emulation layer for sh0"
 
 [dependencies]
+crossterm.workspace = true
+serde.workspace = true
 thiserror = { workspace = true }
 tracing = { workspace = true }
+unicode-width = "0.2.2"
+vte = "0.15.0"

@@ -52,6 +52,11 @@ impl Paths {
         self.runtime_dir.join("sh0.pid")
     }
 
+    /// 后台 daemon 的日志。后台进程没有控制台，不落盘的话出错时完全无迹可寻。
+    pub fn daemon_log(&self) -> PathBuf {
+        self.runtime_dir.join("daemon.log")
+    }
+
     /// 目录不存在时创建（幂等）
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;

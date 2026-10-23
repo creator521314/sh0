@@ -41,6 +41,16 @@ pub enum AiObject {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// 读取会话屏幕（AI 读屏，架构文档 §6.4）
+    Screen {
+        #[command(subcommand)]
+        cmd: ScreenCmd,
+    },
+    /// 向会话注入按键
+    Input {
+        #[command(subcommand)]
+        cmd: InputCmd,
+    },
     /// 连通性探针
     Ping,
 }
@@ -62,6 +72,16 @@ pub enum HostCmd {
 pub enum SessionCmd {
     /// 列出活跃会话
     List,
+    /// 打开会话
+    Open {
+        /// 主机名或主机 ID
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        cols: Option<u16>,
+        #[arg(long)]
+        rows: Option<u16>,
+    },
     /// 关闭会话
     Close {
         /// 会话 ID，或 --all
@@ -70,14 +90,101 @@ pub enum SessionCmd {
         #[arg(long)]
         all: bool,
     },
+    /// 手动触发重连
+    Reconnect {
+        #[arg(long)]
+        session: String,
+    },
+    /// 清空屏幕与滚动缓冲
+    Clear {
+        #[arg(long)]
+        session: String,
+    },
+    /// 调整终端尺寸（会同步通知远端）
+    Resize {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        cols: u16,
+        #[arg(long)]
+        rows: u16,
+    },
+    /// 查询单个会话状态。
+    ///
+    /// 会话已结束并从列表里摘掉时，仍可查到最后一份快照
+    /// （含 `last_error`），用来回答"它为什么没了"。
+    Status {
+        #[arg(long)]
+        session: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScreenCmd {
+    /// 读取屏幕内容。
+    ///
+    /// 默认 `plain` 模式（纯文本 + 滚动缓冲）。`--no-scrollback` 只取当前可见区。
+    Read {
+        #[arg(long)]
+        session: String,
+        /// 只返回当前可见区，不含历史
+        #[arg(long)]
+        no_scrollback: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InputCmd {
+    /// 发送原始字节（不做任何转义，直接投递给远端）
+    Send {
+        #[arg(long)]
+        session: String,
+        /// 要发送的内容；用 `--data` 传原始文本
+        #[arg(long)]
+        data: String,
+        /// 末尾补一个换行（等价于敲回车）
+        #[arg(long)]
+        enter: bool,
+    },
 }
 
 /// 退出码（架构文档 §6.3 的语义化退出码表）
 pub mod exit_code {
     pub const OK: i32 = 0;
-    pub const INVALID_ARGS: i32 = 11;
+    pub const REMOTE_NONZERO: i32 = 1;
+    pub const RISK_DENIED: i32 = 2;
+    pub const NEEDS_CONFIRMATION: i32 = 3;
+    pub const TIMEOUT: i32 = 4;
+    pub const SESSION_UNAVAILABLE: i32 = 5;
+    pub const AUTH_FAILED: i32 = 6;
+    pub const AUTH_REQUIRED: i32 = 7;
+    pub const HOST_NOT_FOUND: i32 = 8;
+    pub const RATE_LIMITED: i32 = 9;
     pub const IPC_UNREACHABLE: i32 = 10;
+    pub const INVALID_ARGS: i32 = 11;
     pub const INTERNAL: i32 = 12;
+}
+
+/// 架构文档 §6.3：把 daemon 返回的业务错误码映射成语义化退出码。
+///
+/// 映射错了比不映射更糟——AI 是靠退出码决定"重试/换方案/转人工"的。
+/// 例如把 `session_unavailable` 报成 `ipc_unreachable`，AI 会去重启 daemon，
+/// 而真正该做的是重新打开会话。
+pub fn code_to_exit(code: &str) -> (String, i32) {
+    match code {
+        "remote_nonzero" => (code.to_string(), exit_code::REMOTE_NONZERO),
+        "risk_denied" => (code.to_string(), exit_code::RISK_DENIED),
+        "needs_confirmation" => (code.to_string(), exit_code::NEEDS_CONFIRMATION),
+        "timeout" => (code.to_string(), exit_code::TIMEOUT),
+        "session_unavailable" => (code.to_string(), exit_code::SESSION_UNAVAILABLE),
+        "auth_failed" => (code.to_string(), exit_code::AUTH_FAILED),
+        "auth_required" => (code.to_string(), exit_code::AUTH_REQUIRED),
+        "host_not_found" => (code.to_string(), exit_code::HOST_NOT_FOUND),
+        "rate_limited" => (code.to_string(), exit_code::RATE_LIMITED),
+        "invalid_args" => (code.to_string(), exit_code::INVALID_ARGS),
+        // 未知的业务码按内部错误处理，但保留原码字样便于排查
+        other => (other.to_string(), exit_code::INTERNAL),
+    }
 }
 
 /// 统一输出：纯文本或 JSON 信封
@@ -119,11 +226,15 @@ pub async fn run(args: AiArgs, client: Option<Arc<IpcClient>>) -> i32 {
         }
         Err(e) => {
             let (code, num) = match &e {
-                AiError::Ipc(_) => ("ipc_unreachable", exit_code::IPC_UNREACHABLE),
-                AiError::Args(_) => ("invalid_args", exit_code::INVALID_ARGS),
-                AiError::Other(_) => ("internal", exit_code::INTERNAL),
+                AiError::Ipc(_) => (
+                    "ipc_unreachable".to_string(),
+                    exit_code::IPC_UNREACHABLE,
+                ),
+                AiError::Remote { code, .. } => code_to_exit(code),
+                AiError::Args(_) => ("invalid_args".to_string(), exit_code::INVALID_ARGS),
+                AiError::Other(_) => ("internal".to_string(), exit_code::INTERNAL),
             };
-            emit_err(json_mode, code, e.to_string());
+            emit_err(json_mode, &code, e.to_string());
             num
         }
     }
@@ -131,8 +242,12 @@ pub async fn run(args: AiArgs, client: Option<Arc<IpcClient>>) -> i32 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {
+    /// 传输层问题：daemon 没起来、令牌不对、连接断了
     #[error("{0}")]
     Ipc(String),
+    /// daemon 正常应答但业务上失败（带它给出的错误码）
+    #[error("{message}")]
+    Remote { code: String, message: String },
     #[error("{0}")]
     Args(String),
     #[error("{0}")]
@@ -141,7 +256,12 @@ pub enum AiError {
 
 impl From<sh0_ipc::IpcError> for AiError {
     fn from(e: sh0_ipc::IpcError) -> Self {
-        AiError::Ipc(e.to_string())
+        match e {
+            // daemon 明确回了一个业务错误码——它是"正常应答但失败了"，
+            // 不是"连不上 daemon"，必须分开，退出码语义完全不同
+            sh0_ipc::IpcError::Remote { code, message } => AiError::Remote { code, message },
+            other => AiError::Ipc(other.to_string()),
+        }
     }
 }
 
@@ -230,6 +350,83 @@ async fn dispatch(args: &AiArgs, client: Option<Arc<IpcClient>>) -> Result<(Stri
                     .call(methods::SESSION_CLOSE, json!({ "session": sid }))
                     .await?;
                 Ok((format!("已关闭 {sid}\n"), data))
+            }
+            SessionCmd::Open { host, cols, rows } => {
+                let c = require_client(client)?;
+                let data = c
+                    .call(
+                        methods::SESSION_OPEN,
+                        json!({
+                            "host": host,
+                            "cols": cols.unwrap_or(120),
+                            "rows": rows.unwrap_or(32),
+                        }),
+                    )
+                    .await?;
+                let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+                Ok((format!("已打开会话 {id}\n"), data))
+            }
+            SessionCmd::Reconnect { session } => {
+                let c = require_client(client)?;
+                let data = c
+                    .call(methods::SESSION_RECONNECT, json!({ "session": session }))
+                    .await?;
+                Ok((format!("正在重连 {session}\n"), data))
+            }
+            SessionCmd::Clear { session } => {
+                let c = require_client(client)?;
+                let data = c
+                    .call(methods::SESSION_CLEAR, json!({ "session": session }))
+                    .await?;
+                Ok((format!("已清空 {session}\n"), data))
+            }
+            SessionCmd::Resize { session, cols, rows } => {
+                let c = require_client(client)?;
+                let data = c
+                    .call(methods::RESIZE, json!({ "session": session, "cols": cols, "rows": rows }))
+                    .await?;
+                Ok((format!("{session} 尺寸改为 {cols}x{rows}\n"), data))
+            }
+            SessionCmd::Status { session } => {
+                let c = require_client(client)?;
+                let data = c
+                    .call(methods::SESSION_STATUS, json!({ "session": session }))
+                    .await?;
+                let state = data.get("state").and_then(|v| v.as_str()).unwrap_or("-");
+                let host = data.get("host_name").and_then(|v| v.as_str()).unwrap_or("-");
+                let mut text = format!("{host}  [{state}]\n");
+                if let Some(e) = data.get("last_error").and_then(|v| v.as_str()) {
+                    text.push_str(&format!("最近错误: {e}\n"));
+                }
+                Ok((text, data))
+            }
+        },
+        AiObject::Input { cmd } => match cmd {
+            InputCmd::Send { session, data, enter } => {
+                let c = require_client(client)?;
+                let payload = if *enter {
+                    format!("{data}\n")
+                } else {
+                    data.clone()
+                };
+                let out = c
+                    .call(methods::INPUT_SEND, json!({ "session": session, "data": payload }))
+                    .await?;
+                Ok((String::new(), out))
+            }
+        },
+        AiObject::Screen { cmd } => match cmd {
+            ScreenCmd::Read { session, no_scrollback } => {
+                let c = require_client(client)?;
+                let with_scrollback = !no_scrollback;
+                let data = c
+                    .call(
+                        methods::SCREEN_READ,
+                        json!({ "session": session, "scrollback": with_scrollback }),
+                    )
+                    .await?;
+                let text = data.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                Ok((format!("{text}\n"), data))
             }
         },
     }

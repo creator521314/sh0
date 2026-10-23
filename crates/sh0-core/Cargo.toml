@@ -13,3 +13,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 chrono = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+async-trait.workspace = true
+sh0-term = { version = "0.1.0", path = "../sh0-term" }
+
+[features]
+default = []
+## 测试与契约验证用的假传输层，正式构建不需要
+mock = []

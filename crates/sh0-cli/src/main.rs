@@ -43,31 +43,17 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            // M1 起 TUI 自带主机树，选择器变成可选项：不带参数直接进树里挑
             let selector = match host {
-                Some(h) => h,
-                None if hosts.hosts.len() == 1 => hosts.hosts[0].name.clone(),
-                None => {
-                    anyhow::bail!(
-                        "配置中有多台主机，请用 `sh0 tui <主机名>` 指定。可用：{}",
-                        hosts
-                            .hosts
-                            .iter()
-                            .map(|h| h.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
+                Some(h) => Some(h),
+                None if hosts.hosts.len() == 1 => Some(hosts.hosts[0].name.clone()),
+                None => None,
             };
 
-            let (conn, _info) = ensure::connect_or_start(store.paths()).await?;
-            sh0_tui::run(
-                conn.client,
-                conn.events,
-                &selector,
-                cfg.cols,
-                cfg.rows,
-            )
-            .await?;
+            let log = store.paths().daemon_log();
+            let (conn, _info) =
+                ensure::connect_or_start(store.paths(), Some(&log)).await?;
+            sh0_tui::run(conn.client, conn.events, store, cfg, selector.as_deref()).await?;
         }
 
         Cmd::Ai {
@@ -86,7 +72,13 @@ async fn main() -> anyhow::Result<()> {
             // host 类子命令只读配置文件，不必拉起 daemon
             let needs_daemon = !matches!(args.object, AiObject::Host { .. });
             let client = if needs_daemon {
-                Some(ensure::connect_or_start(store.paths()).await?.0.client)
+                let log = store.paths().daemon_log();
+                Some(
+                    ensure::connect_or_start(store.paths(), Some(&log))
+                        .await?
+                        .0
+                        .client,
+                )
             } else {
                 None
             };

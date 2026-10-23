@@ -100,6 +100,10 @@ pub mod methods {
     pub const SESSION_OPEN: &str = "session.open";
     pub const SESSION_CLOSE: &str = "session.close";
     pub const SESSION_STATUS: &str = "session.status";
+    pub const SESSION_RECONNECT: &str = "session.reconnect";
+    pub const SESSION_CLEAR: &str = "session.clear";
+    /// M2 的 `screen read` 命令，M1 先落地实现（AI 读屏依赖它）
+    pub const SCREEN_READ: &str = "screen.read";
     pub const INPUT_SEND: &str = "input.send";
     pub const RESIZE: &str = "session.resize";
 }
@@ -108,4 +112,8 @@ pub mod methods {
 pub mod events {
     pub const OUTPUT: &str = "output";
     pub const STATE: &str = "state";
+    /// 重连成功，携带 attempt
+    pub const RECONNECTED: &str = "reconnected";
+    /// 会话结束，携带 reason
+    pub const CLOSED: &str = "closed";
 }

@@ -3,7 +3,9 @@
 pub mod client;
 pub mod error;
 pub mod host_key;
+pub mod session;
 
 pub use client::{ConnectOptions, ShellHandle, SshConnection, probe_key, resolve_secret};
 pub use error::{Result, SshError};
 pub use host_key::{HostKeyVerdict, verify};
+pub use session::{RusshFactory, RusshTransport};
