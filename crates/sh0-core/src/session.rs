@@ -19,6 +19,7 @@ use sh0_term::{MemoryBudget, Screen, ScreenOptions};
 
 use crate::ids::{SessionId, new_session_id};
 use crate::model::{Host, SessionSnapshot, SessionState};
+use crate::sftp::SftpClient;
 use crate::transport::{SessionTransport, TransportEvent, TransportFactory, TransportResult};
 
 /// 重连退避策略
@@ -119,13 +120,20 @@ pub enum SessionEvent {
 }
 
 /// 发给 actor 的控制命令
-#[derive(Debug)]
+///
+/// 不派生 Debug：`Sftp` 变体里的 trait 对象没有 Debug 实现，
+/// 而加 Debug supertrait 会逼着每个实现都去写一个没意义的 fmt。
 enum SessionCmd {
     Input(Vec<u8>),
     Resize(u16, u16),
     Reconnect,
     Close,
     Clear,
+    /// 在本会话的**连接**上开 SFTP channel（FR-4.1：不新开 TCP）。
+    ///
+    /// 必须由 actor 执行：transport 归它所有，且只有它能在 `&mut` 下开 channel。
+    /// 结果经 oneshot 送回调用方。
+    Sftp(tokio::sync::oneshot::Sender<Result<Box<dyn SftpClient>, String>>),
 }
 
 /// 命令处理结果。
@@ -186,6 +194,22 @@ impl SessionHandle {
         self.cmd_tx.send(SessionCmd::Clear).map_err(|_| SessionCmdError::Gone)
     }
 
+    /// 在本会话的连接上开 SFTP（FR-4.1）。
+    ///
+    /// 会话未连上时不会自动重连——SFTP 是一次性操作，
+    /// 悄悄等一次重连会让调用方误以为卡住，不如直接报错让它自己决定。
+    pub async fn sftp(&self) -> Result<Box<dyn SftpClient>, SessionCmdError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(SessionCmd::Sftp(tx))
+            .map_err(|_| SessionCmdError::Gone)?;
+        match rx.await {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(msg)) => Err(SessionCmdError::Failed(msg)),
+            Err(_) => Err(SessionCmdError::Gone),
+        }
+    }
+
     /// 读屏（`ai screen read` 与 TUI 共用）。
     ///
     /// 直接读共享的 `Screen`，不走 actor 的命令通道——屏幕内容由 Mutex 保护，
@@ -228,6 +252,8 @@ impl SessionHandle {
 pub enum SessionCmdError {
     #[error("会话已结束")]
     Gone,
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// 启动一个会话 actor
@@ -441,6 +467,14 @@ impl SessionActor {
             SessionCmd::Close => {
                 self.finish(None).await;
                 CmdOutcome::Closed
+            }
+            SessionCmd::Sftp(reply) => {
+                let r = match self.transport.as_mut() {
+                    Some(t) => t.sftp().await.map_err(|e| e.to_string()),
+                    None => Err("会话当前没有活跃连接".into()),
+                };
+                let _ = reply.send(r);
+                CmdOutcome::Continue
             }
         }
     }

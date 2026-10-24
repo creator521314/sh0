@@ -77,6 +77,11 @@ pub enum AiObject {
         #[command(subcommand)]
         cmd: LogCmd,
     },
+    /// 远端文件操作（M4 / FR-6.6）
+    File {
+        #[command(subcommand)]
+        cmd: FileCmd,
+    },
     /// 连通性探针
     Ping,
 }
@@ -238,6 +243,96 @@ pub enum LogCmd {
         risk: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FileCmd {
+    /// 列目录（FR-6.6）
+    List {
+        /// 会话 ID（与 --host 二选一；给会话时复用其连接）
+        #[arg(long)]
+        session: Option<String>,
+        /// 主机名或 ID（一键式：自建自用连接）
+        #[arg(long)]
+        host: Option<String>,
+        /// 远端路径
+        #[arg(long)]
+        path: String,
+    },
+    /// 单个文件/目录的元信息
+    Stat {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: String,
+    },
+    /// 读文件内容（默认上限 1 MB，防止拉爆内存）
+    Read {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value_t = 1024 * 1024)]
+        max_bytes: usize,
+    },
+    /// 写文件（整体覆盖）
+    Write {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: String,
+        /// 文件内容；不给时从 stdin 读
+        #[arg(long)]
+        data: Option<String>,
+    },
+    /// 新建目录
+    Mkdir {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: String,
+    },
+    /// 删除文件或目录（目录需加 --dir）
+    Remove {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        dir: bool,
+    },
+    /// 重命名 / 移动
+    Rename {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// 改权限（八进制，如 644）
+    Chmod {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: String,
+        /// 权限位，八进制字符串（如 "644"）或 0o644
+        mode: String,
     },
 }
 
@@ -770,7 +865,212 @@ async fn dispatch(
                 Ok((text, json!({ "records": records })))
             }
         },
+        AiObject::File { cmd } => match cmd {
+            FileCmd::List {
+                session,
+                host,
+                path,
+            } => {
+                let c = require_client(client)?;
+                let mut p = json!({ "session": session, "host": host, "path": path });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_LIST, p).await?;
+                let entries = data.get("entries").cloned().unwrap_or(json!([]));
+                let mut text = String::new();
+                if let Some(list) = entries.as_array() {
+                    if list.is_empty() {
+                        text = "（空目录）\n".to_string();
+                    }
+                    for e in list {
+                        let is_dir = e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let mode = e.get("mode").and_then(|v| v.as_u64()).map(|m| m as u32);
+                        let size = e.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let ts = e
+                            .get("modified")
+                            .and_then(|v| v.as_i64())
+                            .map(fmt_ts)
+                            .unwrap_or_else(|| "                ".to_string());
+                        text.push_str(&format!(
+                            "{} {:>10}  {}  {}{}\n",
+                            sh0_core::mode_string(is_dir, mode),
+                            size,
+                            ts,
+                            name,
+                            if is_dir { "/" } else { "" },
+                        ));
+                    }
+                }
+                Ok((text, data))
+            }
+            FileCmd::Stat {
+                session,
+                host,
+                path,
+            } => {
+                let c = require_client(client)?;
+                let mut p = json!({ "session": session, "host": host, "path": path });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_STAT, p).await?;
+                let e = data.get("entry").cloned().unwrap_or(json!(null));
+                let text = if e.is_null() {
+                    "（无此路径）\n".to_string()
+                } else {
+                    format!(
+                        "{}  {}  {} bytes  mode {:o}  uid {:?}  gid {:?}\n",
+                        e.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+                        if e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            "目录"
+                        } else {
+                            "文件"
+                        },
+                        e.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                        e.get("mode").and_then(|v| v.as_u64()).unwrap_or(0),
+                        e.get("uid").and_then(|v| v.as_u64()),
+                        e.get("gid").and_then(|v| v.as_u64()),
+                    )
+                };
+                Ok((text, data))
+            }
+            FileCmd::Read {
+                session,
+                host,
+                path,
+                max_bytes,
+            } => {
+                let c = require_client(client)?;
+                let mut p =
+                    json!({ "session": session, "host": host, "path": path, "max_bytes": max_bytes });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_READ, p).await?;
+                let enc = data.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
+                let text = if enc == "base64" {
+                    format!(
+                        "（二进制文件，{} 字节，base64 见 data.content）\n",
+                        data.get("size").and_then(|v| v.as_u64()).unwrap_or(0)
+                    )
+                } else {
+                    data.get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                Ok((text, data))
+            }
+            FileCmd::Write {
+                session,
+                host,
+                path,
+                data,
+            } => {
+                let c = require_client(client)?;
+                let body = match data {
+                    Some(d) => d.clone(),
+                    None => {
+                        let mut s = String::new();
+                        use std::io::Read;
+                        std::io::stdin()
+                            .read_to_string(&mut s)
+                            .map_err(|e| AiError::Ipc(format!("读取 stdin 失败: {e}")))?;
+                        s
+                    }
+                };
+                let mut p = json!({ "session": session, "host": host, "path": path, "data": body });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_WRITE, p).await?;
+                Ok((
+                    format!("已写入 {} 字节\n", data.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0)),
+                    data,
+                ))
+            }
+            FileCmd::Mkdir {
+                session,
+                host,
+                path,
+            } => {
+                let c = require_client(client)?;
+                let mut p = json!({ "session": session, "host": host, "path": path });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_MKDIR, p).await?;
+                Ok((format!("已创建目录 {path}\n"), data))
+            }
+            FileCmd::Remove {
+                session,
+                host,
+                path,
+                dir,
+            } => {
+                let c = require_client(client)?;
+                let mut p = json!({ "session": session, "host": host, "path": path, "dir": dir });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_REMOVE, p).await?;
+                Ok((format!("已删除 {path}\n"), data))
+            }
+            FileCmd::Rename {
+                session,
+                host,
+                from,
+                to,
+            } => {
+                let c = require_client(client)?;
+                let mut p = json!({ "session": session, "host": host, "from": from, "to": to });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_RENAME, p).await?;
+                Ok((format!("已重命名 {from} → {to}\n"), data))
+            }
+            FileCmd::Chmod {
+                session,
+                host,
+                path,
+                mode,
+            } => {
+                let c = require_client(client)?;
+                let m = parse_octal(mode)?;
+                let mut p = json!({ "session": session, "host": host, "path": path, "mode": m });
+                ctx.trace(&mut p);
+                let data = c.call(methods::FILE_CHMOD, p).await?;
+                Ok((format!("{path} 权限已改为 {mode}\n"), data))
+            }
+        },
     }
+}
+
+/// 八进制权限串 → u32。接受 `644`、`0644`、`0o644`
+fn parse_octal(s: &str) -> Result<u32, AiError> {
+    let t = s.trim().trim_start_matches("0o");
+    u32::from_str_radix(t, 8)
+        .map_err(|_| AiError::Args(format!("`{s}` 不是合法八进制权限（如 644）")))
+}
+
+/// unix 秒 → `YYYY-MM-DD HH:MM:SS`（UTC）。
+///
+/// 不引 chrono：这里只要一个稳定的可读串，为它多一个依赖不划算。
+/// 算法是 Howard Hinnant 的 civil_from_days（公历，1970 起算）。
+fn fmt_ts(secs: i64) -> String {
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 /// exec 的人类可读输出：一行头部 + stdout + stderr

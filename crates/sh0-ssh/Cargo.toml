@@ -15,3 +15,4 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+russh-sftp = "3.0.1"

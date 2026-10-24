@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use sh0_core::session::{SessionConfig, SessionEvent, SessionHandle, spawn_session};
+use sh0_core::sftp::{SftpClient, SftpError, SftpResult};
 use sh0_core::{RiskEngine, RiskLevel, SessionSnapshot, SessionState, TransportFactory, new_session_id};
 use sh0_ipc::protocol::{DaemonInfo, ErrorBody, events, methods};
 use sh0_ipc::{EventHub, Handler, ServerMsg, serve};
@@ -239,6 +240,125 @@ impl DaemonState {
         if let Err(e) = db.record(&rec) {
             tracing::warn!("审计写入失败: {e}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // SFTP（FR-4.x / FR-6.6，M4）
+    // -----------------------------------------------------------------------
+
+    /// 取一个 SFTP 客户端：给了会话就**复用它的连接**，否则按主机一键式建连。
+    ///
+    /// 复用连接是 FR-4.1 的硬要求——同一条 TCP 上另开一个 channel，
+    /// 而不是为一次 `ls` 再握手一遍。
+    async fn sftp_for(
+        &self,
+        params: &Value,
+    ) -> std::result::Result<(Box<dyn SftpClient>, String, Option<String>), ErrorBody> {
+        let session = params
+            .get("session")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let host = params
+            .get("host")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        match (session, host) {
+            (Some(sid), _) => {
+                let h = {
+                    let sessions = self.sessions.lock().await;
+                    sessions.get(sid).cloned().ok_or_else(|| ErrorBody {
+                        code: "session_unavailable".into(),
+                        message: format!("会话 {sid} 不存在"),
+                        data: None,
+                    })?
+                };
+                let c = h.sftp().await.map_err(|e| ErrorBody {
+                    code: "session_unavailable".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
+                Ok((c, h.host.name.clone(), Some(sid.to_string())))
+            }
+            (None, Some(sel)) => {
+                let h = self.store.find_host(sel).map_err(|e| ErrorBody {
+                    code: "host_not_found".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
+                let c = self.factory.open_sftp(&h).await.map_err(|e| ErrorBody {
+                    code: "session_unavailable".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
+                Ok((c, h.name.clone(), None))
+            }
+            _ => Err(ErrorBody {
+                code: "invalid_args".into(),
+                message: "需要 session 或 host 之一".into(),
+                data: None,
+            }),
+        }
+    }
+
+    /// 每个 file.* 分支的收口：审计 + 错误映射。
+    ///
+    /// 集中在一个地方是为了不漏审计——文件操作同样要能回溯"谁改了哪个文件"。
+    fn file_done<T>(
+        &self,
+        params: &Value,
+        action: &str,
+        detail: &str,
+        host: &str,
+        sid: Option<&str>,
+        r: SftpResult<T>,
+    ) -> std::result::Result<T, ErrorBody> {
+        match r {
+            Ok(v) => {
+                self.audit_file(params, action, detail, host, sid, None);
+                Ok(v)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.audit_file(params, action, detail, host, sid, Some(&msg));
+                Err(sftp_err(e))
+            }
+        }
+    }
+
+    fn audit_file(
+        &self,
+        params: &Value,
+        action: &str,
+        detail: &str,
+        host: &str,
+        sid: Option<&str>,
+        error: Option<&str>,
+    ) {
+        self.audit(AuditRecord {
+            ts: now_rfc3339(),
+            trace_id: params
+                .get("trace_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            session_id: sid.map(str::to_string),
+            host_name: Some(host.to_string()),
+            actor: params
+                .get("actor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tui")
+                .to_string(),
+            action: action.to_string(),
+            // 路径记在 command 列：审计只有一个"目标"列，单开一列反而难检索
+            command: Some(detail.to_string()),
+            risk: None,
+            decision: Some(if error.is_some() { "failed" } else { "executed" }.into()),
+            exit_code: None,
+            duration_ms: None,
+            truncated: false,
+            error: error.map(str::to_string),
+            stdout: None,
+            stderr: None,
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -933,6 +1053,43 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// 取 file.* 的目标路径（必填）
+fn file_path(params: &Value) -> std::result::Result<String, ErrorBody> {
+    params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ErrorBody {
+            code: "invalid_args".into(),
+            message: "缺少 path 参数".into(),
+            data: None,
+        })
+}
+
+/// SFTP 错误 → IPC 错误码。能分的都分开：
+/// "路径不存在"与"权限不足"对 AI 的下一步决策完全不同。
+fn sftp_err(e: SftpError) -> ErrorBody {
+    let code = match &e {
+        SftpError::NotFound(_) => "not_found",
+        SftpError::PermissionDenied(_) => "permission_denied",
+        SftpError::TooLarge(_) => "too_large",
+        SftpError::Disconnected(_) => "session_unavailable",
+        SftpError::NotImplemented(_) => "invalid_args",
+        _ => "internal",
+    };
+    ErrorBody {
+        code: code.into(),
+        message: e.to_string(),
+        data: None,
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// 把 `GridView` 序列化成 JSON 值（`screen read --mode grid`）
 fn grid_view_json(v: &GridView) -> Value {
     json!({
@@ -1173,6 +1330,142 @@ impl Handler for DaemonState {
             methods::EXEC_CONFIRM => self.exec_confirm(&params).await,
 
             methods::LOG_QUERY => self.log_query(&params).await,
+
+            // ---- M4 · SFTP（FR-4.x / FR-6.6）----
+            methods::FILE_LIST => {
+                let path = file_path(&params)?;
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = sftp.list(&path).await;
+                let _ = sftp.close().await;
+                let entries = self.file_done(
+                    &params,
+                    "file.list",
+                    &path,
+                    &host_name,
+                    sid.as_deref(),
+                    r,
+                )?;
+                Ok(json!({ "path": path, "host": host_name, "entries": entries }))
+            }
+
+            methods::FILE_STAT => {
+                let path = file_path(&params)?;
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = sftp.stat(&path).await;
+                let _ = sftp.close().await;
+                let entry =
+                    self.file_done(&params, "file.stat", &path, &host_name, sid.as_deref(), r)?;
+                Ok(json!({ "path": path, "host": host_name, "entry": entry }))
+            }
+
+            methods::FILE_READ => {
+                let path = file_path(&params)?;
+                let max_bytes = params
+                    .get("max_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1024 * 1024) as usize;
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = sftp.read(&path, max_bytes).await;
+                let _ = sftp.close().await;
+                let bytes =
+                    self.file_done(&params, "file.read", &path, &host_name, sid.as_deref(), r)?;
+                let size = bytes.len();
+                // 文本直接给内容，二进制给 base64：AI 拿乱码当文本会静默出错
+                Ok(match String::from_utf8(bytes) {
+                    Ok(s) => json!({
+                        "path": path, "host": host_name, "size": size,
+                        "encoding": "utf8", "content": s,
+                    }),
+                    Err(e) => json!({
+                        "path": path, "host": host_name, "size": size,
+                        "encoding": "base64",
+                        "content": base64_encode(&e.into_bytes()),
+                    }),
+                })
+            }
+
+            methods::FILE_WRITE => {
+                let path = file_path(&params)?;
+                let body = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let n = body.len();
+                let r = sftp.write(&path, body.as_bytes()).await;
+                let _ = sftp.close().await;
+                self.file_done(&params, "file.write", &path, &host_name, sid.as_deref(), r)?;
+                Ok(json!({ "path": path, "host": host_name, "bytes": n }))
+            }
+
+            methods::FILE_MKDIR => {
+                let path = file_path(&params)?;
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = sftp.mkdir(&path).await;
+                let _ = sftp.close().await;
+                self.file_done(&params, "file.mkdir", &path, &host_name, sid.as_deref(), r)?;
+                Ok(json!({ "path": path, "host": host_name }))
+            }
+
+            methods::FILE_REMOVE => {
+                let path = file_path(&params)?;
+                let is_dir = params.get("dir").and_then(|v| v.as_bool()).unwrap_or(false);
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = if is_dir {
+                    sftp.remove_dir(&path).await
+                } else {
+                    sftp.remove_file(&path).await
+                };
+                let _ = sftp.close().await;
+                self.file_done(&params, "file.remove", &path, &host_name, sid.as_deref(), r)?;
+                Ok(json!({ "path": path, "host": host_name, "dir": is_dir }))
+            }
+
+            methods::FILE_RENAME => {
+                let from = params
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| ErrorBody {
+                        code: "invalid_args".into(),
+                        message: "缺少 from 参数".into(),
+                        data: None,
+                    })?
+                    .to_string();
+                let to = params
+                    .get("to")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| ErrorBody {
+                        code: "invalid_args".into(),
+                        message: "缺少 to 参数".into(),
+                        data: None,
+                    })?
+                    .to_string();
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = sftp.rename(&from, &to).await;
+                let _ = sftp.close().await;
+                self.file_done(
+                    &params,
+                    "file.rename",
+                    &format!("{from} -> {to}"),
+                    &host_name,
+                    sid.as_deref(),
+                    r,
+                )?;
+                Ok(json!({ "from": from, "to": to, "host": host_name }))
+            }
+
+            methods::FILE_CHMOD => {
+                let path = file_path(&params)?;
+                let mode = params.get("mode").and_then(|v| v.as_u64()).ok_or_else(|| ErrorBody {
+                    code: "invalid_args".into(),
+                    message: "缺少 mode 参数".into(),
+                    data: None,
+                })? as u32;
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = sftp.chmod(&path, mode).await;
+                let _ = sftp.close().await;
+                self.file_done(&params, "file.chmod", &path, &host_name, sid.as_deref(), r)?;
+                Ok(json!({ "path": path, "host": host_name, "mode": mode }))
+            }
 
             methods::SHUTDOWN => {
                 // 先优雅关闭所有会话，再退出

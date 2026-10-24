@@ -144,11 +144,32 @@ impl SshConnection {
         Ok(ShellHandle { channel })
     }
 
-    pub async fn close(&mut self) -> Result<()> {
+    /// 断开连接。`&self` 即可：russh 的 `Handle::disconnect` 内部走 channel 发送，
+    /// 不需要可变借用。这样 SFTP 这类"自持连接"的对象能在 `&self` 方法里释放它。
+    pub async fn close(&self) -> Result<()> {
         self.handle
             .disconnect(Disconnect::ByApplication, "", "English")
             .await
             .map_err(SshError::Connect)
+    }
+
+    /// 在本条连接上打开 SFTP 子系统（FR-4.1：复用 TCP，不新建连接）。
+    ///
+    /// 每个 channel 独立：SFTP 有自己的window/流控，与 shell channel 互不干扰，
+    /// 所以可以放心地开完就关，不必长期持有。
+    pub async fn open_sftp(&self) -> Result<russh_sftp::client::SftpSession> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(SshError::Connect)?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(SshError::Connect)?;
+        russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| SshError::Sftp(e.to_string()))
     }
 
     /// 独立 exec channel 执行一条命令（W2.4 备选路径，不申请 PTY）。

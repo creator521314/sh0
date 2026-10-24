@@ -9,6 +9,7 @@ pub mod model;
 pub mod risk;
 pub mod secret;
 pub mod session;
+pub mod sftp;
 pub mod transport;
 
 #[cfg(feature = "mock")]
@@ -22,6 +23,7 @@ pub use secret::{DefaultResolver, SecretResolver};
 pub use session::{
     ReconnectPolicy, SessionConfig, SessionEvent, SessionHandle, spawn_session,
 };
+pub use sftp::{FileEntry, SftpClient, SftpError, SftpResult, mode_string};
 pub use transport::{
     ExecOutput, SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
 };

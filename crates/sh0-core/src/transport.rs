@@ -12,6 +12,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::Host;
+use crate::sftp::SftpClient;
 
 /// 传输层事件
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,15 @@ pub trait SessionTransport: Send {
     /// 通知远端终端尺寸变化（需求 FR-2.4）
     async fn resize(&mut self, cols: u16, rows: u16) -> TransportResult<()>;
     async fn close(&mut self) -> TransportResult<()>;
+
+    /// 在**本条连接**上打开 SFTP 子系统（FR-4.1：复用现有 SSH 连接，不新开 TCP）。
+    ///
+    /// 默认未实现：终端传输不需要它。只有真的能复用连接的实现才 override。
+    async fn sftp(&mut self) -> TransportResult<Box<dyn SftpClient>> {
+        Err(TransportError::NotImplemented(
+            "该传输不支持 SFTP".into(),
+        ))
+    }
 }
 
 /// 传输层工厂：一次重连就是一次 `connect`
@@ -79,5 +89,15 @@ pub trait TransportFactory: Send + Sync {
     async fn exec(&self, host: &Host, cmd: &str, timeout: Duration) -> TransportResult<ExecOutput> {
         let _ = (host, cmd, timeout);
         Err(TransportError::NotImplemented("exec channel 不可用".into()))
+    }
+
+    /// 一键式 SFTP：没有现成会话时新建一条连接，开 SFTP channel。
+    ///
+    /// 调用方用完即 `close()`（连同一条 TCP 连接一起释放），
+    /// 因此只适合 `sh0 ai file --host X` 这种一次性操作；
+    /// 有会话时优先走 [`SessionTransport::sftp`] 复用连接。
+    async fn open_sftp(&self, host: &Host) -> TransportResult<Box<dyn SftpClient>> {
+        let _ = host;
+        Err(TransportError::NotImplemented("SFTP 不可用".into()))
     }
 }

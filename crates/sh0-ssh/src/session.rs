@@ -10,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use russh::ChannelMsg;
 
+use sh0_core::sftp::SftpClient;
 use sh0_core::transport::{
     ExecOutput, SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
 };
@@ -17,6 +18,7 @@ use sh0_core::{Host, SecretResolver};
 
 use crate::client::{ConnectOptions, ShellHandle, SshConnection};
 use crate::error::SshError;
+use crate::sftp::RusshSftp;
 
 /// 真实 SSH 连接的工厂
 #[derive(Clone)]
@@ -87,6 +89,14 @@ impl TransportFactory for RusshFactory {
             .await
             .map_err(TransportError::from)
     }
+
+    /// 一键式 SFTP：没有现成会话时自建自用。连接由返回的客户端持有，
+    /// `close()` 时连同 TCP 一起释放（所以别在循环里反复开）。
+    async fn open_sftp(&self, host: &Host) -> TransportResult<Box<dyn SftpClient>> {
+        let conn = SshConnection::connect(host, self.opts()).await?;
+        let s = conn.open_sftp().await?;
+        Ok(Box::new(RusshSftp::owned(s, conn)))
+    }
 }
 
 /// 一个交互式 shell 通道
@@ -133,6 +143,13 @@ impl SessionTransport for RusshTransport {
         let _ = self.shell.eof().await;
         self.conn.close().await?;
         Ok(())
+    }
+
+    /// 复用本条连接开 SFTP（FR-4.1）：新开 channel，TCP 不重建。
+    /// 返回的 channel 由调用方负责 `close()`，关掉它不影响 shell。
+    async fn sftp(&mut self) -> TransportResult<Box<dyn SftpClient>> {
+        let s = self.conn.open_sftp().await?;
+        Ok(Box::new(RusshSftp::new(s)))
     }
 }
 

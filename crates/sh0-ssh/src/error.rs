@@ -16,6 +16,9 @@ pub enum SshError {
     #[error("凭据解析失败: {0}")]
     Credential(String),
 
+    #[error("SFTP 失败: {0}")]
+    Sftp(String),
+
     #[error("尚未实现（后续里程碑）: {0}")]
     NotImplemented(String),
 

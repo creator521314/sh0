@@ -137,6 +137,16 @@ pub mod methods {
     pub const EXEC_CONFIRM: &str = "exec.confirm";
     /// M2：审计查询
     pub const LOG_QUERY: &str = "log.query";
+
+    // ---- M4 · SFTP（FR-4.x / FR-6.6）----
+    pub const FILE_LIST: &str = "file.list";
+    pub const FILE_STAT: &str = "file.stat";
+    pub const FILE_READ: &str = "file.read";
+    pub const FILE_WRITE: &str = "file.write";
+    pub const FILE_MKDIR: &str = "file.mkdir";
+    pub const FILE_REMOVE: &str = "file.remove";
+    pub const FILE_RENAME: &str = "file.rename";
+    pub const FILE_CHMOD: &str = "file.chmod";
 }
 
 /// 事件名常量

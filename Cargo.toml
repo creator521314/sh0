@@ -20,6 +20,7 @@ authors = ["creator521314"]
 description = "Lightweight cross-platform TUI SSH/SFTP manager with an AI-first CLI"
 
 [workspace.dependencies]
+base64 = "0.22"   # 纯 Rust：SFTP 读二进制文件时转 base64 给 AI
 # 内部 crate
 sh0-core = { path = "crates/sh0-core" }
 sh0-ssh = { path = "crates/sh0-ssh" }
