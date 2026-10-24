@@ -327,6 +327,12 @@ impl SessionActor {
 
             match tokio::time::timeout(Duration::from_millis(5), transport.wait()).await {
                 Ok(Some(TransportEvent::Data(data))) => {
+                    tracing::debug!(
+                        "会话 {} 收到 {} 字节: {:?}",
+                        self.id,
+                        data.len(),
+                        String::from_utf8_lossy(&data[..data.len().min(200)])
+                    );
                     let mut screen = self.screen.lock().await;
                     screen.feed(&data);
                     // 远端可能要求回话（如光标位置报告）
@@ -338,7 +344,20 @@ impl SessionActor {
                     self.emit_data(&data).await;
                 }
                 Ok(Some(TransportEvent::Eof)) => {
-                    info!("会话 {} 收到 EOF", self.id);
+                    // 把最后几行屏幕内容带上：真机上"连上了却立刻 EOF"是最难查的一类
+                    // 故障（可能是 shell 退出、ForceCommand、nologin），没有这段内容
+                    // 就只能看到一句"收到 EOF"，无从判断。
+                    let tail = {
+                        let s = self.screen.lock().await;
+                        let text = s.plain_text(true);
+                        let chars: Vec<char> = text.chars().collect();
+                        let from = chars.len().saturating_sub(600);
+                        chars[from..].iter().collect::<String>()
+                    };
+                    info!(
+                        "会话 {} 收到 EOF；断开前屏幕尾部: {:?}",
+                        self.id, tail
+                    );
                     self.finish(None).await;
                     return;
                 }

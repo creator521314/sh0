@@ -60,7 +60,7 @@ TOKEN=$(sh0 ai exec run --host web-01 --cmd "systemctl restart nginx" --json \
 sh0 ai exec run --host web-01 --cmd "systemctl restart nginx" --confirm-token "$TOKEN" --json
 
 sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json  # 审计回溯
-sh0 secret set --service sh0 --account web-01 --stdin <<< "$PW"       # 存凭据（无明文）
+printf '%s' "$PW" | sh0 secret set sh0 web-01 --stdin                   # 存凭据（无明文）
 
 sh0 daemon stop                   # 优雅停止后台 daemon
 ```
@@ -162,8 +162,9 @@ docs/
 - `keyboard-interactive` / 2FA 交互应答未实现（M5）
 - TUI raw mode 下无法交互式输入口令，请使用 `agent` / `env`，或 `sh0 secret set` 预存
 - 私钥路径不支持 `~` 展开，请写绝对路径
-- 尚未在真实 SSH 服务端做过端到端验证（开发机上没有可用 SSH 服务）。
-  终端仿真靠 23 条 golden 用例、重连与 exec 哨兵截取靠 mock 传输层 + 11 条契约测试覆盖；
-  真机的 PS1 形态、`clear` 刷屏、回显折行等边界待实测
-- `exec` 的 shell 模式依赖哨兵回显判断命令结束：远端改写 `PS1` 或命令本身回显特殊字符时
-  可能退化为部分输出（此时 `timeout=true`、退出码为 `null`），可切 `--mode exec` 规避
+- 已在真实环境（Debian / aarch64 树莓派，密码认证）跑通端到端一轮：会话、双模式 exec、
+  屏幕读取、按键注入、风险三档、确认闭环、审计回溯全部验证通过（2026-10-24）
+- `exec` 的 shell 模式依赖哨兵回显判断命令结束：远端改写 `PS1`、`clear` 刷屏、
+  回显折行等极端形态下可能退化为部分输出（此时 `timeout=true`、退出码为 `null`），
+  可切 `--mode exec` 规避
+- `known_hosts` 采用 TOFU：首次连接自动记录指纹，指纹变更时拒绝连接

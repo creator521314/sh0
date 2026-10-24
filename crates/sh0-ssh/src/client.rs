@@ -173,11 +173,21 @@ impl SshConnection {
         let mut stderr = Vec::new();
         let mut exit_code = None;
         let deadline = tokio::time::Instant::now() + timeout;
+        // EOF 之后服务端通常**紧接着**补一个 exit-status。见 EOF 就退出会把退出码
+        // 丢掉（真机实测：树莓派 OpenSSH 上 exit_code 恒为 null），而"命令成功还是
+        // 失败"正是 AI 最需要的信息——所以 EOF 后再多等一小会儿收退出码。
+        let mut eof_grace: Option<tokio::time::Instant> = None;
 
         loop {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            let mut left = deadline.saturating_duration_since(now);
+            if let Some(g) = eof_grace {
+                left = left.min(g.saturating_duration_since(now));
+            }
             if left.is_zero() {
-                tracing::warn!("exec channel 超时（{timeout:?}），命令可能仍在远端运行");
+                if eof_grace.is_none() {
+                    tracing::warn!("exec channel 超时（{timeout:?}），命令可能仍在远端运行");
+                }
                 break;
             }
             match tokio::time::timeout(left, channel.wait()).await {
@@ -188,7 +198,12 @@ impl SshConnection {
                 Ok(Some(ChannelMsg::ExitStatus { exit_status })) => {
                     exit_code = Some(exit_status as i32);
                 }
-                Ok(Some(ChannelMsg::Eof) | Some(ChannelMsg::Close)) | Ok(None) => break,
+                Ok(Some(ChannelMsg::Eof)) => {
+                    if eof_grace.is_none() {
+                        eof_grace = Some(now + Duration::from_millis(500));
+                    }
+                }
+                Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
                 Ok(Some(_)) => {}
                 Err(_) => break, // 超时
             }

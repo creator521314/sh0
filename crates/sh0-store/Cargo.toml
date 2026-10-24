@@ -22,3 +22,18 @@ argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 getrandom = { workspace = true }
 keyring = { workspace = true }
+
+# ⚠️ keyring 的平台后端**全是可选 feature**，必须显式启用。
+# 不启用时它不会报错，而是静默退化成 `MockCredential`：set 永远成功、get 永远
+# 读不到（真机上表现为"存进去了却取不出来"，且 `backend()` 还报告 keyring）。
+# 下面按目标平台补齐；三档与 [dependencies] 里的同名条目由 Cargo 做 feature 并集。
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
+# Linux：keyutils（内核钥匙串，不持久）+ Secret Service（dbus，持久）双写。
+# crypto-rust 保证不引入 OpenSSL 之类的 C 依赖。
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypto-rust"] }

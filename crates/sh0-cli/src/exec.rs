@@ -217,30 +217,33 @@ pub fn extract_output(before: &str, after: &str, cmd: &str, sentinel: &str) -> S
         && after_lines[..before_lines.len()] == before_lines[..];
     let start = if prefix_intact { before_lines.len() } else { 0 };
 
+    // echo 命令的回显行含哨兵 id——它是我们自己塞进去的噪声，必须剥掉。
+    // ⚠️ 不能只剥最后一行：真机上 PTY 常把两行输入**一起**回显，形态是
+    //   `prompt$ cmd` / `echo SH0_x:$?` / <输出> / <哨兵行>
+    // 此时回显行紧跟命令回显行、不在末尾（一键式会话尤其常见，shell 还没空闲）。
+    // 哨兵 id 是随机 ULID，真实输出里不可能出现，所以整段过滤是安全的。
+    // （直接调函数，不用闭包——闭包会把两个 &str 的生命周期绑在一起）
+
     let Some(sentinel_idx) = sentinel_idx else {
         // 2) 超时：尽力给出已有输出
-        let out_start = find_echo_line(&after_lines, start, &probe);
-        let mut lines: Vec<&str> = after_lines[out_start.min(after_lines.len())..].to_vec();
-        // 半截的 echo 命令回显也剥掉
-        if let Some(last) = lines.last()
-            && last.contains(&sentinel_pat)
-        {
-            lines.pop();
-        }
-        let out = join_trimmed(&lines);
+        let first = find_echo_line(&after_lines, start, &probe);
+        let out_start = skip_echo_block(
+            &after_lines,
+            first.min(after_lines.len()),
+            after_lines.len(),
+            &probe,
+            &sentinel_pat,
+        );
+        let lines: Vec<&str> = after_lines[out_start.min(after_lines.len())..].to_vec();
+        let out = join_trimmed(&drop_echo_lines(lines, &sentinel_pat));
         return SentinelScan::Partial { output: out };
     };
 
     // 3) 正常路径：输出区间 = (命令回显行, 哨兵行)
-    let out_start = find_echo_line(&after_lines, start, &probe);
-    let mut lines: Vec<&str> = after_lines[out_start..sentinel_idx].to_vec();
-    // 剥掉 echo 命令的回显行（含哨兵 id 的那行）
-    if let Some(last) = lines.last()
-        && last.contains(&sentinel_pat)
-    {
-        lines.pop();
-    }
-    let out = join_trimmed(&lines);
+    let first = find_echo_line(&after_lines, start, &probe);
+    let out_start = skip_echo_block(&after_lines, first, sentinel_idx, &probe, &sentinel_pat);
+    let lines: Vec<&str> = after_lines[out_start..sentinel_idx].to_vec();
+    let out = join_trimmed(&drop_echo_lines(lines, &sentinel_pat));
     SentinelScan::Complete {
         output: out,
         exit_code: exit_code.unwrap_or(-1),
@@ -259,6 +262,63 @@ fn find_echo_line(lines: &[&str], from: usize, probe: &str) -> usize {
         }
     }
     from
+}
+
+/// 跳过紧跟在命令回显后面的"回显噪声块"。
+///
+/// 真机形态（bash + readline，一键式会话尤其明显）比预想的脏：
+///
+/// ```text
+/// date                    ← PTY 对第一行输入的裸回显（提示符还没打印）
+/// echo SH0_x:$?           ← 第二行输入的裸回显
+/// hell@hell:~ $ date      ← readline 换行后重绘的提示符 + 命令
+/// Sat 24 Oct 21:30:15 HKT 2026   ← 真正的输出
+/// hell@hell:~ $ echo SH0_x:$?
+/// SH0_x:0
+/// ```
+///
+/// 只剥"第一行回显"会留下重绘的命令行，只剥"最后一行"会留下两块噪声。
+/// 这里从首个回显行起连续跳过：含命令文本的行，或含哨兵 id 的行。
+/// 上限 4 行——回显块不会更长，也免得命令输出里恰好出现命令文本时被整段吞掉。
+fn skip_echo_block(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    probe: &str,
+    sentinel_pat: &str,
+) -> usize {
+    let mut i = start;
+    let mut prev_was_echo = false;
+    let mut skipped = 0usize;
+    while i < end && skipped < 4 {
+        let l = lines[i];
+        if l.contains(sentinel_pat) {
+            // echo SH0_x:$? 的回显：哨兵 id 是随机 ULID，真实输出里不可能出现
+            prev_was_echo = true;
+            i += 1;
+            skipped += 1;
+            continue;
+        }
+        // 紧跟在 echo 回显行后面的、同样含命令文本的行 = readline 的重绘。
+        // 只认这一种，避免把"输出里恰好含命令文本"的第一行也吞掉。
+        if prev_was_echo && l.contains(probe) {
+            prev_was_echo = false;
+            i += 1;
+            skipped += 1;
+            continue;
+        }
+        break;
+    }
+    i
+}
+
+/// 剥掉所有含哨兵 id 的行：`echo SH0_x:$?` 这条命令是我们自己塞进去的，
+/// 它的回显是噪声。真机上两行输入常被 PTY 一起回显，所以不能只剥最后一行。
+fn drop_echo_lines<'a>(lines: Vec<&'a str>, sentinel_pat: &str) -> Vec<&'a str> {
+    lines
+        .into_iter()
+        .filter(|l| !l.contains(sentinel_pat))
+        .collect()
 }
 
 fn join_trimmed(lines: &[&str]) -> String {
@@ -350,6 +410,70 @@ mod tests {
             SentinelScan::Complete {
                 output: String::new(),
                 exit_code: 0
+            }
+        );
+    }
+
+    #[test]
+    fn readline_repaint_is_not_part_of_output() {
+        // 真机一键式形态：裸回显两行 → readline 重绘提示符+命令 → 输出 → 哨兵
+        let before = "Last login: Sat Oct 24 21:29:42 2026 from 192.168.31.100";
+        let after = format!(
+            "{before}\ndate\necho {S}:$?\nhell@hell:~ $ date\nSat 24 Oct 21:30:15 HKT 2026\nhell@hell:~ $ echo {S}:$?\n{S}:0\nhell@hell:~ $ "
+        );
+        let scan = extract_output(before, &after, "date", S);
+        assert_eq!(
+            scan,
+            SentinelScan::Complete {
+                output: "Sat 24 Oct 21:30:15 HKT 2026".into(),
+                exit_code: 0
+            }
+        );
+    }
+
+    #[test]
+    fn echo_block_skip_is_capped() {
+        // 命令输出里恰好出现命令文本时，不能被"跳过回显块"整段吞掉（上限 4 行）
+        let before = "p$ ";
+        let after = format!(
+            "p$ echo hi\necho {S}:$?\nhi\nhi\nhi\nhi\nhi\nhi\n{S}:0\np$ "
+        );
+        let scan = extract_output(before, &after, "echo hi", S);
+        let out = match scan {
+            SentinelScan::Complete { output, .. } => output,
+            other => panic!("应当是 Complete: {other:?}"),
+        };
+        assert!(out.contains("hi"), "输出不该被跳过逻辑吞掉: {out:?}");
+    }
+
+    #[test]
+    fn two_line_echo_is_stripped_wherever_it_sits() {
+        // 真机形态（一键式会话常见）：PTY 把两行输入一起回显，echo 回显行紧跟
+        // 命令回显行、不在末尾。哨兵 id 只可能来自我们自己的 echo，整段过滤。
+        let before = "hell@hell:~ $ ";
+        let after = format!(
+            "hell@hell:~ $ date\necho {S}:$?\nSat 24 Oct 21:27:05 HKT 2026\n{S}:0\nhell@hell:~ $ "
+        );
+        let scan = extract_output(before, &after, "date", S);
+        assert_eq!(
+            scan,
+            SentinelScan::Complete {
+                output: "Sat 24 Oct 21:27:05 HKT 2026".into(),
+                exit_code: 0
+            }
+        );
+    }
+
+    #[test]
+    fn timeout_partial_also_drops_echo_line() {
+        // 超时分支同样要把半截的 echo 回显剥掉
+        let before = "hell@hell:~ $ ";
+        let after = format!("hell@hell:~ $ sleep 30\necho {S}:$?\nsome partial\n");
+        let scan = extract_output(before, &after, "sleep 30", S);
+        assert_eq!(
+            scan,
+            SentinelScan::Partial {
+                output: "some partial".into()
             }
         );
     }

@@ -98,15 +98,25 @@ pub struct RusshTransport {
 #[async_trait]
 impl SessionTransport for RusshTransport {
     async fn wait(&mut self) -> Option<TransportEvent> {
-        let msg = self.shell.wait().await?;
-        Some(match msg {
-            ChannelMsg::Data { data } => TransportEvent::Data(data.to_vec()),
-            // ext == 1 是 stderr：终端场景里与 stdout 一起渲染才不会乱序
-            ChannelMsg::ExtendedData { data, ext: 1 } => TransportEvent::Data(data.to_vec()),
-            ChannelMsg::ExitStatus { exit_status } => TransportEvent::Exit(exit_status as i32),
-            ChannelMsg::Eof | ChannelMsg::Close => TransportEvent::Eof,
-            _ => TransportEvent::Eof,
-        })
+        // ⚠️ 千万别把"不认识的消息"映射成 EOF。
+        // 真机上海量非数据消息（pty-req 的 Success、WindowAdjust、XonXoff…）
+        // 会先于 shell 的输出到达；旧版把它们一律当 EOF，导致会话刚连上就断开
+        // ——mock 传输层不产生这些消息，所以测试全绿也没能发现（真机实测才暴露）。
+        loop {
+            let msg = self.shell.wait().await?;
+            let ev = match msg {
+                ChannelMsg::Data { data } => TransportEvent::Data(data.to_vec()),
+                // ext == 1 是 stderr：终端场景里与 stdout 一起渲染才不会乱序
+                ChannelMsg::ExtendedData { data, ext: 1 } => TransportEvent::Data(data.to_vec()),
+                ChannelMsg::ExitStatus { exit_status } => TransportEvent::Exit(exit_status as i32),
+                ChannelMsg::Eof | ChannelMsg::Close => TransportEvent::Eof,
+                other => {
+                    tracing::trace!("忽略与终端无关的通道消息: {other:?}");
+                    continue;
+                }
+            };
+            return Some(ev);
+        }
     }
 
     async fn send(&mut self, data: &[u8]) -> TransportResult<()> {

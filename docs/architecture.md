@@ -506,14 +506,31 @@ Filesystem      Size  Used Avail Use% Mounted on
 | `shell`（默认） | 复用交互 shell：发 `cmd\necho SH0_<ulid>:$?`，轮询屏幕直到哨兵输出行出现 | 拿得到交互上下文（`cd`、环境变量、`sudo` 会话）；不额外建连 | 依赖回显形态，`clear` / 改写 PS1 时可能退化为部分输出 |
 | `exec` | 新开一条 SSH exec channel：`channel.exec(true, cmd)` | stdout / stderr 天然分离、退出码精确 | 独立通道，拿不到交互上下文；每条命令一次建连 |
 
-**哨兵截取的四条启发式**（`crates/sh0-cli/src/exec.rs::extract_output`，纯函数、有单测）：
+**哨兵截取的启发式**（`crates/sh0-cli/src/exec.rs::extract_output`，纯函数、有单测）：
 
 1. 哨兵行 = 去空白后**整行恰为** `SENTINEL:<整数>`（从后往前找第一行）。不能用 `contains`——
    `echo SH0_x:$?` 的**回显行**也含哨兵 id，会在命令还没跑完时误判结束；
 2. 输出起点 = 从屏底样之后起，第一行包含命令前 40 字符（容忍折行）的**下一行**；
-3. 哨兵行前一行若含哨兵 id（echo 命令的回显），剥掉；
+3. 剥掉回显噪声：**所有**含哨兵 id 的行（echo 回显），以及紧跟其后、同样含命令文本的
+   readline 重绘行；
 4. 超时（`timeout_ms` 到点）返回 `Partial`：退出码为 `null`、`timeout: true`，
    AI 必须能看到"命令跑了一半"这件事。
+
+第 3 条是**真机实测**逼出来的。真机屏幕比预想的脏（bash + readline，一键式会话尤其明显）：
+
+```text
+date                    ← PTY 对第一行输入的裸回显（提示符还没打印）
+echo SH0_x:$?           ← 第二行输入的裸回显
+hell@hell:~ $ date      ← readline 换行后重绘的提示符 + 命令行
+Sat 24 Oct 21:30:15 HKT 2026   ← 真正的输出
+hell@hell:~ $ echo SH0_x:$?
+SH0_x:0
+```
+
+只剥"第一行回显"会留下重绘的命令行，只剥"最后一行"会留下两块噪声；而把所有"含命令
+文本的行"都剥掉，又会吞掉那些输出里恰好含命令文本的命令（如 `echo foo`）。
+最终规则：剥含哨兵 id 的行（哨兵是随机 ULID，真实输出里不可能出现）+ 紧跟其后的一行
+readline 重绘，跳过上限 4 行。
 
 `timeout` 字段恒出现在 JSON 里（即便为 `false`）——AI 判读输出完整性只看这一个字段，
 让它时有时无等于逼调用方多写一个分支。
@@ -731,6 +748,15 @@ SQLite**——这是"单二进制、跨平台行为一致"（NFR-1 / NFR-5）的
 M2 契约测试正是被这个点卡住过（症状：daemon 明明已应答，客户端仍在超时）。
 
 同时：错误信封支持挂载 `data`（确认令牌走这条路），服务端 `ErrorBody { code, message, data }`。
+
+### 9.4 真机（Debian / OpenSSH）踩到的两个 SSH 层陷阱
+
+1. **不认识的通道消息不能当成 EOF**。pty-req 的 `Success`、`WindowAdjust` 等非数据消息
+   会先于 shell 输出到达；早期实现把它们一律映射成 `TransportEvent::Eof`，结果会话刚连上
+   就"EOF"断开了。mock 传输层不产生这类消息，所以 79 条测试全绿也没能发现——真机一轮就暴露。
+   现在未知消息一律忽略并继续等下一条。
+2. **EOF 后要再等一会儿收退出码**。OpenSSH 常在 `EOF` 之后才补发 `exit-status`，
+   见 EOF 就退出会让 `exit_code` 恒为 `null`（AC-4 直接不成立）。现在 EOF 后多等 500ms。
 
 ---
 
