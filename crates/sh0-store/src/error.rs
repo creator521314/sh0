@@ -18,6 +18,12 @@ pub enum StoreError {
     #[error("failed to serialize config: {0}")]
     Serialize(#[source] toml::ser::Error),
 
+    #[error("credential error: {0}")]
+    Credential(String),
+
+    #[error("database error: {0}")]
+    Db(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

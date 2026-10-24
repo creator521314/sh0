@@ -13,6 +13,17 @@ use crate::scrollback::{MemoryBudget, Scrollback};
 /// 注意这是**软上限**：真正的约束是 [`MemoryBudget`]（NFR-3 / AC-2）。
 pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 
+/// 屏幕的二维网格视图（`screen read --mode grid` 的返回体）
+#[derive(Debug, Clone)]
+pub struct GridView {
+    pub cols: usize,
+    pub rows: usize,
+    /// 光标 (行, 列)；回看历史时不可见则为 None
+    pub cursor: Option<(usize, usize)>,
+    /// 当前视图每行的文本
+    pub lines: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScreenOptions {
     pub cols: usize,
@@ -20,7 +31,6 @@ pub struct ScreenOptions {
     pub scrollback_lines: usize,
     pub budget: Option<MemoryBudget>,
 }
-
 impl ScreenOptions {
     pub fn new(cols: usize, rows: usize) -> Self {
         Self {
@@ -228,6 +238,20 @@ impl Screen {
     /// 当前屏幕的纯文本
     pub fn screen_text(&self) -> String {
         self.plain_text(false)
+    }
+
+    /// 网格视图（`ai screen read --mode grid`，架构文档 §6.2）。
+    ///
+    /// 与 `plain_text` 的分工：plain 给人/AI 读语义，grid 保留二维结构
+    /// （行列号、光标位置），AI 需要定位屏幕上的某个元素时用它。
+    pub fn grid_view(&self) -> GridView {
+        let lines: Vec<String> = self.view_lines().iter().map(|l| l.text()).collect();
+        GridView {
+            cols: self.cols(),
+            rows: self.rows(),
+            cursor: self.view_cursor(),
+            lines,
+        }
     }
 
     /// 光标在视图中的行（考虑回看偏移）；不在视图内返回 None

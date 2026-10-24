@@ -30,7 +30,7 @@
 
 ## 2. 里程碑总览
 
-> **进度（2026-10-24）：M0、M1 已完成，M2 未开始。**
+> **进度（2026-10-24）：M0、M1、M2 已完成。**
 >
 > **M0**（12 人日）：8 个 crate 的 workspace 骨架、配置层、russh 连接与认证、
 > known_hosts TOFU、daemon 进程模型、IPC、最小 TUI。
@@ -40,21 +40,32 @@
 > 三套键位预设、文本选择与 OSC 52 剪贴板。`sh0-ssh` 已抽象为 trait 并提供 `MockTransport`
 > （feature `mock`），为 M2 契约测试铺路。
 >
-> 测试：**35 条**（终端 23 + 会话 12），`cargo clippy` 零警告。
+> **M2**（18 人日）：`sh0 ai` 全套子命令（host / session / exec / screen / input / log）、
+> 双渲染器与 12 类退出码、风险三档引擎（shell 词法切分 + 分段判定 + 内置规则集 +
+> 用户规则文件 + 主机 `risk_cap`）、确认机制（TUI 弹窗 / 无人值守令牌闭环）、
+> SQLite 审计（脱敏先行 + 输出归档 + 保留期与体积上限）、OS 钥匙串 + 主密码 vault 双后端凭据。
 >
-> 实现期对计划的两处偏离，已同步进架构文档：
+> 测试：**75 条**（终端 23 + 会话 12 + 风险 14 + 审计 3 + 凭据 5 + exec 12 + 契约 11 等），
+> `cargo clippy --workspace --all-targets` 零警告。契约测试进程内起完整 daemon（假传输层），
+> 覆盖 AC-4 ~ AC-8。
+>
+> 实现期对计划的三处偏离，已同步进架构文档：
 > 1. **IPC 后端改为 loopback TCP + 令牌**（原计划 UDS / Named Pipe）——见 §9 说明。
 > 2. **russh 必须启用 crypto backend**（`ring`），因此引入 C 依赖，与 NFR-11 的
 >    「纯 Rust 优先」有冲突 —— 见架构文档 §9 备注。
+> 3. **审计库用 `rusqlite bundled`**（SQLite 源码随包编译，需 C 工具链），换取
+>    「单二进制、不依赖系统 SQLite」——与 ring 同属受控的 C 依赖，见架构文档 §9。
 >
-> **M1 遗留风险**：尚未在真实 SSH 服务端做过端到端验证（开发机无可用 SSH 服务）。
-> 终端仿真靠 golden 用例、重连靠 mock 传输层覆盖，M2 开始前应找一台真机验证一轮。
+> **M2 遗留风险**：仍未在真实 SSH 服务端做过端到端验证（开发机无可用 SSH 服务）。
+> 哨兵截取算法目前只有「单测 + 契约测试里的假 shell」两道覆盖，真机的 PS1 形态、
+> 命令回显折行、`clear` 刷屏等边界未经实测。M3 开工前应先找一台真机跑一轮
+> `sh0 ai exec run` 双模式（shell 哨兵 / exec channel）验证。
 
 | ID | 名称 | 目标一句话 | 人日 | 关键验收 | 可停止 |
 | --- | --- | --- | --- | --- | --- |
 | **M0** | 骨架与连通 | 能跑起来的 daemon + 最小 TUI + 建立一条 SSH 连接 | 12 ✅ | 三平台 CI 产物可运行；`sh0 ai session list --json` 返回 `[]` | — |
 | **M1** | 终端与会话 | 可用的人机界面：xterm 仿真、主机树、标签页、断线自愈 | 21 ✅ | AC-2 / AC-3 / AC-9 | 可停：已可日常自用（无 AI） |
-| **M2** | AI 接口 MVP | 全部 `sh0 ai` 子命令 + 风险三档 + 审计闭环 | 18 | AC-4 / AC-5 / AC-6 / AC-7 / AC-8 | **首个完整可交付点** |
+| **M2** | AI 接口 MVP | 全部 `sh0 ai` 子命令 + 风险三档 + 审计闭环 | 18 ✅ | AC-4 / AC-5 / AC-6 / AC-7 / AC-8 | **首个完整可交付点** |
 | **M3** | 批量与广播 | 多机并行执行与结果汇总、会话广播输入 | 9 | 30 台巡检 ≤ 10s；结果可导出 | 可停：单机场景已够用 |
 | **M4** | SFTP 落地 | 双栏文件管理 + 传输队列 + `ai file *` | 14 | 大文件传输进度准确、中断可续 | 可停：文件操作可走命令行 |
 | **M5** | 打磨与发布 | 主题/键位、导入导出、体积性能、跳板机、文档 | 16 | NFR-1 ~ NFR-10 全绿 | 发布 v1.0 |
@@ -138,13 +149,24 @@
 | W2.11 | 错误码 → 退出码映射（12 类）+ 全子命令端到端契约测试 | 1.5 | FR-6.10 / NFR-10 |
 | W2.12 | 凭据存储：OS 钥匙串优先 + 主密码加密回落；确保配置无明文 | 1.5 | FR-1.4~FR-1.7 |
 
-**验收标准**
-- **AC-4**：`sh0 ai exec --host X --cmd "uname -a" --json` 返回合法 JSON，含 stdout/stderr/exit_code/duration_ms。
-- **AC-5**：`rm -rf /` 类命令无论 actor 一律 `deny`，审计留痕。
-- **AC-6**：`confirm` 档在无人值守模式返回 `needs_confirmation` + token，带 token 二次调用可通过。
-- **AC-7**：配置目录内 grep 不到任何明文密码。
-- **AC-8**：AI 与 TUI 操作同一批会话，双方动作都出现在同一份审计日志中。
+**验收标准**（2026-10-24：全部达成，由 `crates/sh0-cli/tests/contract.rs` 的 11 条契约测试守护）
+- **AC-4** ✅：`sh0 ai exec --host X --cmd "uname -a" --json` 返回合法 JSON，含 stdout/stderr/exit_code/duration_ms。
+- **AC-5** ✅：`rm -rf /` 类命令无论 actor 一律 `deny`，审计留痕（连 `--yes` 也拦）。
+- **AC-6** ✅：`confirm` 档在无人值守模式返回 `needs_confirmation` + token，带 token 二次调用可通过
+  （令牌单次消费，重放报 `invalid_args`）。
+- **AC-7** ✅：配置目录内 grep 不到任何明文密码（vault 密文 + `SH0_DISABLE_KEYRING` 下的确定性验证）。
+- **AC-8** ✅：AI 与 TUI 操作同一批会话，双方动作都出现在同一份审计日志中。
 - 契约测试覆盖全部 P0 子命令 × 成功/失败/需确认三条路径。
+
+**实现与计划的偏差**
+1. **`exec` 双模式同时落地**（原计划只把 exec channel 当备选）：默认走 shell 哨兵模式
+   （复用交互 shell、拿得到上下文），`--mode exec` 走独立 SSH channel（stdout/stderr 天然分离、
+   退出码精确，但没有交互上下文）。AI 可按场景选，`NFR-10` 的契约测试两种模式都覆盖。
+2. **凭据后端**：钥匙串优先（macOS Keychain / Windows 凭据管理器 / Linux Secret Service），
+   拿不到或用户禁用时回落到主密码 vault（Argon2id + ChaCha20-Poly1305）。
+   `SH0_DISABLE_KEYRING=1` 可强制走 vault（测试用它保证确定性）。
+3. **TUI 确认弹窗**：`confirm.requested` 事件 → 模态框（y 批准 / 其它键拒绝），
+   `confirm.resolved` 事件回写结果。与无人值守令牌共用同一份待确认表。
 
 **产出**：完整的 AI CLI + 契约测试套件 + 审计报告能力。**此时项目已具备对外交付价值。**
 **主要风险**：`exec` 依赖"哨兵回显"判断命令结束，遇到 `PS1` 被改写或命令本身回显特殊字符时会误判 → 建议 W2.4 同时预留 `exec` 走独立 exec channel（不复用 shell）的备选路径，后者更可靠但拿不到交互式上下文。

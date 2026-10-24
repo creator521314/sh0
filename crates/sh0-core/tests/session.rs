@@ -23,6 +23,7 @@ fn host() -> Host {
         auth: CredentialRef::None,
         tags: vec![],
         note: None,
+        risk_cap: None,
     }
 }
 

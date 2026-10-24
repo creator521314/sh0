@@ -15,17 +15,30 @@ use russh::keys::ssh_key::PublicKey;
 use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
 
-use sh0_core::{CredentialRef, Host, SecretRef};
+use sh0_core::transport::ExecOutput;
+use sh0_core::{CredentialRef, Host, SecretRef, SecretResolver};
 
 use crate::error::{Result, SshError};
 use crate::host_key::{HostKeyVerdict, verify};
 
 /// 连接参数
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub known_hosts: PathBuf,
     /// 0 表示不启用 keepalive
     pub keepalive_secs: u64,
+    /// 秘密解析后端；None 时用 `sh0_core::DefaultResolver`
+    pub resolver: Option<Arc<dyn SecretResolver>>,
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("known_hosts", &self.known_hosts)
+            .field("keepalive_secs", &self.keepalive_secs)
+            .field("resolver", &self.resolver.as_ref().map(|r| r.backend_name()))
+            .finish()
+    }
 }
 
 impl Default for ConnectOptions {
@@ -33,6 +46,7 @@ impl Default for ConnectOptions {
         Self {
             known_hosts: PathBuf::from("known_hosts"),
             keepalive_secs: 30,
+            resolver: None,
         }
     }
 }
@@ -105,7 +119,7 @@ impl SshConnection {
             .await
             .map_err(SshError::Connect)?;
 
-        authenticate(&mut handle, host).await?;
+        authenticate(&mut handle, host, opts.resolver.as_deref()).await?;
 
         Ok(Self { handle })
     }
@@ -135,6 +149,59 @@ impl SshConnection {
             .disconnect(Disconnect::ByApplication, "", "English")
             .await
             .map_err(SshError::Connect)
+    }
+
+    /// 独立 exec channel 执行一条命令（W2.4 备选路径，不申请 PTY）。
+    ///
+    /// 与 shell 哨兵模式的分工：
+    /// - exec channel：stdout/stderr 天然分离、退出码精确，适合一次性非交互命令；
+    /// - shell 哨兵：保留交互上下文（cwd、环境变量），适合连续操作。
+    ///
+    /// 超时到达时直接收线，已收到的输出照常返回（`exit_code` 为 None）。
+    pub async fn exec_command(&self, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(SshError::Connect)?;
+        channel
+            .exec(true, cmd)
+            .await
+            .map_err(SshError::Connect)?;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = None;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                tracing::warn!("exec channel 超时（{timeout:?}），命令可能仍在远端运行");
+                break;
+            }
+            match tokio::time::timeout(left, channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => stdout.extend_from_slice(&data),
+                Ok(Some(ChannelMsg::ExtendedData { data, ext: 1 })) => {
+                    stderr.extend_from_slice(&data)
+                }
+                Ok(Some(ChannelMsg::ExitStatus { exit_status })) => {
+                    exit_code = Some(exit_status as i32);
+                }
+                Ok(Some(ChannelMsg::Eof) | Some(ChannelMsg::Close)) | Ok(None) => break,
+                Ok(Some(_)) => {}
+                Err(_) => break, // 超时
+            }
+        }
+
+        let _ = channel.eof().await;
+        let _ = channel.close().await;
+
+        Ok(ExecOutput {
+            stdout: String::from_utf8_lossy(&stdout).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
+            exit_code,
+        })
     }
 }
 
@@ -170,10 +237,14 @@ impl ShellHandle {
     }
 }
 
-async fn authenticate(session: &mut Handle<ClientHandler>, host: &Host) -> Result<()> {
+async fn authenticate(
+    session: &mut Handle<ClientHandler>,
+    host: &Host,
+    resolver: Option<&dyn SecretResolver>,
+) -> Result<()> {
     match &host.auth {
         CredentialRef::Password { secret } => {
-            let pw = resolve_secret(secret, &format!("{} 的密码", host.endpoint()))?;
+            let pw = resolve_secret(resolver, secret, &format!("{} 的密码", host.endpoint()))?;
             let res = session
                 .authenticate_password(host.user.clone(), pw)
                 .await
@@ -182,7 +253,11 @@ async fn authenticate(session: &mut Handle<ClientHandler>, host: &Host) -> Resul
         }
         CredentialRef::KeyFile { path, passphrase } => {
             let pp = match passphrase {
-                Some(s) => Some(resolve_secret(s, &format!("私钥 {} 的 passphrase", path.display()))?),
+                Some(s) => Some(resolve_secret(
+                    resolver,
+                    s,
+                    &format!("私钥 {} 的 passphrase", path.display()),
+                )?),
                 None => None,
             };
             let key = load_secret_key(path, pp.as_deref())
@@ -268,25 +343,21 @@ fn ensure_success(res: AuthResult) -> Result<()> {
 
 /// 把 `SecretRef` 解析成实际的秘密值。
 ///
-/// 注意：M0 的 `Prompt` 直接从 stdin 读取，因此**不适用于 TUI raw mode 场景**。
-/// TUI 下请使用 `Env` 或无 passphrase 的私钥；带隐藏输入的提示框计划于 M1 落地。
-pub fn resolve_secret(r: &SecretRef, prompt: &str) -> Result<String> {
-    match r {
-        SecretRef::Env(name) => std::env::var(name)
-            .map_err(|_| SshError::Credential(format!("环境变量 {name} 未设置"))),
-        SecretRef::Prompt => {
-            use std::io::Write;
-            eprint!("{prompt}: ");
-            let _ = std::io::stderr().flush();
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .map_err(SshError::Io)?;
-            Ok(line.trim_end().to_string())
-        }
-        SecretRef::Keyring { .. } => Err(SshError::NotImplemented(
-            "系统钥匙串（FR-1.6）计划于 M2 落地".into(),
-        )),
+/// 有注入 resolver（钥匙串 / vault）时优先走它；否则用 `DefaultResolver`
+/// （环境变量 / stdin 提示）。注意 `Prompt` 直接从 stdin 读取，
+/// 因此**不适用于 TUI raw mode 场景**——TUI 下请用钥匙串或 `Env`。
+pub fn resolve_secret(
+    resolver: Option<&dyn SecretResolver>,
+    r: &SecretRef,
+    prompt: &str,
+) -> Result<String> {
+    match resolver {
+        Some(res) => res
+            .resolve(r, prompt)
+            .map_err(|e| SshError::Credential(e.to_string())),
+        None => sh0_core::DefaultResolver
+            .resolve(r, prompt)
+            .map_err(|e| SshError::Credential(e.to_string())),
     }
 }
 

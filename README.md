@@ -7,7 +7,9 @@
 - **原生为 AI 设计**：所有能力以结构化子命令暴露，AI Agent 通过命令行即可操作远程主机，
   并受内置风险分级引擎约束。
 
-## 当前进度：M1「终端与会话」已完成
+## 当前进度：M2「AI 接口 MVP」已完成 ★
+
+人类能用 TUI 日常运维，AI 能用 CLI 完整操作——**首个完整可交付点**。
 
 | 能力 | 说明 |
 | --- | --- |
@@ -20,10 +22,15 @@
 | resize | 窗口变化同步到远端（`window_change`），本地网格同步重建 |
 | 按键编码 | 方向键 / F1-F12 / Ctrl-Alt 组合编码，键位映射三套预设（default / vim / xshell） |
 | 文本选择与剪贴板 | 选择模式（Alt+V）方向键扩选，Enter/y 复制，OSC 52 写父终端剪贴板 |
-| AI 接口 | `ai host list`、`ai session open/close/list/status/reconnect/clear/resize`、`ai screen read`、`ai input send`、`ai ping`，默认纯文本 + `--json` |
+| AI 接口 | `ai host list/show`、`ai session open/close/list/status/reconnect`、`ai exec run`、`ai screen read`、`ai input send`、`ai log query`、`ai ping`，默认纯文本 + `--json`，12 类语义化退出码 |
+| 命令执行 | 双模式：`shell`（默认，复用交互 shell + 哨兵截取）/ `exec`（独立通道，stdout/stderr 分离）；一键式 `--host X --cmd Y` 自动建连→执行→关闭 |
+| 风险引擎 | 三档 `auto / confirm / deny`：shell 词法切分 + 分段判定 + 内置规则集 + 用户 `risk.toml` + 主机 `risk_cap`；默认档是 `confirm`（宁拦勿放） |
+| 确认机制 | 有人值守：TUI 弹确认框（y / n）；无人值守：返回 `needs_confirmation` + 一次性令牌，带令牌二次调用闭环 |
+| 审计 | SQLite 单文件，脱敏后落库（口令 / token / 私钥 / AKIA），输出可归档，默认保留 30 天 / 512 MB |
+| 凭据 | OS 钥匙串优先（Keychain / 凭据管理器 / Secret Service），回落主密码 vault（Argon2id + ChaCha20-Poly1305）；配置与数据目录**无明文** |
 
-尚未实现（后续里程碑）：命令执行与风险分级引擎（M2）、批量与广播（M3）、SFTP（M4）、
-主题与键位自定义、导入导出（M5）。
+尚未实现（后续里程碑）：批量与广播（M3）、SFTP 文件管理（M4）、主题与键位自定义、
+导入导出、`keyboard-interactive` / 2FA（M5）。
 
 ## 快速开始
 
@@ -41,6 +48,19 @@ sh0 ai session list --json        # 列出活跃会话（含 state 与 last_erro
 sh0 ai screen read --session <id> --json
 sh0 ai input send --session <id> --data "uptime" --enter --json
 sh0 ai ping --json                # 检查 daemon 连通性
+
+# 命令执行：一键式（自动建连→执行→关闭），返回 stdout/stderr/exit_code/duration_ms
+sh0 ai exec run --host web-01 --cmd "uname -a" --timeout 10 --json
+sh0 ai exec run --host web-01 --cmd "df -h /" --mode exec --json   # 独立通道，流分离
+
+# 风险三档：deny 直接拦；confirm 无人值守返回 needs_confirmation + 令牌
+sh0 ai exec run --host web-01 --cmd "rm -rf /" --json              # 退出码 2，一律拒绝
+TOKEN=$(sh0 ai exec run --host web-01 --cmd "systemctl restart nginx" --json \
+        | jq -r .data.confirm_token)
+sh0 ai exec run --host web-01 --cmd "systemctl restart nginx" --confirm-token "$TOKEN" --json
+
+sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json  # 审计回溯
+sh0 secret set --service sh0 --account web-01 --stdin <<< "$PW"       # 存凭据（无明文）
 
 sh0 daemon stop                   # 优雅停止后台 daemon
 ```
@@ -81,7 +101,7 @@ key_file = { path = "/home/u/.ssh/id_ed25519" }    # 无 passphrase
 # key_file = { path = "/home/u/.ssh/id_rsa", passphrase = { env = "SH0_KEY_PW" } }
 # password  = { secret = { env = "SH0_PW" } }      # 从环境变量取
 # password  = { secret = "prompt" }                # 运行时询问（不适用 TUI raw mode）
-# password  = { secret = { keyring = { service = "sh0", account = "web-01" } } }  # M2 支持
+# password  = { secret = { keyring = { service = "sh0", account = "web-01" } } }  # 钥匙串（推荐）
 ```
 
 **凭据不落明文**：配置文件只存「去哪里取」（`agent` / `key_file` / `env` / `prompt` / `keyring`），
@@ -95,14 +115,14 @@ key_file = { path = "/home/u/.ssh/id_ed25519" }    # 无 passphrase
 
 ```
 crates/
-├── sh0-core/    领域模型：Host / Credential / SessionState / RiskLevel
+├── sh0-core/    领域模型：Host / Credential / SessionState / RiskLevel / 风险引擎 / SecretResolver
 ├── sh0-ssh/     russh 封装（唯一接触 SSH 协议的地方）
 ├── sh0-term/    终端仿真：vte 解析 + 网格 + 滚动缓冲 + 按键编码
-├── sh0-store/   TOML 配置与平台路径（SQLite 审计在 M2）
-├── sh0-ipc/     本机 IPC 协议与传输
-├── sh0-ai/      `sh0 ai` 子命令层
-├── sh0-tui/     ratatui 前端
-└── sh0-cli/     二进制入口与 daemon
+├── sh0-store/   TOML 配置 + SQLite 审计 + 凭据（钥匙串 / vault）+ 平台路径
+├── sh0-ipc/     本机 IPC 协议与传输（loopback TCP + 令牌）
+├── sh0-ai/      `sh0 ai` 子命令层（双渲染器 + 退出码映射）
+├── sh0-tui/     ratatui 前端（含风险确认弹窗）
+└── sh0-cli/     二进制入口、daemon、exec 编排（哨兵截取 / 确认 / 审计 / 限速）
 docs/
 ├── requirements.md        需求说明书
 ├── architecture.md        架构设计与 AI 接口契约
@@ -135,13 +155,15 @@ docs/
 选择模式内：方向键或 hjkl 扩选，Enter / y 复制，p 粘贴回会话，Esc 取消。
 键位可在 `config.toml` 里改，`keymap = "vim"` / `"xshell"` 切换预设。
 
-## 已知限制（M1）
+## 已知限制（M2）
 
 - 复制走 OSC 52，需要父终端支持（Windows Terminal / iTerm2 / kitty / Alacritty 均支持）；
   不支持时内容仍会留在 `sh0` 内部，可用 `p` 粘回会话
-- `keyboard-interactive` / 2FA 与系统钥匙串未实现（M2）
-- TUI raw mode 下无法交互式输入口令，请使用 `agent` 或 `env`
+- `keyboard-interactive` / 2FA 交互应答未实现（M5）
+- TUI raw mode 下无法交互式输入口令，请使用 `agent` / `env`，或 `sh0 secret set` 预存
 - 私钥路径不支持 `~` 展开，请写绝对路径
-- 审计日志与输出归档未落盘（M2 的 SQLite）
-- 尚未在真实 SSH 服务端做过端到端验证（开发机上没有可用 SSH 服务），
-  终端仿真与重连是用 mock 传输层 + 23 条 golden 用例覆盖的
+- 尚未在真实 SSH 服务端做过端到端验证（开发机上没有可用 SSH 服务）。
+  终端仿真靠 23 条 golden 用例、重连与 exec 哨兵截取靠 mock 传输层 + 11 条契约测试覆盖；
+  真机的 PS1 形态、`clear` 刷屏、回显折行等边界待实测
+- `exec` 的 shell 模式依赖哨兵回显判断命令结束：远端改写 `PS1` 或命令本身回显特殊字符时
+  可能退化为部分输出（此时 `timeout=true`、退出码为 `null`），可切 `--mode exec` 规避

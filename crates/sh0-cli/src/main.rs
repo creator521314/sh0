@@ -1,8 +1,5 @@
 //! sh0 入口：命令路由与 daemon 生命周期。
-
-mod cli;
-mod daemon;
-mod ensure;
+//! 业务逻辑在 lib 目标（`sh0::daemon` 等），这里只做命令行粘合。
 
 use std::sync::Arc;
 
@@ -10,7 +7,8 @@ use clap::Parser;
 use sh0_ai::AiObject;
 use sh0_store::Store;
 
-use cli::{Cmd, Cli, ConfigCmd, DaemonCmd, HostCmd};
+use sh0::cli::{Cmd, Cli, ConfigCmd, DaemonCmd, HostCmd, SecretCmd};
+use sh0::daemon;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
                 daemon::run_foreground(store, cfg, background).await?
             }
             DaemonCmd::Stop => {
-                if ensure::stop_daemon(store.paths()).await? {
+                if sh0::ensure::stop_daemon(store.paths()).await? {
                     println!("daemon 已停止");
                 } else {
                     println!("daemon 未在运行");
@@ -52,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
             let log = store.paths().daemon_log();
             let (conn, _info) =
-                ensure::connect_or_start(store.paths(), Some(&log)).await?;
+                sh0::ensure::connect_or_start(store.paths(), Some(&log)).await?;
             sh0_tui::run(conn.client, conn.events, store, cfg, selector.as_deref()).await?;
         }
 
@@ -61,12 +59,18 @@ async fn main() -> anyhow::Result<()> {
             json,
             trace_id,
             timeout,
+            yes,
+            dry_run,
+            quiet,
         } => {
             let args = sh0_ai::AiArgs {
                 object,
                 json,
                 trace_id,
                 timeout,
+                yes,
+                dry_run,
+                quiet,
             };
 
             // host 类子命令只读配置文件，不必拉起 daemon
@@ -74,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             let client = if needs_daemon {
                 let log = store.paths().daemon_log();
                 Some(
-                    ensure::connect_or_start(store.paths(), Some(&log))
+                    sh0::ensure::connect_or_start(store.paths(), Some(&log))
                         .await?
                         .0
                         .client,
@@ -113,6 +117,60 @@ async fn main() -> anyhow::Result<()> {
                 println!("data_dir    : {}", p.data_dir.display());
                 println!("runtime_dir : {}", p.runtime_dir.display());
                 println!("hosts_file  : {}", p.hosts_file().display());
+                println!("audit_db    : {}", p.audit_db().display());
+            }
+        },
+
+        Cmd::Secret { cmd } => match cmd {
+            SecretCmd::Set { service, account, stdin } => {
+                let paths = store.paths().clone();
+                let value = if stdin {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim_end_matches(['\n', '\r']).to_string()
+                } else {
+                    // 交互读取（无回显做不到就退而求其次——提示说清楚）
+                    eprint!("{service}/{account} 的值: ");
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim_end_matches(['\n', '\r']).to_string()
+                };
+                if value.is_empty() {
+                    anyhow::bail!("值为空，已取消");
+                }
+                let creds = sh0_store::CredentialStore::open(&paths)?;
+                creds.set(&service, &account, &value)?;
+                println!("已存入 {service}/{account}（后端: {}）", creds.backend());
+            }
+            SecretCmd::Get { service, account } => {
+                let paths = store.paths().clone();
+                let creds = sh0_store::CredentialStore::open(&paths)?;
+                match creds.get(&service, &account)? {
+                    Some(v) => println!("{v}"),
+                    None => println!("（无此条目）"),
+                }
+            }
+            SecretCmd::List => {
+                let paths = store.paths().clone();
+                let creds = sh0_store::CredentialStore::open(&paths)?;
+                let entries = creds.list();
+                if entries.is_empty() {
+                    println!("（vault 为空；钥匙串条目不在此列举）");
+                }
+                for e in entries {
+                    println!("{e}");
+                }
+            }
+            SecretCmd::Rm { service, account } => {
+                let paths = store.paths().clone();
+                let creds = sh0_store::CredentialStore::open(&paths)?;
+                if creds.delete(&service, &account)? {
+                    println!("已删除 {service}/{account}");
+                } else {
+                    println!("（无此条目）");
+                }
             }
         },
     }

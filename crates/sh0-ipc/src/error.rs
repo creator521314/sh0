@@ -11,7 +11,12 @@ pub enum IpcError {
     Unauthorized(String),
 
     #[error("daemon 返回错误 [{code}]: {message}")]
-    Remote { code: String, message: String },
+    Remote {
+        code: String,
+        message: String,
+        /// 失败但仍携带的交付数据（确认令牌、部分输出等）
+        data: Option<serde_json::Value>,
+    },
 
     #[error("协议错误: {0}")]
     Protocol(String),

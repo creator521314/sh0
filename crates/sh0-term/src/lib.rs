@@ -22,5 +22,5 @@ pub use cell::{Cell, Color, Line};
 pub use grid::Grid;
 pub use keymap::Keymap;
 pub use keys::encode_key;
-pub use screen::{Screen, ScreenOptions};
+pub use screen::{GridView, Screen, ScreenOptions};
 pub use scrollback::MemoryBudget;

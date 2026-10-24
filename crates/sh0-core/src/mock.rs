@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::transport::{
-    SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
+    ExecOutput, SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
 };
 use crate::Host;
 
@@ -109,7 +109,10 @@ pub struct MockFactory {
     scripts: Arc<Mutex<VecDeque<Vec<TransportEvent>>>>,
     fail_times: Arc<Mutex<u32>>,
     disconnect_times: Arc<Mutex<u32>>,
+    /// exec channel 的脚本化返回（按调用顺序取，空了重复最后一个）
+    exec_outputs: Arc<Mutex<VecDeque<ExecOutput>>>,
     pub connect_calls: Arc<Mutex<u32>>,
+    pub exec_calls: Arc<Mutex<u32>>,
 }
 
 impl MockFactory {
@@ -118,7 +121,9 @@ impl MockFactory {
             scripts: Arc::new(Mutex::new(VecDeque::from(scripts))),
             fail_times: Arc::new(Mutex::new(fail_times)),
             disconnect_times: Arc::new(Mutex::new(disconnect_times)),
+            exec_outputs: Arc::new(Mutex::new(VecDeque::new())),
             connect_calls: Arc::new(Mutex::new(0)),
+            exec_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -141,8 +146,18 @@ impl MockFactory {
         Self::new(scripts, fail_times, disconnect_times)
     }
 
+    /// 配置 exec channel 的返回脚本（W2.4 备选路径）
+    pub fn with_exec(self, outputs: Vec<ExecOutput>) -> Self {
+        *self.exec_outputs.lock().unwrap() = VecDeque::from(outputs);
+        self
+    }
+
     pub fn calls(&self) -> u32 {
         *self.connect_calls.lock().unwrap()
+    }
+
+    pub fn exec_calls(&self) -> u32 {
+        *self.exec_calls.lock().unwrap()
     }
 }
 
@@ -183,5 +198,18 @@ impl TransportFactory for MockFactory {
         drop(disc);
 
         Ok(MockTransport::new(script, on_empty).boxed())
+    }
+
+    async fn exec(&self, _host: &Host, _cmd: &str, _timeout: std::time::Duration) -> TransportResult<ExecOutput> {
+        *self.exec_calls.lock().unwrap() += 1;
+        let mut outs = self.exec_outputs.lock().unwrap();
+        let out = match outs.pop_front() {
+            Some(o) => {
+                outs.push_back(o.clone());
+                o
+            }
+            None => ExecOutput::default(),
+        };
+        Ok(out)
     }
 }

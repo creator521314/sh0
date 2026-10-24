@@ -57,6 +57,16 @@ impl Paths {
         self.runtime_dir.join("daemon.log")
     }
 
+    /// 审计库（SQLite 单文件，需求 FR-9.2：与配置同目录 → 放 data_dir）
+    pub fn audit_db(&self) -> PathBuf {
+        self.data_dir.join("audit.db")
+    }
+
+    /// 凭据加密 vault（钥匙串不可用时的回落，需求 FR-1.6 / FR-1.7）
+    pub fn vault_file(&self) -> PathBuf {
+        self.data_dir.join("creds.vault")
+    }
+
     /// 目录不存在时创建（幂等）
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;

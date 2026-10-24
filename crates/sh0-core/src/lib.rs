@@ -6,6 +6,8 @@
 pub mod error;
 pub mod ids;
 pub mod model;
+pub mod risk;
+pub mod secret;
 pub mod session;
 pub mod transport;
 
@@ -15,9 +17,11 @@ pub mod mock;
 pub use error::{CoreError, Result};
 pub use ids::{HostId, SessionId, new_host_id, new_session_id};
 pub use model::{CredentialRef, Host, RiskLevel, SecretRef, SessionSnapshot, SessionState};
+pub use risk::{Assessment, RiskEngine, Rule};
+pub use secret::{DefaultResolver, SecretResolver};
 pub use session::{
     ReconnectPolicy, SessionConfig, SessionEvent, SessionHandle, spawn_session,
 };
 pub use transport::{
-    SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
+    ExecOutput, SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
 };

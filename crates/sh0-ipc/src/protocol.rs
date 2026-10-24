@@ -50,6 +50,11 @@ pub struct ErrorBody {
     /// 机器可读的错误码，与 `sh0 ai` 退出码表一一对应（见架构文档 §6.3）
     pub code: String,
     pub message: String,
+    /// "失败了但仍有东西要交付"时挂在这里（架构文档 §6.3）：
+    /// needs_confirmation 带确认令牌，remote_nonzero / timeout 带部分输出。
+    /// AI 侧必须能拿到——否则确认流永远闭环不了。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl ServerMsg {
@@ -70,6 +75,26 @@ impl ServerMsg {
             error: Some(ErrorBody {
                 code: code.into(),
                 message: message.into(),
+                data: None,
+            }),
+        }
+    }
+
+    /// 带数据的错误应答：调用方失败了，但 data 里有关键交付物
+    pub fn err_with_data(
+        id: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        ServerMsg::Response {
+            id,
+            ok: false,
+            data: None,
+            error: Some(ErrorBody {
+                code: code.into(),
+                message: message.into(),
+                data: Some(data),
             }),
         }
     }
@@ -106,6 +131,12 @@ pub mod methods {
     pub const SCREEN_READ: &str = "screen.read";
     pub const INPUT_SEND: &str = "input.send";
     pub const RESIZE: &str = "session.resize";
+    /// M2：命令执行（shell 哨兵 / exec channel 双模式）
+    pub const EXEC_RUN: &str = "exec.run";
+    /// M2：有人值守的确认应答（TUI 弹窗批准/拒绝）
+    pub const EXEC_CONFIRM: &str = "exec.confirm";
+    /// M2：审计查询
+    pub const LOG_QUERY: &str = "log.query";
 }
 
 /// 事件名常量
@@ -116,4 +147,9 @@ pub mod events {
     pub const RECONNECTED: &str = "reconnected";
     /// 会话结束，携带 reason
     pub const CLOSED: &str = "closed";
+    /// M2：有命令进入 confirm 档等待确认（TUI 弹窗用）。
+    /// data: { token, session, host, command, risk, reason }
+    pub const CONFIRM_REQUESTED: &str = "confirm.requested";
+    /// M2：确认已处理。data: { token, approved, summary, audit_id }
+    pub const CONFIRM_RESOLVED: &str = "confirm.resolved";
 }

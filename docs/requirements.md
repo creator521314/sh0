@@ -85,6 +85,9 @@
 
 ### FR-1 主机与凭据管理
 
+> **M2 进度**：FR-1.5 ~ FR-1.7 已实现（凭据与主机解耦、钥匙串优先 + 主密码 vault 回落、
+> 配置无明文 + 私钥只存路径）；FR-1.4 的 `keyboard-interactive` / 2FA 交互应答仍待 M5。
+
 | 编号 | 需求 | 优先级 |
 | --- | --- | --- |
 | FR-1.1 | 主机配置字段：`id / 名称 / 分组 / 地址 / 端口 / 用户名 / 认证引用 / 标签 / 备注 / 跳板机 / 启动时自动连接` | P0 |
@@ -156,6 +159,10 @@
 
 ### FR-6 AI 接口（核心差异化）
 
+> **M2 已实现**：FR-6.1 ~ FR-6.5、FR-6.7 ~ FR-6.11（file 系列 FR-6.6 属 M4；MCP adapter FR-6.12 属 P2）。
+> `sh0 ai` 全套子命令 + 双渲染器 + 12 类退出码；`exec run` 支持一键式（自动建连→执行→关闭）
+> 与双模式（shell 哨兵 / exec channel）；`log query` 支持按时间/主机/actor/风险过滤。
+
 | 编号 | 需求 | 优先级 |
 | --- | --- | --- |
 | FR-6.1 | 所有能力以**子命令**形式暴露：`sh0 ai <对象> <动作> [选项]` | P0 |
@@ -173,6 +180,10 @@
 
 ### FR-7 权限与风险分级
 
+> **M2 已实现**：FR-7.1 ~ FR-7.7 全部。判定链路为「全局 deny 正则 → 分段 deny → 用户规则 →
+> confirm → auto 白名单 → 默认档（Confirm，宁拦勿放）」，支持 `sudo/env/timeout` 包装剥离与
+> 主机 `risk_cap` 压制；用户可在 `risk.toml` 增删规则；单 actor 每分钟调用数可限。
+
 | 编号 | 需求 | 优先级 |
 | --- | --- | --- |
 | FR-7.1 | 三档风险分级引擎：`auto`（自动执行）/ `confirm`（需确认）/ `deny`（直接拒绝） | P0 |
@@ -184,6 +195,10 @@
 | FR-7.7 | 速率限制：单 actor 每分钟命令数上限，防止 AI 失控 | P1 |
 
 ### FR-8 日志与审计
+
+> **M2 已实现**：FR-8.1 ~ FR-8.5 全部。SQLite 单文件（`data_dir/audit.db`），写入前脱敏
+> （password / token / Bearer / PEM 私钥 / AKIA / `-p<值>`），默认开启输出归档、保留 30 天、
+> 体积上限 512 MB（超限删最旧并 VACUUM）；`sh0 ai log query` 为查询接口（TUI 检索面板属 M5）。
 
 | 编号 | 需求 | 优先级 |
 | --- | --- | --- |
@@ -250,9 +265,9 @@
 
 | 里程碑 | 目标 | 交付物 |
 | --- | --- | --- |
-| M0 | 骨架与连通 | Cargo workspace、daemon 进程、russh 建连 + 密码/密钥认证、最小 TUI 显示裸输出 |
-| M1 | 终端与会话 | xterm 仿真网格 + 滚动缓冲、标签页、主机树、resize、断线重连 |
-| M2 | AI 接口 MVP | `ai` 子命令全套（session/exec/screen/input/log）、`--json` 输出、风险三档引擎、审计入库 |
+| M0 | 骨架与连通 ✅ | Cargo workspace、daemon 进程、russh 建连 + 密码/密钥认证、最小 TUI 显示裸输出 |
+| M1 | 终端与会话 ✅ | xterm 仿真网格 + 滚动缓冲、标签页、主机树、resize、断线重连 |
+| M2 | AI 接口 MVP ✅ | `ai` 子命令全套（session/exec/screen/input/log）、`--json` 输出、风险三档引擎、审计入库、凭据无明文 |
 | M3 | 批量与广播 | 广播输入、批量执行与结果汇总视图 |
 | M4 | SFTP 落地 | 双栏文件管理、传输队列、进度与重试 |
 | M5 | 打磨 | 主题/键位配置、命令面板、导入导出、性能与体积优化、跨平台 CI 产物 |
@@ -266,11 +281,11 @@
 | AC-1 | 单二进制在纯净 Linux/Windows 机器上可直接运行，无需安装任何依赖 |
 | AC-2 | TUI 中同时打开 20 个会话，切换无卡顿，内存 ≤ 120 MB |
 | AC-3 | 手动断开网络 10 秒后恢复，会话自动重连且历史输出可见 |
-| AC-4 | `sh0 ai exec --host X --cmd "uname -a" --json` 返回合法 JSON，含 stdout/stderr/exit_code/duration |
-| AC-5 | 对 `rm -rf /` 类命令，无论 actor 是谁一律 `deny`，且审计日志留痕 |
-| AC-6 | `confirm` 档命令在无人值守模式返回 `needs_confirmation` + 令牌，二次调用带令牌可通过 |
-| AC-7 | 配置文件中 grep 不到任何明文密码 |
-| AC-8 | AI 与 TUI 操作同一批会话，双方动作都出现在同一份审计日志中 |
+| AC-4 ✅ | `sh0 ai exec --host X --cmd "uname -a" --json` 返回合法 JSON，含 stdout/stderr/exit_code/duration |
+| AC-5 ✅ | 对 `rm -rf /` 类命令，无论 actor 是谁一律 `deny`，且审计日志留痕 |
+| AC-6 ✅ | `confirm` 档命令在无人值守模式返回 `needs_confirmation` + 令牌，二次调用带令牌可通过 |
+| AC-7 ✅ | 配置文件中 grep 不到任何明文密码 |
+| AC-8 ✅ | AI 与 TUI 操作同一批会话，双方动作都出现在同一份审计日志中 |
 | AC-9 | 中文/emoji 在远端输出中正确显示且光标位置不错乱 |
 
 ---

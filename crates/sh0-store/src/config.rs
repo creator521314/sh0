@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use sh0_core::RiskLevel;
+
 use crate::error::{Result, StoreError};
 use crate::paths::Paths;
 
@@ -41,6 +43,15 @@ pub struct AppConfig {
     /// 断线重连行为（需求 FR-2.5 / FR-2.6）
     #[serde(default)]
     pub reconnect: ReconnectConfig,
+    /// 审计与日志（需求 FR-8）
+    #[serde(default)]
+    pub audit: AuditConfig,
+    /// AI 接口的保护参数（需求 FR-6.11 / FR-7.7）
+    #[serde(default)]
+    pub limits: LimitsConfig,
+    /// 风险引擎（需求 FR-7.5）
+    #[serde(default)]
+    pub risk: RiskConfig,
 }
 
 /// 重连策略的可持久化形式
@@ -112,6 +123,106 @@ impl Default for ReconnectConfig {
     }
 }
 
+/// 审计配置（需求 FR-8.1~FR-8.4）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// 总开关。关闭后不写库、不归档，但 daemon 仍会输出 tracing 日志
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+    /// 命令输出归档（FR-8.2，默认开）
+    #[serde(default = "default_archive_output")]
+    pub archive_output: bool,
+    /// 保留天数（FR-8.5 的策略化下限，默认 30 天）
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+    /// 审计库体积上限（MB）。超出后从最旧记录开始淘汰
+    #[serde(default = "default_max_db_mb")]
+    pub max_db_mb: u32,
+}
+
+/// AI 接口保护参数（需求 FR-6.11 / FR-7.7）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    /// 单次 exec 的 stdout+stderr 输出上限（字节，默认 64KB）。
+    /// 超出即截断并置 `truncated` 标记——AI 读不到被截断的尾部，
+    /// 因此这个值要能覆盖常见巡检命令的输出。
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// exec 默认超时（秒），可被 --timeout 覆盖（上限 3600）
+    #[serde(default = "default_exec_timeout")]
+    pub exec_timeout_secs: u64,
+    /// 单 actor 每分钟 exec 次数上限，0 = 关闭（FR-7.7）
+    #[serde(default)]
+    pub rate_limit_per_min: u32,
+}
+
+/// 风险引擎配置（需求 FR-7.5）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskConfig {
+    /// 用户规则文件，相对 config_dir
+    #[serde(default = "default_rules_file")]
+    pub rules_file: String,
+    /// 未命中任何规则时的默认档位。
+    /// 默认 `confirm`：宁可多问一次，不可放过一条（FR-7 的安全取向）
+    #[serde(default = "default_unmatched")]
+    pub unmatched: RiskLevel,
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+fn default_archive_output() -> bool {
+    true
+}
+fn default_retention_days() -> u32 {
+    30
+}
+fn default_max_db_mb() -> u32 {
+    512
+}
+fn default_max_output_bytes() -> usize {
+    64 * 1024
+}
+fn default_exec_timeout() -> u64 {
+    30
+}
+fn default_rules_file() -> String {
+    "risk.toml".to_string()
+}
+fn default_unmatched() -> RiskLevel {
+    RiskLevel::Confirm
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            archive_output: default_archive_output(),
+            retention_days: default_retention_days(),
+            max_db_mb: default_max_db_mb(),
+        }
+    }
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: default_max_output_bytes(),
+            exec_timeout_secs: default_exec_timeout(),
+            rate_limit_per_min: 0,
+        }
+    }
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            rules_file: default_rules_file(),
+            unmatched: default_unmatched(),
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -125,6 +236,9 @@ impl Default for AppConfig {
             keymap: default_keymap(),
             keys: HashMap::new(),
             reconnect: ReconnectConfig::default(),
+            audit: AuditConfig::default(),
+            limits: LimitsConfig::default(),
+            risk: RiskConfig::default(),
         }
     }
 }
@@ -222,5 +336,31 @@ impl Store {
             },
             None => Err(sh0_core::CoreError::HostNotFound(selector.to_string())),
         }
+    }
+
+    /// 用户风险规则文件路径（FR-7.5）。`rules_file` 来自 `cfg.risk.rules_file`
+    pub fn risk_rules_path(&self, rules_file: &str) -> std::path::PathBuf {
+        self.paths.config_dir.join(rules_file)
+    }
+
+    /// 读取用户风险规则。文件不存在 = 没有自定义规则（不是错误）；
+    /// 文件存在但解析失败 = 错误（静默忽略规则等于悄悄放宽风险）。
+    pub fn load_risk_rules(&self, rules_file: &str) -> Result<Vec<sh0_core::Rule>> {
+        let path = self.risk_rules_path(rules_file);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        #[derive(Deserialize)]
+        struct RulesFile {
+            #[serde(default)]
+            rule: Vec<sh0_core::Rule>,
+        }
+        toml::from_str::<RulesFile>(&raw)
+            .map(|f| f.rule)
+            .map_err(|e| StoreError::Parse {
+                path,
+                source: e,
+            })
     }
 }

@@ -269,6 +269,7 @@ impl HostForm {
             auth,
             tags: vec![],
             note: None,
+        risk_cap: None,
         })
     }
 }

@@ -118,9 +118,11 @@ impl IpcClient {
                                     }
                             }
                             Ok(evt @ ServerMsg::Event { .. }) => {
-                                if ev_tx.send(evt).is_err() {
-                                    break;
-                                }
+                                // 事件是**可选**流：一次性客户端（`sh0 ai`、脚本）不订阅，
+                                // 通道早已随 receiver 一起丢弃。此时只能丢弃事件继续读——
+                                // 一旦在此 break，读任务退出，后续所有应答再无人分发，
+                                // 调用方就会永久挂起（M2 契约测试就是这么挂的）。
+                                let _ = ev_tx.send(evt);
                             }
                             Err(e) => {
                                 tracing::warn!("收到无法解析的帧: {e}");
@@ -188,6 +190,7 @@ impl IpcClient {
             } => Err(IpcError::Remote {
                 code: e.code,
                 message: e.message,
+                data: e.data,
             }),
             _ => Err(IpcError::Protocol("unexpected frame".to_string())),
         }
@@ -295,9 +298,13 @@ where
                     let _ = out_tx.send(s);
                     continue;
                 }
+                tracing::debug!("收到请求 id={id} method={method}");
                 let resp = match handler.call(&method, params, &hub).await {
                     Ok(data) => ServerMsg::ok(id, data),
-                    Err(e) => ServerMsg::err(id, e.code, e.message),
+                    Err(e) => match e.data {
+                        Some(d) => ServerMsg::err_with_data(id, e.code, e.message, d),
+                        None => ServerMsg::err(id, e.code, e.message),
+                    },
                 };
                 match serde_json::to_string(&resp) {
                     Ok(mut s) => {
@@ -305,6 +312,7 @@ where
                         if out_tx.send(s).is_err() {
                             return Err(IpcError::Disconnected);
                         }
+                        tracing::debug!("已应答 id={id} method={method}");
                     }
                     Err(e) => tracing::warn!("应答序列化失败: {e}"),
                 }

@@ -434,7 +434,7 @@ Filesystem      Size  Used Avail Use% Mounted on
 }
 ```
 
-失败：
+失败（`data` 与成功信封同级——AI 的解析路径只有一个，不必按 `ok` 分叉）：
 
 ```json
 {
@@ -442,13 +442,13 @@ Filesystem      Size  Used Avail Use% Mounted on
   "trace_id": "ai-7f3c",
   "error": {
     "code": "risk_denied",
-    "message": "命令命中禁止规则: recursive delete on /",
-    "detail": { "rule": "deny-rm-root", "risk": "deny" }
-  }
+    "message": "命令命中禁止规则: recursive delete on /"
+  },
+  "data": { "risk": "deny", "reason": "recursive delete on /" }
 }
 ```
 
-需确认：
+需确认（令牌必须随错误返回：`sh0 ai` 是一次性进程，收不到广播事件）：
 
 ```json
 {
@@ -456,17 +456,21 @@ Filesystem      Size  Used Avail Use% Mounted on
   "trace_id": "ai-7f3c",
   "error": {
     "code": "needs_confirmation",
-    "message": "命令需确认后执行",
-    "detail": {
-      "token": "cf_01J...",
-      "expires_in_sec": 300,
-      "risk": "confirm",
-      "command": "systemctl restart nginx",
-      "retry": "sh0 ai exec run --session S --cmd '...' --confirm-token cf_01J..."
-    }
+    "message": "命令需确认后执行: 服务重启类操作"
+  },
+  "data": {
+    "confirm_token": "cf_01J...",
+    "expires_in_secs": 300,
+    "host": "web-01",
+    "command": "systemctl restart nginx",
+    "risk": "confirm",
+    "retry": "sh0 ai exec run --host web-01 --cmd 'systemctl restart nginx' --confirm-token cf_01J..."
   }
 }
 ```
+
+> `remote_nonzero`（退出码 1）与 `timeout`（退出码 4）是**带数据的失败**：
+> 命令确实跑了、输出也在 `data` 里，AI 必须能读到半截输出再决定下一步。
 
 `screen read --mode grid` 返回二维数组：
 
@@ -493,7 +497,48 @@ Filesystem      Size  Used Avail Use% Mounted on
 | 11 | `invalid_args` | 参数错误 | 修正参数 |
 | 12 | `internal` | 内部错误（附 trace_id） | 上报 |
 
-### 6.4 AI 使用的推荐范式
+### 6.4 exec 双模式
+
+`exec run` 有两种跑法，AI 按场景选（`--mode shell | exec`，默认 `shell`）：
+
+| 模式 | 机制 | 优点 | 代价 |
+| --- | --- | --- | --- |
+| `shell`（默认） | 复用交互 shell：发 `cmd\necho SH0_<ulid>:$?`，轮询屏幕直到哨兵输出行出现 | 拿得到交互上下文（`cd`、环境变量、`sudo` 会话）；不额外建连 | 依赖回显形态，`clear` / 改写 PS1 时可能退化为部分输出 |
+| `exec` | 新开一条 SSH exec channel：`channel.exec(true, cmd)` | stdout / stderr 天然分离、退出码精确 | 独立通道，拿不到交互上下文；每条命令一次建连 |
+
+**哨兵截取的四条启发式**（`crates/sh0-cli/src/exec.rs::extract_output`，纯函数、有单测）：
+
+1. 哨兵行 = 去空白后**整行恰为** `SENTINEL:<整数>`（从后往前找第一行）。不能用 `contains`——
+   `echo SH0_x:$?` 的**回显行**也含哨兵 id，会在命令还没跑完时误判结束；
+2. 输出起点 = 从屏底样之后起，第一行包含命令前 40 字符（容忍折行）的**下一行**；
+3. 哨兵行前一行若含哨兵 id（echo 命令的回显），剥掉；
+4. 超时（`timeout_ms` 到点）返回 `Partial`：退出码为 `null`、`timeout: true`，
+   AI 必须能看到"命令跑了一半"这件事。
+
+`timeout` 字段恒出现在 JSON 里（即便为 `false`）——AI 判读输出完整性只看这一个字段，
+让它时有时无等于逼调用方多写一个分支。
+
+### 6.5 确认流程（有人值守 / 无人值守）
+
+```
+AI: exec run（confirm 档，无令牌、无 --yes）
+      │
+      ├─ 签发一次性令牌 cf_<ulid>（TTL 5 分钟）存入待确认表
+      ├─ 广播 confirm.requested 事件 ──► TUI 弹模态框（y 批准 / 其它键拒绝）
+      │                                   └─ 批准：TUI 调 exec.confirm(token)
+      └─ 返回 needs_confirmation + 令牌（无人值守时 AI 走这条路）
+             │
+             └─ AI 二次调用 exec run --confirm-token <token>
+                   ├─ 令牌取出即消费（防重放），校验 session/命令匹配
+                   ├─ 执行 + 广播 confirm.resolved
+                   └─ 审计记 decision=confirmed（区别于直接放行的 executed）
+```
+
+- `--yes` 等价人工批准，但**对 `deny` 档无效**（AC-5：一律拦截）。
+- `--dry-run` 只回风险判定，不执行、不建连。
+- 审计流水成对出现：`needs_confirmation` → `confirmed`（或 `failed`）。
+
+### 6.6 AI 使用的推荐范式
 
 ```bash
 # 1. 先看有哪些机器
@@ -582,45 +627,50 @@ max_level = "confirm"      # 生产环境不自动放行 confirm
 
 ```
 <config_dir>/sh0/
-├── config.toml          # 全局偏好：主题、键位、缓冲、并发、超时
+├── config.toml          # 全局偏好：主题、键位、缓冲、并发、超时、审计与限速
 ├── hosts.toml           # 主机与分组（无明文密钥）
-├── risk.toml            # 风险规则
-├── credentials.enc      # 主密码加密的凭据（钥匙串不可用时的回落）
+├── risk.toml            # 风险规则（用户自定义，覆盖内置默认值）
 ├── known_hosts          # OpenSSH 兼容格式
-├── sh0.db               # SQLite：审计、历史输出、批量结果
-└── sh0.sock / pipe      # 运行时 IPC 端点 + token
+<data_dir>/sh0/
+├── creds.vault          # 主密码加密的凭据（钥匙串不可用时的回落）
+├── audit.db             # SQLite：审计与输出归档
+└── run/daemon.json      # 运行时 IPC 端点 + token（daemon 存活时才存在）
 ```
 
-### 8.2 SQLite 表（摘要）
+### 8.2 SQLite 表（M2 实现）
+
+审计与输出归档合在一张表里（命令输出是短文本，分表只增加 join 成本）：
 
 ```sql
 CREATE TABLE audit (
-  id INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
-  session_id TEXT, host_id TEXT, actor TEXT NOT NULL,
-  action TEXT NOT NULL, raw TEXT, risk TEXT, decision TEXT,
-  exit_code INTEGER, duration_ms INTEGER, trace_id TEXT
+  id INTEGER PRIMARY KEY, ts TEXT NOT NULL,           -- RFC3339，便于直接读
+  trace_id TEXT, session_id TEXT, host_name TEXT,
+  actor TEXT NOT NULL, action TEXT NOT NULL,          -- exec.run / exec.confirm / session.open ...
+  command TEXT, risk TEXT, decision TEXT,             -- auto|confirm|deny / executed|confirmed|denied|needs_confirmation|timeout|failed
+  exit_code INTEGER, duration_ms INTEGER, truncated INTEGER,
+  error TEXT, stdout TEXT, stderr TEXT                -- 归档（可关）
 );
 CREATE INDEX idx_audit_ts ON audit(ts);
-CREATE INDEX idx_audit_host ON audit(host_id, ts);
-
-CREATE TABLE output_archive (
-  id INTEGER PRIMARY KEY, audit_id INTEGER REFERENCES audit(id),
-  seq INTEGER, stream TEXT, chunk BLOB
-);
-
-CREATE TABLE batch_run (
-  id INTEGER PRIMARY KEY, ts INTEGER, cmd TEXT,
-  host_count INTEGER, ok_count INTEGER, fail_count INTEGER
-);
+CREATE INDEX idx_audit_host ON audit(host_name, ts);
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);       -- schema 版本等
 ```
 
-保留策略：默认 30 天 / 1 GB，超出按时间淘汰（可配）。
+- **脱敏先行**：写入前对 `key=value` 口令、`Authorization: Bearer/Basic`、PEM 私钥块、
+  `AKIA*` 访问键、`--password x`、` -p<值>` 做掩码，落库的永远是掩码后的文本。
+- **保留策略**：默认 30 天 / 512 MB，超期与超体积都删最旧（体积超限后 `VACUUM`）；
+  每 100 条写入触发一次清理。可在 `config.toml` 的 `[audit]` 段关闭归档或改阈值。
+- 查询接口：`sh0 ai log query [--host] [--session] [--since] [--actor] [--risk] [--limit≤1000]`。
 
 ### 8.3 凭据
 
 - 优先 OS 钥匙串：`keyring` crate（macOS Keychain / Windows Credential Manager / Linux Secret Service）。
-- 回落：主密码 → Argon2id 派生密钥 → ChaCha20-Poly1305 加密 `credentials.enc`；主密码只在本次进程内存中的 `secrecy::SecretBox` 保存，可设置会话级缓存时长。
+- 回落：主密码 → Argon2id（19 MiB / t=2 / p=1）派生密钥 → ChaCha20-Poly1305 加密 `creds.vault`
+  （JSON 文件，salt / nonce / 密文 hex 编码，tmp + rename 原子写）。
+- 主密码来源：`SH0_MASTER_PASSWORD` 环境变量，否则 stdin 提示（daemon 后台场景 stdin 为 null，
+  此时 vault 处于 `Locked`——不会静默降级成"什么都读不到但也不报错"）。
+- `SH0_DISABLE_KEYRING=1` 可强制走 vault（CI / 测试用它保证确定性）。
 - 私钥：只存文件路径，不复制内容；私钥自身的 passphrase 走上述加密存储。
+- `sh0 secret set/get/list/rm` 是面向命令行的管理入口。
 
 ---
 
@@ -664,6 +714,23 @@ NFR-11 要求「纯 Rust 依赖栈优先」。**实测 russh 0.64 无法完全�
 
 若将来 russh 提供纯 Rust crypto 路径，可去掉 `ring` feature 回归纯 Rust 依赖栈。
 工作区 `Cargo.toml` 中已就地注明该取舍。
+
+### 9.2 关于 SQLite 的 bundled 编译（M2 引入的第二处 C 依赖）
+
+审计库用 `rusqlite` 的 `bundled` feature：SQLite 源码随 crate 一起编译，产物**不依赖系统
+SQLite**——这是"单二进制、跨平台行为一致"（NFR-1 / NFR-5）的必要代价，与 `ring` 同属
+"只要 C 编译器、无需额外工具链"的一类（`cc` crate 自动探测 MSVC / gcc），不引入 cmake / nasm。
+
+已评估的替代：`sqlx`（异步、但要链接系统库或同样 bundled）、纯 Rust 的 `redb`（无 SQL，
+审计的多条件过滤与回溯查询要自己写索引，不划算）。结论：保留 `rusqlite bundled`。
+
+### 9.3 IPC 帧上的一个易错点（M2 实测）
+
+客户端读循环收到**事件帧**时，若事件通道已无接收者（`sh0 ai` 这类一次性客户端不订阅事件），
+必须**丢弃事件继续读**，不能中断循环——一旦中断，后续所有应答再无人分发，调用方永久挂起。
+M2 契约测试正是被这个点卡住过（症状：daemon 明明已应答，客户端仍在超时）。
+
+同时：错误信封支持挂载 `data`（确认令牌走这条路），服务端 `ErrorBody { code, message, data }`。
 
 ---
 

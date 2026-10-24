@@ -8,6 +8,7 @@
 //! `&mut self`，由调用方串行调度。
 
 use async_trait::async_trait;
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::Host;
@@ -23,6 +24,18 @@ pub enum TransportEvent {
     Exit(i32),
     /// 连接中断（网络故障、服务端断开等），携带原因
     Broken(String),
+}
+
+/// exec channel 一次执行的结果（`ai exec run --mode exec` 的备选路径）。
+///
+/// 与 shell 哨兵模式的区别：stdout / stderr 天然分离、退出码精确，
+/// 但拿不到交互式上下文（cwd、环境变量、前一条命令的状态）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+    /// 远端没给退出码（超时被掐断等）时为 None
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Error)]
@@ -58,4 +71,13 @@ pub trait TransportFactory: Send + Sync {
         cols: u16,
         rows: u16,
     ) -> TransportResult<Box<dyn SessionTransport + Send>>;
+
+    /// 独立 exec channel 执行命令（W2.4 的备选路径，不复用交互 shell）。
+    ///
+    /// 默认未实现：shell 传输不需要它，mock 与真实 SSH 工厂按需支持。
+    /// daemon 在 `--mode exec` 时调用；不支持时回退到 shell 哨兵模式。
+    async fn exec(&self, host: &Host, cmd: &str, timeout: Duration) -> TransportResult<ExecOutput> {
+        let _ = (host, cmd, timeout);
+        Err(TransportError::NotImplemented("exec channel 不可用".into()))
+    }
 }

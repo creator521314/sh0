@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use serde_json::json;
 use sh0_ipc::ServerMsg;
 use sh0_ipc::protocol::methods;
@@ -53,6 +53,18 @@ pub enum Focus {
 pub struct Selection {
     pub anchor: (usize, usize),
     pub head: (usize, usize),
+}
+
+/// 待人工确认的 exec 请求（daemon 广播 confirm.requested，FR-7.4）
+///
+/// 会话型调用带 session  id，一键式 `--host` 调用不带——所以确认事件
+/// 不能走"按 session 找标签页"的那条路，必须在事件入口优先分流。
+#[derive(Debug, Clone)]
+pub struct PendingConfirm {
+    pub token: String,
+    pub host: String,
+    pub command: String,
+    pub reason: Option<String>,
 }
 
 impl Selection {
@@ -108,6 +120,8 @@ pub struct App {
     selection: Option<Selection>,
     /// 最近一次复制的内容（剪贴板不可用时至少能粘回会话）
     last_copy: String,
+    /// 待确认的 exec 弹窗（confirm.requested）；Some 时拦截全部按键
+    confirm: Option<PendingConfirm>,
 }
 
 impl App {
@@ -146,6 +160,7 @@ impl App {
             term_size: (cfg.cols, cfg.rows),
             selection: None,
             last_copy: String::new(),
+            confirm: None,
         }
     }
 
@@ -210,6 +225,41 @@ impl App {
     // ---- 事件 ----
 
     async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // 0) 风险确认弹窗优先：AI 在等一个"人"拍板，此刻任何键都属于这次决定
+        if let Some(pc) = self.confirm.take() {
+            // 强退键放行：令牌留给 daemon 5 分钟自然过期，人永远能退出 TUI
+            if is_hard_quit(key) {
+                self.should_quit = true;
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let res = self
+                        .client
+                        .call(
+                            methods::EXEC_CONFIRM,
+                            json!({ "token": pc.token, "approve": true }),
+                        )
+                        .await;
+                    self.notice = match res {
+                        Ok(_) => "已批准，正在执行…".into(),
+                        Err(e) => format!("批准失败：{e}"),
+                    };
+                }
+                _ => {
+                    let _ = self
+                        .client
+                        .call(
+                            methods::EXEC_CONFIRM,
+                            json!({ "token": pc.token, "approve": false }),
+                        )
+                        .await;
+                    self.notice = "已拒绝该命令".into();
+                }
+            }
+            return Ok(());
+        }
+
         // 1) 主机编辑表单优先
         if let Some(form) = self.form.as_mut() {
             match key.code {
@@ -535,6 +585,52 @@ impl App {
         let ServerMsg::Event { event, session, data, .. } = msg else {
             return;
         };
+
+        // 确认类事件不绑定会话（一键式 --host 调用时 session 为 null），
+        // 必须先于下面"按 session 找标签页"的逻辑分流，否则永远弹不出来
+        match event.as_str() {
+            "confirm.requested" => {
+                let d = data.unwrap_or(json!({}));
+                let token = d.get("token").and_then(|v| v.as_str()).unwrap_or_default();
+                if token.is_empty() {
+                    return;
+                }
+                if self.confirm.is_some() {
+                    self.notice = "有新的确认请求，上一个已被顶掉".into();
+                }
+                self.confirm = Some(PendingConfirm {
+                    token: token.to_string(),
+                    host: d
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    command: d
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    reason: d.get("reason").and_then(|v| v.as_str()).map(str::to_string),
+                });
+                return;
+            }
+            "confirm.resolved" => {
+                let d = data.unwrap_or(json!({}));
+                let token = d.get("token").and_then(|v| v.as_str()).unwrap_or_default();
+                let approved = d.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+                let summary = d.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                if self.confirm.as_ref().is_some_and(|c| c.token == token) {
+                    self.confirm = None;
+                }
+                self.notice = format!(
+                    "{}：{summary}",
+                    if approved { "已批准执行" } else { "已拒绝" }
+                );
+                return;
+            }
+            _ => {}
+        }
+
         let Some(sid) = session else { return };
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == sid) else {
             return;
@@ -573,6 +669,10 @@ impl App {
     fn draw(&self, f: &mut ratatui::Frame) {
         if let Some(form) = &self.form {
             self.draw_form(f, form);
+            // 确认弹窗优先级更高，可以压在表单之上
+            if let Some(pc) = &self.confirm {
+                self.draw_confirm(f, pc);
+            }
             return;
         }
 
@@ -628,6 +728,55 @@ impl App {
                 area,
             );
         }
+
+        if let Some(pc) = &self.confirm {
+            self.draw_confirm(f, pc);
+        }
+    }
+
+    /// 风险确认弹窗（FR-7.4）：AI 发起的 confirm 档命令在这里等一个"人"拍板
+    fn draw_confirm(&self, f: &mut ratatui::Frame, pc: &PendingConfirm) {
+        let area = centered_rect(70, 9, f.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.warn))
+            .title(" 命令需确认 ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::styled("主机 ", Style::default().fg(self.theme.border)),
+                Span::styled(
+                    pc.host.clone(),
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("命令 ", Style::default().fg(self.theme.border)),
+                Span::styled(
+                    pc.command.clone(),
+                    Style::default()
+                        .fg(self.theme.status_fg)
+                        .bg(self.theme.warn)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ];
+        if let Some(reason) = &pc.reason {
+            lines.push(Line::from(vec![
+                Span::styled("原因 ", Style::default().fg(self.theme.border)),
+                Span::raw(truncate(reason, inner.width as usize)),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "按 y 批准执行，其它键拒绝（令牌 5 分钟内有效）",
+            Style::default().fg(self.theme.warn),
+        )));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn draw_tabs(&self, f: &mut ratatui::Frame, area: Rect) {

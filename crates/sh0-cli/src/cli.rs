@@ -38,17 +38,51 @@ pub enum Cmd {
         /// 超时（秒）
         #[arg(long, global = true, default_value_t = 30)]
         timeout: u64,
+
+        /// 无人值守场景下显式批准 confirm 档命令（等价于用户点了"确认"）
+        #[arg(long, global = true)]
+        yes: bool,
+
+        /// 只做风险判定不执行（AI 自检：这条命令会被放行吗）
+        #[arg(long, global = true)]
+        dry_run: bool,
+
+        /// 安静模式：不输出人类可读文本（JSON 仍会打印）
+        #[arg(long, global = true)]
+        quiet: bool,
     },
     /// 主机清单管理
     Host {
         #[command(subcommand)]
         cmd: HostCmd,
     },
+    /// 凭据管理（OS 钥匙串 / 加密 vault，FR-1.4~FR-1.7）
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
     /// 配置目录与校验
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCmd {
+    /// 存入一条秘密（--stdin 从标准输入读，避免进入 shell 历史）
+    Set {
+        service: String,
+        account: String,
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// 取出一条秘密（明文打印到 stdout，小心管道）
+    Get { service: String, account: String },
+    /// 列出 vault 中的条目名（钥匙串无法枚举）
+    List,
+    /// 删除一条秘密
+    Rm { service: String, account: String },
 }
 
 #[derive(Debug, Subcommand)]

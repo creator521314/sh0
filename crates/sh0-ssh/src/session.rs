@@ -4,27 +4,41 @@
 //! 测试时把 `RusshFactory` 换成 `MockFactory` 即可跑通整条链路。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use russh::ChannelMsg;
 
-use sh0_core::Host;
 use sh0_core::transport::{
-    SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
+    ExecOutput, SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
 };
+use sh0_core::{Host, SecretResolver};
 
 use crate::client::{ConnectOptions, ShellHandle, SshConnection};
 use crate::error::SshError;
 
 /// 真实 SSH 连接的工厂
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RusshFactory {
     pub known_hosts: PathBuf,
     /// 0 表示不启用 SSH 层保活（需求 FR-2.7）
     pub keepalive_secs: u64,
     /// 远端 TERM 环境变量值
     pub term: String,
+    /// 秘密解析后端（钥匙串 / vault）。None 时用 DefaultResolver。
+    pub resolver: Option<Arc<dyn SecretResolver>>,
+}
+
+impl std::fmt::Debug for RusshFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RusshFactory")
+            .field("known_hosts", &self.known_hosts)
+            .field("keepalive_secs", &self.keepalive_secs)
+            .field("term", &self.term)
+            .field("resolver", &self.resolver.as_ref().map(|r| r.backend_name()))
+            .finish()
+    }
 }
 
 impl RusshFactory {
@@ -33,6 +47,21 @@ impl RusshFactory {
             known_hosts: known_hosts.as_ref().to_path_buf(),
             keepalive_secs,
             term: term.into(),
+            resolver: None,
+        }
+    }
+
+    /// 注入凭据存储后端（W2.12）
+    pub fn with_resolver(mut self, resolver: Arc<dyn SecretResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    fn opts(&self) -> ConnectOptions {
+        ConnectOptions {
+            known_hosts: self.known_hosts.clone(),
+            keepalive_secs: self.keepalive_secs,
+            resolver: self.resolver.clone(),
         }
     }
 }
@@ -45,13 +74,18 @@ impl TransportFactory for RusshFactory {
         cols: u16,
         rows: u16,
     ) -> TransportResult<Box<dyn SessionTransport + Send>> {
-        let opts = ConnectOptions {
-            known_hosts: self.known_hosts.clone(),
-            keepalive_secs: self.keepalive_secs,
-        };
-        let conn = SshConnection::connect(host, opts).await?;
+        let conn = SshConnection::connect(host, self.opts()).await?;
         let shell = conn.open_shell(&self.term, cols, rows).await?;
         Ok(Box::new(RusshTransport { conn, shell }))
+    }
+
+    /// exec channel 备选路径（W2.4）：不复用交互 shell，
+    /// 因此 stdout/stderr 分离、退出码精确，代价是拿不到 cwd 等上下文。
+    async fn exec(&self, host: &Host, cmd: &str, timeout: Duration) -> TransportResult<ExecOutput> {
+        let conn = SshConnection::connect(host, self.opts()).await?;
+        conn.exec_command(cmd, timeout)
+            .await
+            .map_err(TransportError::from)
     }
 }
 

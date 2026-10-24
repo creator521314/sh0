@@ -36,6 +36,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 
+# 安全：审计库加密与凭据 vault（均为纯 Rust，无 C 依赖）
+regex = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+# vault nonce 的随机源（chacha20poly1305 的 OsRng 走 optional feature，
+# 直接依赖更直白；纯 Rust 包装 OS 随机数，无 C 代码）
+getrandom = "0.2"
+# 审计与归档：SQLite 单文件（FR-8 / FR-9.2）。
+# bundled 特性随包编译 SQLite C 源码——与 ring 一样需要 C 编译器（cc 自动探测），
+# 换来三平台零外部依赖，值回票价。
+rusqlite = { version = "0.34", features = ["bundled"] }
+# OS 钥匙串：macOS Keychain / Windows Credential Manager / Linux Secret Service。
+# 不可用（如无 dbus 的 Linux）时由 sh0-store 的加密文件 vault 兜底。
+keyring = "3"
+
 # 错误处理与日志
 thiserror = "2"
 anyhow = "1"

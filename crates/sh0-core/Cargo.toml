@@ -15,7 +15,12 @@ ulid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
 async-trait.workspace = true
+regex = { workspace = true }
 sh0-term = { version = "0.1.0", path = "../sh0-term" }
+
+[dev-dependencies]
+## 测试要 mock 传输层；自依赖是本 crate 在自己的测试里开启特性的标准姿势
+sh0-core = { path = ".", features = ["mock"] }
 
 [features]
 default = []

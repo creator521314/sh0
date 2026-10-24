@@ -141,7 +141,12 @@ enum CmdOutcome {
     NeedsReconnect,
 }
 
-/// 会话句柄：daemon 与外部只通过这个对象操作会话
+/// 会话句柄：daemon 与外部只通过这个对象操作会话。
+///
+/// `Clone` 是廉价的可共享引用（内部全是 `Arc` + channel）——
+/// daemon 的 exec 路径需要从会话表里取出一份来跑命令，
+/// 同时不把表锁整个锁住。
+#[derive(Clone)]
 pub struct SessionHandle {
     pub id: SessionId,
     pub host: Host,

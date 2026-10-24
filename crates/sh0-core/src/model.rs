@@ -75,6 +75,11 @@ pub struct Host {
     pub tags: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// 该主机允许的最高风险档位（FR-7.6）。None = 不限制。
+    /// 例如生产组设 `confirm`，则任何 auto 档命令照旧、但判定为 auto 的
+    /// 危险命令会被压到 confirm 档——引擎仍可能给出更高档，由 daemon 取较小值。
+    #[serde(default)]
+    pub risk_cap: Option<RiskLevel>,
 }
 
 fn default_port() -> u16 {
