@@ -720,6 +720,11 @@ impl DaemonState {
         let sentinel = new_sentinel();
         // 发送前先留一份屏幕底样：回显定位与"新输出"边界都靠它
         let screen = handle.screen();
+        // 列宽用于把 PTY 硬折的行还原成逻辑行（长命令回显会折行）
+        let cols = {
+            let s = screen.lock().await;
+            s.cols()
+        };
         let before = {
             let s = screen.lock().await;
             s.plain_text(true)
@@ -746,10 +751,16 @@ impl DaemonState {
             last_after = after.clone();
             if scan_sentinel(&after, &sentinel).is_some() {
                 // 哨兵已出现：交给 extract_output 结合屏底样截输出与退出码
-                break (extract_output(&before, &after, &req.cmd, &sentinel), false);
+                break (
+                    extract_output(&before, &after, &req.cmd, &sentinel, cols),
+                    false,
+                );
             }
             if Instant::now() >= deadline {
-                break (extract_output(&before, &after, &req.cmd, &sentinel), true);
+                break (
+                    extract_output(&before, &after, &req.cmd, &sentinel, cols),
+                    true,
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };

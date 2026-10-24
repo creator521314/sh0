@@ -187,14 +187,25 @@ pub enum SentinelScan {
 /// ```
 ///
 /// 启发式规则：
+/// 0. 先按终端列宽把**物理折行**还原成逻辑行（见 [`merge_wrapped`]）；
 /// 1. 哨兵行 = 去空白后恰为 `SENTINEL:<整数>` 的行（从后往前找第一行）；
 /// 2. 输出起点 = `after` 中从 `start` 起第一行**包含命令文本**的下一行
 ///    （容忍回显前夹杂着上一条命令的残余输出）；
 /// 3. 哨兵行前一行若含哨兵 id（echo 命令的回显），剥掉；
 /// 4. `after` 不以 `before` 为前缀时（`clear` 刷屏 / 滚动丢失），从 0 开始找。
-pub fn extract_output(before: &str, after: &str, cmd: &str, sentinel: &str) -> SentinelScan {
-    let before_lines: Vec<&str> = before.lines().collect();
-    let after_lines: Vec<&str> = after.lines().collect();
+///
+/// `cols` 为终端列宽；传 0 表示未知（跳过折行还原，行为同旧版）。
+pub fn extract_output(
+    before: &str,
+    after: &str,
+    cmd: &str,
+    sentinel: &str,
+    cols: usize,
+) -> SentinelScan {
+    let merged_before = merge_wrapped(before.lines().collect(), cols);
+    let merged_after = merge_wrapped(after.lines().collect(), cols);
+    let before_lines: Vec<&str> = merged_before.iter().map(|s| s.as_str()).collect();
+    let after_lines: Vec<&str> = merged_after.iter().map(|s| s.as_str()).collect();
     let sentinel_pat = format!("{sentinel}:");
 
     // 1) 找哨兵输出行（从后往前）
@@ -248,6 +259,36 @@ pub fn extract_output(before: &str, after: &str, cmd: &str, sentinel: &str) -> S
         output: out,
         exit_code: exit_code.unwrap_or(-1),
     }
+}
+
+/// 把终端按列宽硬折的物理行还原成逻辑行。
+///
+/// PTY 折行不发换行符，网格里就是连续两行，且**续行既不含提示符也不含命令文本**——
+/// 于是回显噪声剥不干净（续行被当成输出）、真实输出被切成碎片。
+/// 唯一可用的信号是"上一行是否填满列宽"：折行必然填满，程序自己输出 `\n` 通常不满。
+///
+/// 留 1 列余量：readline 重绘命令行时会预留一列避免换行歧义。
+/// `cols < 2` 时不做还原（宽度未知，硬猜比不猜更糟）。
+fn merge_wrapped(lines: Vec<&str>, cols: usize) -> Vec<String> {
+    if cols < 2 {
+        return lines.into_iter().map(|s| s.to_string()).collect();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut prev_filled = false;
+    for line in lines {
+        if prev_filled {
+            // 上一条是被折断的，续行拼回去
+            out.last_mut().expect("prev_filled 为真时必有上一条").push_str(line);
+        } else {
+            out.push(line.to_string());
+        }
+        // 只有"恰好填满"或"差一列"才算被折断。网格每行只有 cols 个 cell，
+        // 物理行长度不可能超过 cols；超出说明这份文本不是真实网格（如单测构造），
+        // 此时硬拼会吞掉本该独立的下一行。
+        let len = line.chars().count();
+        prev_filled = len >= cols - 1 && len <= cols;
+    }
+    out
 }
 
 /// 从 `from` 起找第一行包含探针文本的行，返回其下一行的下标；
@@ -377,7 +418,7 @@ mod tests {
     fn extracts_output_and_exit_code() {
         let before = "user@host:~$ ";
         let after = screen("user@host:~$", "df -h /", "Filesystem x\n/dev/sda1 40G");
-        let scan = extract_output(before, &after, "df -h /", S);
+        let scan = extract_output(before, &after, "df -h /", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -391,7 +432,7 @@ mod tests {
     fn exit_code_nonzero_is_captured() {
         let mut after = screen("user@host:~$", "false", "");
         after = after.replace(&format!("{S}:0"), &format!("{S}:1"));
-        let scan = extract_output("p$ ", &after, "false", S);
+        let scan = extract_output("p$ ", &after, "false", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -404,7 +445,7 @@ mod tests {
     #[test]
     fn empty_output_yields_empty_string() {
         let after = screen("user@host:~$", "true", "");
-        let scan = extract_output("user@host:~$ ", &after, "true", S);
+        let scan = extract_output("user@host:~$ ", &after, "true", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -421,7 +462,7 @@ mod tests {
         let after = format!(
             "{before}\ndate\necho {S}:$?\nhell@hell:~ $ date\nSat 24 Oct 21:30:15 HKT 2026\nhell@hell:~ $ echo {S}:$?\n{S}:0\nhell@hell:~ $ "
         );
-        let scan = extract_output(before, &after, "date", S);
+        let scan = extract_output(before, &after, "date", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -438,7 +479,7 @@ mod tests {
         let after = format!(
             "p$ echo hi\necho {S}:$?\nhi\nhi\nhi\nhi\nhi\nhi\n{S}:0\np$ "
         );
-        let scan = extract_output(before, &after, "echo hi", S);
+        let scan = extract_output(before, &after, "echo hi", S, 80);
         let out = match scan {
             SentinelScan::Complete { output, .. } => output,
             other => panic!("应当是 Complete: {other:?}"),
@@ -454,7 +495,7 @@ mod tests {
         let after = format!(
             "hell@hell:~ $ date\necho {S}:$?\nSat 24 Oct 21:27:05 HKT 2026\n{S}:0\nhell@hell:~ $ "
         );
-        let scan = extract_output(before, &after, "date", S);
+        let scan = extract_output(before, &after, "date", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -469,7 +510,7 @@ mod tests {
         // 超时分支同样要把半截的 echo 回显剥掉
         let before = "hell@hell:~ $ ";
         let after = format!("hell@hell:~ $ sleep 30\necho {S}:$?\nsome partial\n");
-        let scan = extract_output(before, &after, "sleep 30", S);
+        let scan = extract_output(before, &after, "sleep 30", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Partial {
@@ -482,7 +523,7 @@ mod tests {
     fn cleared_screen_falls_back_to_full_scan() {
         // clear 之后 before 不再是前缀：起点退化为 0，仍靠回显行定位
         let after = screen("user@host:~$", "ls", "a\nb");
-        let scan = extract_output("some old prompt$ ", &after, "ls", S);
+        let scan = extract_output("some old prompt$ ", &after, "ls", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -501,7 +542,7 @@ mod tests {
             after = screen("user@host:~$", "date", "Sat Oct 24")
         );
         // before 不是前缀（stale 行在中间），start=0；靠"包含 cmd 的行"定位
-        let scan = extract_output(before, &after, "date", S);
+        let scan = extract_output(before, &after, "date", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -514,7 +555,7 @@ mod tests {
     #[test]
     fn multiline_output_is_kept_whole() {
         let after = screen("user@host:~$", "ps aux", "a\nb\nc\nd");
-        let scan = extract_output("user@host:~$ ", &after, "ps aux", S);
+        let scan = extract_output("user@host:~$ ", &after, "ps aux", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {
@@ -529,7 +570,7 @@ mod tests {
         // 命令卡在交互程序里，哨兵始终不出现
         let before = "user@host:~$ ";
         let after = "user@host:~$ vim nginx.conf\nsome vim screen";
-        let scan = extract_output(before, after, "vim nginx.conf", S);
+        let scan = extract_output(before, after, "vim nginx.conf", S, 80);
         assert_eq!(
             scan,
             SentinelScan::Partial {
@@ -539,11 +580,62 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_echo_block_is_rewrapped_before_stripping() {
+        // 真机形态：80 列终端，155 字符的命令被 PTY 硬折成多行，
+        // 续行既不含提示符也不含命令文本——必须先按列宽还原成逻辑行再剥噪声
+        const COLS: usize = 80;
+        let cmd = format!("echo {}", "a".repeat(150));
+        let echo_cmd = format!("echo {}:$?", S);
+        let real_out = "a".repeat(150);
+
+        let fold = |s: &str| -> Vec<String> {
+            let cs: Vec<char> = s.chars().collect();
+            if cs.len() <= COLS {
+                return vec![s.to_string()];
+            }
+            cs.chunks(COLS).map(|c| c.iter().collect::<String>()).collect()
+        };
+
+        let mut rows = vec!["p$ ".to_string()];
+        rows.extend(fold(&cmd));                    // 裸回显命令（折行）
+        rows.extend(fold(&echo_cmd));               // 裸回显 echo（含哨兵 id）
+        rows.extend(fold(&format!("p$ {cmd}")));    // readline 重绘（折行）
+        rows.extend(fold(&real_out));               // 真实输出（折行）
+        rows.push(format!("p$ {echo_cmd}"));
+        rows.push(format!("{S}:0"));
+        let after = rows.join("\n");
+
+        let scan = extract_output("p$ ", &after, &cmd, S, COLS);
+        assert_eq!(
+            scan,
+            SentinelScan::Complete {
+                output: real_out,
+                exit_code: 0
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_width_skips_rewrapping() {
+        // 列宽未知时不做还原，行为与旧版一致（短行不受影响）
+        let before = "p$ ";
+        let after = format!("p$ date\nSat 24 Oct\np$ echo {S}:$?\n{S}:0\np$ ");
+        let scan = extract_output(before, &after, "date", S, 0);
+        assert_eq!(
+            scan,
+            SentinelScan::Complete {
+                output: "Sat 24 Oct".into(),
+                exit_code: 0
+            }
+        );
+    }
+
+    #[test]
     fn long_command_probe_uses_first_40_chars() {
         let long = "echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let before = "p$ ";
         let after = format!("p$ {long}\nhello\np$ echo {S}:$?\n{S}:0\np$ ");
-        let scan = extract_output(before, &after, long, S);
+        let scan = extract_output(before, &after, long, S, 80);
         assert_eq!(
             scan,
             SentinelScan::Complete {

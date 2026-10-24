@@ -769,6 +769,9 @@ fn builtin_auto() -> BTreeSet<&'static str> {
         "nvidia-smi", "tar", "gzip", "gunzip", "zip", "unzip", "zcat", "bc", "expr", "seq",
         "watch", "time", "strace", "lsof", "fuser", "readlink", "realpath", "basename",
         "dirname", "column", "ts", "jq", "yq",
+        // 清屏 / 查帮助：无副作用。注意 clear 会清掉屏幕底样，
+        // exec 的哨兵截取有专门兜底（extract_output 规则 4）
+        "clear", "reset", "tput", "history", "alias", "man", "info", "help",
         // 非递归的权限/属主变更按 auto 处理；递归形式由 confirm 规则先拦截
         "chmod", "chown", "chgrp", "setfacl", "getfacl",
     ]
