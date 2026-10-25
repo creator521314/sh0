@@ -273,6 +273,18 @@ pub enum BatchCmd {
         #[arg(long)]
         output: Option<std::path::PathBuf>,
     },
+    /// 最近 N 次批量执行（OQ-5）
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 查看一次批量执行的逐台明细
+    Show {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value = "table")]
+        out: String,
+    },
 }
 
 /// 广播（FR-5.1）：一份输入、多个会话。
@@ -1038,6 +1050,99 @@ async fn dispatch(
                         ),
                         data: Some(data),
                     });
+                }
+                Ok((text, data))
+            }
+            BatchCmd::List { limit } => {
+                let c = require_client(client)?;
+                let data = c
+                    .call(methods::BATCH_LIST, json!({ "limit": limit }))
+                    .await?;
+                let runs = data.get("runs").and_then(|v| v.as_array());
+                let mut text = String::new();
+                let empty: Vec<Value> = Vec::new();
+                for r in runs.unwrap_or(&empty) {
+                    let id = r.get("run_id").and_then(|v| v.as_str()).unwrap_or("-");
+                    let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("-");
+                    let cmd = r.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    let total = r.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let ok = r.get("ok").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let failed = r.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let ms = r.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                    text.push_str(&format!(
+                        "{id}  {ts}  {cmd}  ·  {total} 台 / 成功 {ok} / 失败 {failed}  ·  {:.2}s\n",
+                        ms as f64 / 1000.0
+                    ));
+                }
+                if text.is_empty() {
+                    text = "还没有批量执行记录\n".into();
+                }
+                Ok((text, data))
+            }
+            BatchCmd::Show { run_id, out } => {
+                if !matches!(out.as_str(), "table" | "json") {
+                    return Err(AiError::Args(format!(
+                        "未知 out: {out}（可选 table / json）"
+                    )));
+                }
+                let c = require_client(client)?;
+                let data = c
+                    .call(methods::BATCH_SHOW, json!({ "run_id": run_id }))
+                    .await?;
+                if out == "json" {
+                    return Ok((
+                        serde_json::to_string_pretty(&data).unwrap_or_default() + "\n",
+                        data,
+                    ));
+                }
+                // 回看时把明细重新排成与实时执行一致的表格（失败在前）
+                let mut text = String::new();
+                let (cmd, total, ok, failed, ms) = (
+                    data["run"]["command"].as_str().unwrap_or(""),
+                    data["run"]["total"].as_i64().unwrap_or(0),
+                    data["run"]["ok"].as_i64().unwrap_or(0),
+                    data["run"]["failed"].as_i64().unwrap_or(0),
+                    data["run"]["duration_ms"].as_i64().unwrap_or(0),
+                );
+                text.push_str(&format!(
+                    "{run_id}  {cmd}  ·  {total} 台 / 成功 {ok} / 失败 {failed}  ·  {:.2}s\n",
+                    ms as f64 / 1000.0
+                ));
+                let empty: Vec<Value> = Vec::new();
+                let mut rows: Vec<&Value> = data
+                    .get("results")
+                    .and_then(|v| v.as_array())
+                    .unwrap_or(&empty)
+                    .iter()
+                    .collect();
+                rows.sort_by_key(|r| {
+                    match r.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                        "ok" => 2,
+                        "skipped" => 1,
+                        _ => 0,
+                    }
+                });
+                for r in rows {
+                    let host = r.get("host").and_then(|v| v.as_str()).unwrap_or("-");
+                    let st = r.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+                    let code = r
+                        .get("exit_code")
+                        .and_then(|v| v.as_i64())
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    let d = r.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let mark = match st {
+                        "ok" => "✔",
+                        "skipped" => "○",
+                        _ => "✘",
+                    };
+                    let err = r
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .filter(|e| !e.is_empty())
+                        .map(|e| format!("  {e}"))
+                        .unwrap_or_default();
+                    text.push_str(&format!("{mark} {host:<20} {st:<8} exit={code:<4} {d}ms{err}\n"));
                 }
                 Ok((text, data))
             }

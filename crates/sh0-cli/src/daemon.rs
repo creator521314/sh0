@@ -23,26 +23,24 @@ use tokio::task::JoinSet;
 use sh0_core::session::{SessionConfig, SessionEvent, SessionHandle, spawn_session};
 use sh0_core::sftp::{SftpClient, SftpError, SftpResult};
 use sh0_core::{
-    Host, HostSelector, RiskEngine, RiskLevel, SessionSnapshot, SessionState, TransportFactory,
-    new_session_id,
+    Host, RiskEngine, RiskLevel, SessionSnapshot, SessionState, TransportFactory, new_session_id,
 };
 use sh0_ipc::protocol::{DaemonInfo, ErrorBody, events, methods};
 use sh0_ipc::{EventHub, Handler, ServerMsg, serve};
 use sh0_ssh::session::RusshFactory;
-use sh0_store::{AppConfig, AuditDb, AuditFilter, AuditRecord, CredentialStore, Store};
+use sh0_store::{
+    AppConfig, AuditDb, AuditFilter, AuditRecord, BatchResultRow, BatchRunRecord,
+    CredentialStore, Store,
+};
 use sh0_term::{GridView, MemoryBudget};
 
 use crate::exec::{
     BatchRequest, ConfirmStore, ExecData, ExecMode, ExecRequest, PendingConfirm, RateLimiter,
-    SentinelScan, exec_sentinel_on, extract_output, new_sentinel, parse_batch_request,
-    truncate_output,
+    exec_sentinel_on, parse_batch_request, truncate_output,
 };
 
 /// 保留多少个已结束会话的快照，供事后查询
 const RECENT_LIMIT: usize = 32;
-
-/// 一次性会话等待就绪的宽限（秒）：连接失败不该把 exec 整体超时吃光
-const CONNECT_GRACE_SECS: u64 = 20;
 
 /// 确认令牌有效期（FR-7.4：无人值守时 AI 拿着 token 二次调用）
 const CONFIRM_TTL_SECS: u64 = 300;
@@ -1445,6 +1443,13 @@ impl DaemonState {
             Some(format!("{} 台未成功: {}", names.len(), names.join(", ")))
         };
 
+        let decision = if failed_n > 0 || panicked > 0 {
+            "partial"
+        } else if confirmed {
+            "confirmed"
+        } else {
+            "executed"
+        };
         self.audit(AuditRecord {
             ts: now_rfc3339(),
             trace_id: req.trace_id.clone(),
@@ -1454,13 +1459,7 @@ impl DaemonState {
             action: "batch.run".into(),
             command: Some(req.cmd.clone()),
             risk: Some(risk_str(risk)),
-            decision: Some(if failed_n > 0 || panicked > 0 {
-                "partial".into()
-            } else if confirmed {
-                "confirmed".into()
-            } else {
-                "executed".into()
-            }),
+            decision: Some(decision.into()),
             exit_code: None,
             duration_ms: Some(duration_ms),
             truncated: false,
@@ -1468,6 +1467,43 @@ impl DaemonState {
             stdout: None,
             stderr: None,
         });
+
+        // 历史回看（OQ-5）：run_id 让"上次那批到底跑成什么样"可复查。
+        // 落库失败只告警——批量已经跑完了，不该因为存档问题让调用方以为失败。
+        if let Some(db) = &self.audit {
+            let rec = BatchRunRecord {
+                run_id: run_id.clone(),
+                ts: now_rfc3339(),
+                trace_id: req.trace_id.clone(),
+                actor: req.actor.clone(),
+                command: req.cmd.clone(),
+                mode: req.mode.as_str().to_string(),
+                risk: risk_str(risk),
+                decision: decision.into(),
+                concurrency,
+                total: hosts.len(),
+                ok: ok_n,
+                failed: failed_n,
+                skipped: skipped_n,
+                duration_ms,
+                results: results
+                    .iter()
+                    .map(|r| BatchResultRow {
+                        host: r["host"].as_str().unwrap_or("").to_string(),
+                        status: r["status"].as_str().unwrap_or("").to_string(),
+                        exit_code: r["exit_code"].as_i64().map(|v| v as i32),
+                        duration_ms: r["duration_ms"].as_i64().unwrap_or(0),
+                        truncated: r["truncated"].as_bool().unwrap_or(false),
+                        timeout: r["timeout"].as_bool().unwrap_or(false),
+                        stdout: r["stdout"].as_str().unwrap_or("").to_string(),
+                        error: r["error"].as_str().map(str::to_string),
+                    })
+                    .collect(),
+            };
+            if let Err(e) = db.record_batch(&rec) {
+                tracing::warn!("批量历史落库失败（不影响本次结果）: {e}");
+            }
+        }
 
         Ok(json!({
             "run_id": run_id,
@@ -1482,6 +1518,61 @@ impl DaemonState {
             "duration_ms": duration_ms,
             "results": results,
         }))
+    }
+
+    /// batch.list：最近 N 次批量执行（OQ-5）
+    async fn batch_list(&self, params: &Value) -> std::result::Result<Value, ErrorBody> {
+        let Some(db) = &self.audit else {
+            return Err(ErrorBody {
+                code: "internal".into(),
+                message: "批量历史未启用（config.toml 的 audit.enabled = false）".into(),
+                data: None,
+            });
+        };
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).clamp(1, 500))
+            .unwrap_or(20);
+        let runs = db.list_batch(limit).map_err(|e| ErrorBody {
+            code: "internal".into(),
+            message: e.to_string(),
+            data: None,
+        })?;
+        Ok(json!({ "runs": runs, "count": runs.len() }))
+    }
+
+    /// batch.show：按 run_id 取完整明细
+    async fn batch_show(&self, params: &Value) -> std::result::Result<Value, ErrorBody> {
+        let Some(db) = &self.audit else {
+            return Err(ErrorBody {
+                code: "internal".into(),
+                message: "批量历史未启用（config.toml 的 audit.enabled = false）".into(),
+                data: None,
+            });
+        };
+        let run_id = params
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ErrorBody {
+                code: "invalid_args".into(),
+                message: "缺少 run_id".into(),
+                data: None,
+            })?;
+        let detail = db.get_batch(run_id).map_err(|e| ErrorBody {
+            code: "internal".into(),
+            message: e.to_string(),
+            data: None,
+        })?;
+        match detail {
+            Some(d) => Ok(json!(d)),
+            None => Err(ErrorBody {
+                code: "not_found".into(),
+                message: format!("没有这次批量执行: {run_id}"),
+                data: None,
+            }),
+        }
     }
 }
 
@@ -1909,6 +2000,8 @@ impl Handler for DaemonState {
             methods::BROADCAST_STATUS => Ok(self.broadcast_status().await),
             methods::BROADCAST_SEND => self.broadcast_send(&params).await,
             methods::BATCH_RUN => self.batch_run(&params).await,
+            methods::BATCH_LIST => self.batch_list(&params).await,
+            methods::BATCH_SHOW => self.batch_show(&params).await,
 
             // ---- M4 · SFTP（FR-4.x / FR-6.6）----
             methods::FILE_LIST => {

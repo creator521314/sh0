@@ -52,6 +52,66 @@ pub struct AuditRecord {
     pub stderr: Option<String>,
 }
 
+/// 一次批量执行的落库形态（OQ-5：批量历史回看）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRunRecord {
+    pub run_id: String,
+    pub ts: String,
+    pub trace_id: Option<String>,
+    pub actor: String,
+    pub command: String,
+    pub mode: String,
+    pub risk: String,
+    pub decision: String,
+    pub concurrency: usize,
+    pub total: usize,
+    pub ok: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub duration_ms: i64,
+    pub results: Vec<BatchResultRow>,
+}
+
+/// 批量执行里单台主机的结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResultRow {
+    pub host: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: i64,
+    pub truncated: bool,
+    pub timeout: bool,
+    pub stdout: String,
+    pub error: Option<String>,
+}
+
+/// 列表项：不含逐台明细（30 台的明细不该在列表里反复搬运）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRunSummary {
+    pub run_id: String,
+    pub ts: String,
+    /// 调用链追踪 ID：批量往往是 AI 编排里的一步，回看要能对上号
+    pub trace_id: Option<String>,
+    pub actor: String,
+    pub command: String,
+    pub mode: String,
+    pub risk: String,
+    pub decision: String,
+    pub concurrency: i64,
+    pub total: i64,
+    pub ok: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub duration_ms: i64,
+}
+
+/// 一次批量执行的完整视图：汇总 + 逐台明细
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRunDetail {
+    pub run: BatchRunSummary,
+    pub results: Vec<BatchResultRow>,
+}
+
 /// 查询过滤条件（`ai log query`）
 #[derive(Debug, Clone, Default)]
 pub struct AuditFilter {
@@ -106,7 +166,40 @@ impl AuditDb {
             CREATE TABLE IF NOT EXISTS meta (
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
-            );",
+            );
+            -- M3：批量执行历史（OQ-5）。一条 run 对多台 result，
+            -- run 表里只放汇总，明细单独一张表，列表页才不会搬一堆输出。
+            CREATE TABLE IF NOT EXISTS batch_run (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                ts TEXT NOT NULL,
+                trace_id TEXT,
+                actor TEXT NOT NULL,
+                command TEXT,
+                mode TEXT,
+                risk TEXT,
+                decision TEXT,
+                concurrency INTEGER,
+                total INTEGER,
+                ok INTEGER,
+                failed INTEGER,
+                skipped INTEGER,
+                duration_ms INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS batch_result (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                host TEXT NOT NULL,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                duration_ms INTEGER,
+                truncated INTEGER NOT NULL DEFAULT 0,
+                timeout INTEGER NOT NULL DEFAULT 0,
+                stdout TEXT,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_batch_run_ts ON batch_run(ts);
+            CREATE INDEX IF NOT EXISTS idx_batch_result_run ON batch_result(run_id);",
         )
         .map_err(|e| StoreError::Db(e.to_string()))?;
 
@@ -167,6 +260,165 @@ impl AuditDb {
             self.cleanup()?;
         }
         Ok(id)
+    }
+
+    /// 落一次批量执行（汇总 + 逐台明细，同一事务）。
+    ///
+    /// 明细里的 stdout 与审计归档同策略：`archive_output` 关闭时不存，
+    /// 否则 30 台的输出会把库撑大，而"哪台失败了"靠 status 就够看。
+    pub fn record_batch(&self, rec: &BatchRunRecord) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO batch_run
+                (run_id, ts, trace_id, actor, command, mode, risk, decision,
+                 concurrency, total, ok, failed, skipped, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                rec.run_id,
+                rec.ts,
+                rec.trace_id,
+                rec.actor,
+                redact(&rec.command),
+                rec.mode,
+                rec.risk,
+                rec.decision,
+                rec.concurrency as i64,
+                rec.total as i64,
+                rec.ok as i64,
+                rec.failed as i64,
+                rec.skipped as i64,
+                rec.duration_ms,
+            ],
+        )
+        .map_err(|e| StoreError::Db(e.to_string()))?;
+
+        for r in &rec.results {
+            let stdout = if self.archive_output {
+                Some(redact(&r.stdout))
+            } else {
+                None
+            };
+            tx.execute(
+                "INSERT INTO batch_result
+                    (run_id, host, status, exit_code, duration_ms, truncated, timeout, stdout, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    rec.run_id,
+                    r.host,
+                    r.status,
+                    r.exit_code,
+                    r.duration_ms,
+                    r.truncated as i64,
+                    r.timeout as i64,
+                    stdout,
+                    r.error.as_deref().map(redact),
+                ],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| StoreError::Db(e.to_string()))
+    }
+
+    /// 最近 N 次批量执行（新在前）
+    pub fn list_batch(&self, limit: usize) -> Result<Vec<BatchRunSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, ts, trace_id, actor, command, mode, risk, decision,
+                        concurrency, total, ok, failed, skipped, duration_ms
+                 FROM batch_run ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(BatchRunSummary {
+                    run_id: row.get(0)?,
+                    ts: row.get(1)?,
+                    trace_id: row.get(2)?,
+                    actor: row.get(3)?,
+                    command: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    mode: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    risk: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    decision: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    concurrency: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    total: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                    ok: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                    failed: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    skipped: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                    duration_ms: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                })
+            })
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| StoreError::Db(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// 按 run_id 取完整明细（汇总 + 逐台）
+    pub fn get_batch(&self, run_id: &str) -> Result<Option<BatchRunDetail>> {
+        let conn = self.conn.lock().unwrap();
+        let run = conn
+            .query_row(
+                "SELECT run_id, ts, trace_id, actor, command, mode, risk, decision,
+                        concurrency, total, ok, failed, skipped, duration_ms
+                 FROM batch_run WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok(BatchRunSummary {
+                        run_id: row.get(0)?,
+                        ts: row.get(1)?,
+                        trace_id: row.get(2)?,
+                        actor: row.get(3)?,
+                        command: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        mode: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                        risk: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        decision: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                        concurrency: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                        total: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                        ok: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                        failed: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                        skipped: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                        duration_ms: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+
+        let Some(run) = run else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT host, status, exit_code, duration_ms, truncated, timeout, stdout, error
+                 FROM batch_result WHERE run_id = ?1 ORDER BY id",
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![run_id], |row| {
+                Ok(BatchResultRow {
+                    host: row.get(0)?,
+                    status: row.get(1)?,
+                    exit_code: row.get(2)?,
+                    duration_ms: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    truncated: row.get::<_, i64>(4)? != 0,
+                    timeout: row.get::<_, i64>(5)? != 0,
+                    stdout: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    error: row.get(7)?,
+                })
+            })
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r.map_err(|e| StoreError::Db(e.to_string()))?);
+        }
+        Ok(Some(BatchRunDetail { run, results }))
     }
 
     /// 查询（FR-8.4）。按时间倒序，`limit` 默认 100。

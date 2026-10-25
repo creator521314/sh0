@@ -1762,3 +1762,70 @@ async fn batch_consumes_one_quota_not_per_host() {
         .await;
     assert_eq!(err_code(&e), "rate_limited");
 }
+
+// ---------------------------------------------------------------------------
+// M3 W3.5：批量历史持久化与回看（OQ-5）
+// ---------------------------------------------------------------------------
+
+/// 批量执行要落库并可按 run_id 回看（汇总 + 逐台明细）
+#[tokio::test]
+async fn batch_history_is_persisted_and_replayable() {
+    let fx = fixture_with_hosts(
+        EchoShellFactory::with_exec(vec![ExecOutput {
+            stdout: "/dev/root 40%".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        }]),
+        vec![
+            host_named("h0", &[], &[]),
+            host_named("h1", &[], &[]),
+            host_named("h2", &[], &[]),
+        ],
+    )
+    .await;
+
+    let d = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({
+                "cmd": "df -h /",
+                "all": true,
+                "mode": "exec",
+                "concurrency": 2,
+                "trace_id": "trace-batch-1",
+                "actor": "ai",
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = d["run_id"].as_str().unwrap().to_string();
+    assert!(run_id.starts_with("br_"), "run_id 应可检索: {run_id}");
+
+    // 列表里有它
+    let list = fx
+        .call(methods::BATCH_LIST, json!({ "limit": 10 }))
+        .await
+        .unwrap();
+    let runs = list["runs"].as_array().unwrap();
+    assert!(runs.iter().any(|r| r["run_id"] == run_id), "列表应有本次: {list}");
+    assert_eq!(runs[0]["total"], 3);
+    assert_eq!(runs[0]["ok"], 3);
+    assert_eq!(runs[0]["command"], "df -h /");
+    assert_eq!(runs[0]["trace_id"], "trace-batch-1");
+
+    // 明细：3 台都在，且带退出码
+    let show = fx
+        .call(methods::BATCH_SHOW, json!({ "run_id": run_id }))
+        .await
+        .unwrap();
+    let results = show["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3, "明细应含 3 台: {show}");
+    assert!(results.iter().all(|r| r["status"] == "ok"));
+    assert_eq!(show["run"]["run_id"], run_id);
+
+    // 不存在的 run_id → not_found（AI 靠这个区分"没跑过"和"跑过但全失败"）
+    let e = fx
+        .call_err(methods::BATCH_SHOW, json!({ "run_id": "br_nope" }))
+        .await;
+    assert_eq!(err_code(&e), "not_found");
+}

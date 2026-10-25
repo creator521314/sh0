@@ -11,6 +11,9 @@ pub mod paths;
 
 pub use config::{AppConfig, AuditConfig, HostsFile, LimitsConfig, RiskConfig, Store, CONFIG_VERSION};
 pub use creds::{CredentialStore, MASTER_PASSWORD_ENV};
-pub use db::{AuditDb, AuditFilter, AuditRecord, redact};
+pub use db::{
+    AuditDb, AuditFilter, AuditRecord, BatchResultRow, BatchRunDetail, BatchRunRecord,
+    BatchRunSummary, redact,
+};
 pub use error::{Result, StoreError};
 pub use paths::{Paths, APP_NAME};
