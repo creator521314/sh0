@@ -122,6 +122,8 @@ struct EchoShellFactory {
     pub sftp_calls: Arc<std::sync::Mutex<u32>>,
     /// 每条 `send` 的内容（广播测试要断言"同一份输入到了几个会话"）
     pub sends: Arc<std::sync::Mutex<Vec<String>>>,
+    /// 指定"连不上/执行失败"的主机（批量测试要造部分失败）
+    pub fail_hosts: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl EchoShellFactory {
@@ -132,6 +134,9 @@ impl EchoShellFactory {
             connect_calls: Arc::new(std::sync::Mutex::new(0)),
             sftp_calls: Arc::new(std::sync::Mutex::new(0)),
             sends: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_hosts: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -161,10 +166,17 @@ impl TransportFactory for EchoShellFactory {
 
     async fn exec(
         &self,
-        _host: &Host,
+        host: &Host,
         _cmd: &str,
         _timeout: Duration,
     ) -> TransportResult<ExecOutput> {
+        // 注入的失败主机：批量要能造出"部分失败"的现场
+        if self.fail_hosts.lock().unwrap().contains(&host.name) {
+            return Err(TransportError::NotImplemented(format!(
+                "mock: {} 执行失败",
+                host.name
+            )));
+        }
         let mut q = self.exec_outputs.lock().unwrap();
         let out = if q.len() > 1 {
             q.pop_front()
@@ -260,6 +272,46 @@ async fn fixture() -> Fixture {
 }
 
 async fn fixture_with(factory: EchoShellFactory) -> Fixture {
+    fixture_with_cfg(factory, AppConfig::default()).await
+}
+
+/// 多台主机的装置（批量测试用：选择器、并发、部分失败都要 >1 台）
+async fn fixture_with_hosts(factory: EchoShellFactory, hosts: Vec<Host>) -> Fixture {
+    fixture_with_hosts_cfg(factory, AppConfig::default(), hosts).await
+}
+
+async fn fixture_with_hosts_cfg(
+    factory: EchoShellFactory,
+    cfg: AppConfig,
+    hosts: Vec<Host>,
+) -> Fixture {
+    let fx = fixture_with_cfg(factory, cfg).await;
+    fx.store
+        .save_hosts(&HostsFile {
+            version: 1,
+            hosts,
+        })
+        .expect("写入主机清单失败");
+    fx
+}
+
+fn host_named(name: &str, group: &[&str], tags: &[&str]) -> Host {
+    Host {
+        id: sh0_core::new_host_id(),
+        name: name.into(),
+        group: group.iter().map(|s| s.to_string()).collect(),
+        addr: "127.0.0.1".into(),
+        port: 22,
+        user: "u".into(),
+        auth: CredentialRef::None,
+        tags: tags.iter().map(|s| s.to_string()).collect(),
+        note: None,
+        risk_cap: None,
+    }
+}
+
+/// 自定义配置的装置（配额类断言要改 AppConfig）
+async fn fixture_with_cfg(factory: EchoShellFactory, cfg: AppConfig) -> Fixture {
     // 诊断用：RUST_LOG=debug 时能看到 daemon 内部走到哪一步
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -272,7 +324,6 @@ async fn fixture_with(factory: EchoShellFactory) -> Fixture {
         runtime_dir: dir.join("data").join("run"),
     };
     let store = Arc::new(Store::with_paths(paths).expect("临时 Store 创建失败"));
-    let cfg = AppConfig::default();
     store
         .save_hosts(&HostsFile {
             version: 1,
@@ -1429,4 +1480,285 @@ async fn tui_broadcast_toggle_and_mark() {
     app.mark_broadcast().await;
     let st3 = fx.call(methods::BROADCAST_STATUS, json!({})).await.unwrap();
     assert!(st3["all"].as_bool().unwrap(), "取消勾选后应回到全部会话");
+}
+
+// ---------------------------------------------------------------------------
+// M3 W3.2 / W3.3：批量执行编排与结果汇总（FR-5.2 / FR-5.3）
+// ---------------------------------------------------------------------------
+
+/// 主机选择器：显式列表 / 分组前缀 / 标签 / 全部（FR-5.2）
+#[tokio::test]
+async fn batch_selector_picks_hosts_by_list_group_tag_all() {
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![
+            host_named("web1", &["prod", "web"], &["web"]),
+            host_named("web2", &["prod", "web"], &["web"]),
+            host_named("db1", &["prod", "db"], &["db"]),
+            host_named("dev1", &["dev"], &[]),
+        ],
+    )
+    .await;
+
+    // dry-run 不建连：只回答"选到了谁、风险几档"
+    let g = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({ "cmd": "df -h", "group": "prod", "dry_run": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(g["total"], 3, "prod 分组应命中 3 台: {g}");
+
+    let t = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({ "cmd": "df -h", "tag": "web", "dry_run": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(t["total"], 2, "web 标签应命中 2 台: {t}");
+
+    let l = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({ "cmd": "df -h", "hosts": ["web1", "db1"], "dry_run": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(l["total"], 2);
+
+    let a = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({ "cmd": "df -h", "all": true, "dry_run": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(a["total"], 4);
+
+    // 空选择器：不隐式等于"全部"
+    let e = fx
+        .call_err(methods::BATCH_RUN, json!({ "cmd": "df -h" }))
+        .await;
+    assert_eq!(err_code(&e), "invalid_args");
+
+    // 名单里的名字不存在 → 整批失败（少跑一台比跑不了更难发现）
+    let e2 = fx
+        .call_err(methods::BATCH_RUN, json!({ "cmd": "df -h", "hosts": ["nope"] }))
+        .await;
+    assert_eq!(err_code(&e2), "host_not_found");
+}
+
+/// 30 台并发 16 跑 `df -h /`：验收要求总耗时 ≤ 10s（FR-5.2 / FR-5.4）
+#[tokio::test]
+async fn batch_runs_in_parallel_within_budget() {
+    let fx = fixture_with_hosts(
+        EchoShellFactory::with_exec(vec![ExecOutput {
+            stdout: "/dev/root  20G  8G  12G  40% /".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        }]),
+        (0..30).map(|i| host_named(&format!("h{i}"), &[], &[])).collect(),
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let d = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({
+                "cmd": "df -h /",
+                "all": true,
+                "mode": "exec",
+                "concurrency": 16,
+                "timeout_ms": 5000,
+            }),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(d["total"], 30);
+    assert_eq!(d["ok"], 30, "全部成功: {d}");
+    assert_eq!(d["concurrency"], 16);
+    assert_eq!(d["results"].as_array().unwrap().len(), 30);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "30 台并发 16 应 ≤10s，实际 {elapsed:?}"
+    );
+    // 每台都有退出码与耗时：汇总视图靠这些字段着色
+    assert_eq!(d["results"][0]["exit_code"], 0);
+    assert!(d["results"][0]["duration_ms"].is_i64());
+}
+
+/// 部分失败要如实汇总；fail_fast 时剩下的不再跑（FR-5.3 / FR-5.4）
+#[tokio::test]
+async fn batch_reports_partial_failure_and_fail_fast() {
+    let mut f = EchoShellFactory::with_exec(vec![ExecOutput {
+        stdout: "ok".into(),
+        stderr: String::new(),
+        exit_code: Some(0),
+    }]);
+    f.fail_hosts.lock().unwrap().insert("h1".into());
+    let fx = fixture_with_hosts(
+        f,
+        vec![
+            host_named("h0", &[], &[]),
+            host_named("h1", &[], &[]),
+            host_named("h2", &[], &[]),
+        ],
+    )
+    .await;
+
+    // 默认：三台都跑，失败的那台如实标记
+    let d = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({ "cmd": "ls", "all": true, "mode": "exec" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(d["total"], 3);
+    assert_eq!(d["ok"], 2, "应有两台成功: {d}");
+    assert_eq!(d["failed"], 1, "应有一台失败: {d}");
+    let bad = d["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["host"] == "h1")
+        .unwrap();
+    assert_eq!(bad["status"], "error");
+    assert!(bad["error"].as_str().unwrap().contains("h1"));
+
+    // fail_fast + 并发 1：h1 失败后 h2 不再执行
+    let d2 = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({
+                "cmd": "ls",
+                "all": true,
+                "mode": "exec",
+                "fail_fast": true,
+                "concurrency": 1,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(d2["failed"], 1);
+    assert!(
+        d2["skipped"].as_u64().unwrap() >= 1,
+        "fail_fast 应让剩余主机被跳过: {d2}"
+    );
+}
+
+/// 批量同样被风险引擎拦截：deny 档整批拒绝，confirm 档要令牌（FR-5.5）
+#[tokio::test]
+async fn batch_is_gated_by_risk_engine() {
+    let fx = fixture_with_hosts(
+        EchoShellFactory::with_exec(vec![ExecOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        }]),
+        vec![host_named("h0", &[], &[]), host_named("h1", &[], &[])],
+    )
+    .await;
+
+    // deny：--yes 也拦不住
+    let e = fx
+        .call_err(
+            methods::BATCH_RUN,
+            json!({ "cmd": "rm -rf /", "all": true, "mode": "exec", "yes": true }),
+        )
+        .await;
+    assert_eq!(err_code(&e), "risk_denied");
+
+    // confirm：先要令牌
+    let e2 = fx
+        .call_err(
+            methods::BATCH_RUN,
+            json!({ "cmd": "systemctl restart nginx", "all": true, "mode": "exec" }),
+        )
+        .await;
+    assert_eq!(err_code(&e2), "needs_confirmation");
+    let data = match &e2 {
+        IpcError::Remote { data, .. } => data.clone().unwrap(),
+        other => panic!("期望带 data 的错误信封: {other:?}"),
+    };
+    let token = data["confirm_token"].as_str().unwrap().to_string();
+    assert_eq!(data["hosts"].as_array().unwrap().len(), 2, "令牌里要带目标主机清单");
+
+    // 带令牌重放 → 放行
+    let d = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({
+                "cmd": "systemctl restart nginx",
+                "all": true,
+                "mode": "exec",
+                "confirm_token": token,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(d["ok"], 2, "令牌放行后整批执行: {d}");
+
+    // 令牌一次性：再用来一次应当失效
+    let e3 = fx
+        .call_err(
+            methods::BATCH_RUN,
+            json!({
+                "cmd": "systemctl restart nginx",
+                "all": true,
+                "mode": "exec",
+                "confirm_token": token,
+            }),
+        )
+        .await;
+    assert_eq!(err_code(&e3), "invalid_args");
+}
+
+/// 批量只扣一次速率配额（FR-5.5）：30 台不等于 30 次
+#[tokio::test]
+async fn batch_consumes_one_quota_not_per_host() {
+    let mut cfg = AppConfig::default();
+    cfg.limits.rate_limit_per_min = 2; // 配额给 2：1 次批量 + 1 次单台，之后应被限流
+    let fx = fixture_with_hosts_cfg(
+        EchoShellFactory::with_exec(vec![ExecOutput {
+            stdout: "ok".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        }]),
+        cfg,
+        (0..30).map(|i| host_named(&format!("h{i}"), &[], &[])).collect(),
+    )
+    .await;
+
+    // 30 台整批：只算 1 次
+    let d = fx
+        .call(
+            methods::BATCH_RUN,
+            json!({ "cmd": "df -h", "all": true, "mode": "exec", "concurrency": 16 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(d["ok"], 30, "30 台只扣一次配额，不该被限流: {d}");
+
+    // 第 2 次：单台 exec 还能过
+    fx.call(
+        methods::EXEC_RUN,
+        json!({ "host": "h0", "cmd": "df -h", "mode": "exec" }),
+    )
+    .await
+    .expect("配额还剩一次，单台 exec 应放行");
+
+    // 第 3 次：配额用尽
+    let e = fx
+        .call_err(
+            methods::EXEC_RUN,
+            json!({ "host": "h0", "cmd": "df -h", "mode": "exec" }),
+        )
+        .await;
+    assert_eq!(err_code(&e), "rate_limited");
 }

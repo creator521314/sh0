@@ -77,6 +77,11 @@ pub enum AiObject {
         #[command(subcommand)]
         cmd: BroadcastCmd,
     },
+    /// 批量执行：一组主机跑同一条命令（M3 / FR-5.2）
+    Batch {
+        #[command(subcommand)]
+        cmd: BatchCmd,
+    },
     /// 审计查询（FR-8.4）
     Log {
         #[command(subcommand)]
@@ -226,6 +231,47 @@ pub enum InputCmd {
         /// 末尾补一个换行（等价于敲回车，仅对 --text 有意义）
         #[arg(long)]
         enter: bool,
+    },
+}
+
+/// 批量执行（FR-5.2 / FR-5.3）：一组主机、一条命令。
+///
+/// 目标三选一并可叠加：显式 `--host`（可重复或逗号分隔）、`--group`、
+/// `--tag`；`--all` 必须显式写出——"对全部机器执行"不该由"条件都没给"隐式触发。
+#[derive(Debug, Subcommand)]
+pub enum BatchCmd {
+    /// 在一组主机上执行同一条命令
+    Exec {
+        /// 主机名或 id，可重复传入，也可逗号分隔
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        /// 分组前缀，如 `prod`（命中 prod 及其子分组）
+        #[arg(long)]
+        group: Option<String>,
+        /// 标签
+        #[arg(long)]
+        tag: Option<String>,
+        /// 全部主机
+        #[arg(long)]
+        all: bool,
+        /// 要执行的命令
+        #[arg(long)]
+        cmd: String,
+        /// shell（哨兵截取，保留交互上下文）/ exec（独立 channel，默认）
+        #[arg(long, default_value = "exec")]
+        mode: String,
+        /// 并发上限，默认取配置（16）
+        #[arg(long)]
+        concurrency: Option<usize>,
+        /// 有失败就尽快停下，剩下的标记 skipped
+        #[arg(long)]
+        fail_fast: bool,
+        /// 汇总格式：table（人读）/ json / csv
+        #[arg(long, default_value = "table")]
+        out: String,
+        /// 导出到文件（配合 --out json|csv），不写则只打印
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
     },
 }
 
@@ -428,6 +474,9 @@ pub mod exit_code {
 pub fn code_to_exit(code: &str) -> (String, i32) {
     match code {
         "remote_nonzero" => (code.to_string(), exit_code::REMOTE_NONZERO),
+        // 批量里有一部分机器失败：与"远端退出码非零"同档——
+        // AI 的应对都是"看 data 里的明细"，退出码不该再发明一个数字
+        "batch_partial" => (code.to_string(), exit_code::REMOTE_NONZERO),
         "risk_denied" => (code.to_string(), exit_code::RISK_DENIED),
         "needs_confirmation" => (code.to_string(), exit_code::NEEDS_CONFIRMATION),
         "timeout" => (code.to_string(), exit_code::TIMEOUT),
@@ -898,6 +947,101 @@ async fn dispatch(
                 Ok((out, data))
             }
         },
+        AiObject::Batch { cmd } => match cmd {
+            BatchCmd::Exec {
+                hosts,
+                group,
+                tag,
+                all,
+                cmd,
+                mode,
+                concurrency,
+                fail_fast,
+                out,
+                output,
+            } => {
+                if !matches!(mode.as_str(), "shell" | "exec") {
+                    return Err(AiError::Args(format!(
+                        "未知 mode: {mode}（可选 shell / exec）"
+                    )));
+                }
+                if !matches!(out.as_str(), "table" | "json" | "csv") {
+                    return Err(AiError::Args(format!(
+                        "未知 out: {out}（可选 table / json / csv）"
+                    )));
+                }
+                let c = require_client(client)?;
+                let mut params = json!({
+                    "hosts": hosts,
+                    "group": group,
+                    "tag": tag,
+                    "all": all,
+                    "cmd": cmd,
+                    "mode": mode,
+                    "fail_fast": fail_fast,
+                    "timeout_ms": ctx.timeout_secs * 1000,
+                    "dry_run": ctx.dry_run,
+                    "yes": ctx.yes,
+                });
+                if let Some(n) = concurrency {
+                    params["concurrency"] = json!(n);
+                }
+                ctx.trace(&mut params);
+                let data = c.call(methods::BATCH_RUN, params).await?;
+
+                if ctx.dry_run {
+                    let risk = data.get("risk").and_then(|v| v.as_str()).unwrap_or("?");
+                    let total = data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let hosts: Vec<&str> = data
+                        .get("hosts")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                        .unwrap_or_default();
+                    return Ok((
+                        format!(
+                            "{cmd}  ·  {total} 台  ·  风险评估: {risk}{}\n目标: {}\n",
+                            if risk == "auto" {
+                                "（会被放行）"
+                            } else {
+                                "（会被拦截，需确认或拒绝）"
+                            },
+                            hosts.join(", ")
+                        ),
+                        data,
+                    ));
+                }
+
+                // 导出：--out json/csv 时把整份 data 或表格落到文件
+                if let Some(path) = output {
+                    let text = match out.as_str() {
+                        "csv" => batch_csv(&data),
+                        _ => serde_json::to_string_pretty(&data).unwrap_or_default(),
+                    };
+                    std::fs::write(&path, text).map_err(|e| {
+                        AiError::Other(format!("写导出文件失败 {}: {e}", path.display()))
+                    })?;
+                    if !ctx.quiet {
+                        eprintln!("已导出到 {}", path.display());
+                    }
+                }
+
+                let text = batch_text(&data, &out);
+                let failed = data.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+                if failed > 0 {
+                    // 部分失败：退出码非零，但整份结果仍在 data 里（§6.3）
+                    return Err(AiError::Remote {
+                        code: "batch_partial".into(),
+                        message: format!(
+                            "{} 台未成功（共 {} 台），明细见 data.results",
+                            failed,
+                            data.get("total").and_then(|v| v.as_u64()).unwrap_or(0)
+                        ),
+                        data: Some(data),
+                    });
+                }
+                Ok((text, data))
+            }
+        },
         AiObject::Screen { cmd } => match cmd {
             ScreenCmd::Read {
                 session,
@@ -1362,6 +1506,119 @@ fn exec_text(data: &Value, suffix: Option<&str>) -> String {
 }
 
 /// 把 --text / --keys / --hex 合成最终要发送的字节串
+/// 批量结果的人读汇总：一行总览 + 逐台结果（失败排前面，FR-5.3）
+fn batch_text(data: &Value, out: &str) -> String {
+    if out == "json" {
+        return serde_json::to_string_pretty(data).unwrap_or_default();
+    }
+    if out == "csv" {
+        return batch_csv(data);
+    }
+
+    let total = data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ok = data.get("ok").and_then(|v| v.as_u64()).unwrap_or(0);
+    let failed = data.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+    let skipped = data.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ms = data.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+    let conc = data.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(0);
+    let risk = data.get("risk").and_then(|v| v.as_str()).unwrap_or("-");
+
+    let mut s = format!(
+        "{} 台 · 成功 {ok} · 失败 {failed} · 跳过 {skipped} · 并发 {conc} · 风险 {risk} · 耗时 {:.2}s\n",
+        total,
+        ms as f64 / 1000.0
+    );
+
+    let mut rows: Vec<&Value> = data
+        .get("results")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    // 失败的排前面：批量巡检时人要第一时间看到哪几台有问题
+    rows.sort_by_key(|r| {
+        let st = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        match st {
+            "ok" => 2,
+            "skipped" => 1,
+            _ => 0,
+        }
+    });
+    for r in rows {
+        let host = r.get("host").and_then(|v| v.as_str()).unwrap_or("-");
+        let st = r.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+        let code = r
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        let d = r.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+        let mark = match st {
+            "ok" => "✔",
+            "skipped" => "○",
+            _ => "✘",
+        };
+        let out_first = r
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let err = r
+            .get("error")
+            .and_then(|v| v.as_str())
+            .filter(|e| !e.is_empty())
+            .map(|e| format!("  {e}"))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "{mark} {host:<20} {st:<8} exit={code:<4} {d}ms  {out_first}{err}\n"
+        ));
+    }
+    s
+}
+
+/// 批量结果导出 CSV：表头固定，字段按 RFC4180 转义（Excel / jq 可直接读）
+fn batch_csv(data: &Value) -> String {
+    let mut s = String::from("host,status,ok,exit_code,duration_ms,timeout,truncated,stdout,error\n");
+    let empty: Vec<Value> = Vec::new();
+    let rows = data.get("results").and_then(|v| v.as_array()).unwrap_or(&empty);
+    for r in rows {
+        let pick = |k: &str| -> String {
+            match r.get(k) {
+                Some(Value::String(x)) => x.clone(),
+                Some(Value::Null) | None => String::new(),
+                Some(other) => other.to_string(),
+            }
+        };
+        let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut fields = vec![
+            pick("host"),
+            pick("status"),
+            ok.to_string(),
+            pick("exit_code"),
+            pick("duration_ms"),
+            pick("timeout"),
+            pick("truncated"),
+            pick("stdout"),
+            pick("error"),
+        ];
+        fields = fields
+            .into_iter()
+            .map(|f| {
+                if f.contains([',', '"', '\n', '\r']) {
+                    format!("\"{}\"", f.replace('"', "\"\""))
+                } else {
+                    f
+                }
+            })
+            .collect();
+        s.push_str(&fields.join(","));
+        s.push('\n');
+    }
+    s
+}
+
 /// 广播态的人读表述（开/关 + 目标范围）
 fn broadcast_status_text(data: &Value) -> String {
     let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1471,4 +1728,62 @@ fn parse_hex(s: &str) -> Result<String, AiError> {
 
 fn require_client(client: Option<Arc<IpcClient>>) -> Result<Arc<IpcClient>, AiError> {
     client.ok_or_else(|| AiError::Ipc("daemon 未运行，请先执行 `sh0 daemon run`".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_batch() -> Value {
+        json!({
+            "run_id": "br_1",
+            "command": "df -h /",
+            "mode": "exec",
+            "risk": "auto",
+            "concurrency": 16,
+            "total": 3,
+            "ok": 2,
+            "failed": 1,
+            "skipped": 0,
+            "duration_ms": 1200,
+            "results": [
+                {"host":"h0","status":"ok","ok":true,"exit_code":0,"stdout":"40%","stderr":"","duration_ms":12,"truncated":false,"timeout":false,"error":null},
+                {"host":"h1","status":"error","ok":false,"exit_code":null,"stdout":"","stderr":"","duration_ms":30,"truncated":false,"timeout":false,"error":"boom, \"quoted\""},
+                {"host":"h2","status":"ok","ok":true,"exit_code":0,"stdout":"a,b","stderr":"","duration_ms":15,"truncated":false,"timeout":false,"error":null}
+            ]
+        })
+    }
+
+    /// CSV 要能被 Excel / jq 直接读：逗号与引号按 RFC4180 转义（FR-5.3）
+    #[test]
+    fn batch_csv_escapes_commas_and_quotes() {
+        let csv = batch_csv(&sample_batch());
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "host,status,ok,exit_code,duration_ms,timeout,truncated,stdout,error"
+        );
+        assert_eq!(lines.len(), 4, "表头 + 3 行: {csv}");
+        assert!(csv.contains("\"a,b\""), "含逗号的字段要加引号: {csv}");
+        assert!(csv.contains("\"boom, \"\"quoted\"\"\""), "引号要双写: {csv}");
+    }
+
+    /// 汇总文本把失败的排前面：巡检时人第一时间看到有问题的机器
+    #[test]
+    fn batch_text_puts_failures_first() {
+        let t = batch_text(&sample_batch(), "table");
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].contains("3 台"), "首行是总览: {lines:?}");
+        assert!(lines[0].contains("成功 2"), "总览含成功数: {}", lines[0]);
+        let h1 = lines.iter().position(|l| l.contains("h1")).unwrap();
+        let h0 = lines.iter().position(|l| l.contains("h0")).unwrap();
+        assert!(h1 < h0, "失败的要排在成功前面: {t}");
+        assert!(lines.iter().any(|l| l.starts_with("✘")), "失败行用 ✘ 标记: {t}");
+    }
+
+    #[test]
+    fn batch_text_json_mode_emits_json() {
+        let t = batch_text(&sample_batch(), "json");
+        assert!(t.trim_start().starts_with('{'), "json 模式应输出 JSON: {t}");
+    }
 }

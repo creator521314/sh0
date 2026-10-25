@@ -98,6 +98,32 @@ impl Host {
     }
 }
 
+/// 批量操作的主机选择器（FR-5.2）。
+///
+/// 三种来源可叠加：显式列表 + 分组 + 标签，最终取并集去重；
+/// `all` 一旦为真就直接覆盖其余条件——"对全部机器执行"是很危险的动作，
+/// 必须让人显式写出来，而不是靠"条件都没给"隐式触发。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostSelector {
+    /// 主机名称或 id
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// 分组前缀：`prod` 命中 prod 及其子分组（prod/web）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+impl HostSelector {
+    /// 什么都没给：既不是"全部"，也没有具体目标
+    pub fn is_empty(&self) -> bool {
+        !self.all && self.hosts.is_empty() && self.group.is_none() && self.tag.is_none()
+    }
+}
+
 /// 会话状态机（需求 FR-2.6）。M0 只用到 Connecting / Ready / Closed。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

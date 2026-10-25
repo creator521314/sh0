@@ -158,6 +158,11 @@ pub mod methods {
     pub const BROADCAST_STATUS: &str = "broadcast.status";
     /// 向参与会话同时发送同一份输入（FR-5.1）
     pub const BROADCAST_SEND: &str = "broadcast.send";
+    /// 批量执行：一组主机跑同一条命令（FR-5.2 / FR-5.4）
+    pub const BATCH_RUN: &str = "batch.run";
+    /// 批量历史回看（FR-5.3 / OQ-5）
+    pub const BATCH_LIST: &str = "batch.list";
+    pub const BATCH_SHOW: &str = "batch.show";
 }
 
 /// 事件名常量

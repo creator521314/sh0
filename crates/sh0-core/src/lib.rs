@@ -17,7 +17,9 @@ pub mod mock;
 
 pub use error::{CoreError, Result};
 pub use ids::{HostId, SessionId, new_host_id, new_session_id};
-pub use model::{CredentialRef, Host, RiskLevel, SecretRef, SessionSnapshot, SessionState};
+pub use model::{
+    CredentialRef, Host, HostSelector, RiskLevel, SecretRef, SessionSnapshot, SessionState,
+};
 pub use risk::{Assessment, RiskEngine, Rule};
 pub use secret::{DefaultResolver, SecretResolver};
 pub use session::{

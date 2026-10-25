@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use sh0_core::RiskLevel;
+use sh0_core::session::SessionHandle;
+use sh0_core::{HostSelector, RiskLevel};
 
 /// 执行模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -85,6 +86,282 @@ pub struct ExecData {
     pub timeout: bool,
 }
 
+/// 一次批量请求（FR-5.2）。
+///
+/// 与 `ExecRequest` 的关键差别是目标从"一台"变成"一组"，
+/// 因此风险判定与配额都按**整批**算一次（FR-5.5），而不是每台各算一次。
+#[derive(Debug, Clone)]
+pub struct BatchRequest {
+    pub selector: HostSelector,
+    pub cmd: String,
+    pub timeout: Duration,
+    pub max_output_bytes: usize,
+    pub mode: ExecMode,
+    /// 并发上限（FR-5.4）
+    pub concurrency: usize,
+    /// 有失败就尽快停下，剩余主机标记为 skipped
+    pub fail_fast: bool,
+    pub actor: String,
+    pub trace_id: Option<String>,
+}
+
+impl BatchRequest {
+    /// 退化成单台请求，供确认令牌复用 exec 的存储结构（FR-5.5）
+    pub fn as_exec_request(&self) -> ExecRequest {
+        ExecRequest {
+            session: None,
+            host: self.selector.hosts.first().cloned(),
+            cmd: self.cmd.clone(),
+            timeout: self.timeout,
+            max_output_bytes: self.max_output_bytes,
+            mode: self.mode,
+            actor: self.actor.clone(),
+            trace_id: self.trace_id.clone(),
+        }
+    }
+}
+
+/// 从 IPC params 解析批量请求；参数不合法一律 `invalid_args`
+pub fn parse_batch_request(
+    params: &serde_json::Value,
+    default_timeout_secs: u64,
+    default_max_bytes: usize,
+    default_concurrency: usize,
+) -> std::result::Result<BatchRequest, ErrorBodyLite> {
+    let mut hosts: Vec<String> = params
+        .get("hosts")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // 逗号分隔的便捷写法：`--host a,b,c`
+    if let Some(s) = params.get("host").and_then(|v| v.as_str())
+        && !s.is_empty()
+    {
+        hosts.extend(s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()));
+    }
+    let group = params
+        .get("group")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let tag = params
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let all = params.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let selector = HostSelector {
+        hosts,
+        group,
+        tag,
+        all,
+    };
+    if selector.is_empty() {
+        return Err(ErrorBodyLite {
+            code: "invalid_args".into(),
+            message: "需要 --host / --group / --tag / --all 之一指定目标主机".into(),
+        });
+    }
+    let cmd = params
+        .get("cmd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if cmd.trim().is_empty() {
+        return Err(ErrorBodyLite {
+            code: "invalid_args".into(),
+            message: "命令不能为空".into(),
+        });
+    }
+    let mode = match params.get("mode").and_then(|v| v.as_str()) {
+        Some(m) => ExecMode::parse(m).ok_or_else(|| ErrorBodyLite {
+            code: "invalid_args".into(),
+            message: format!("未知 mode: {m}（可选 shell / exec）"),
+        })?,
+        // 批量默认走 exec channel：一批机器各建一条一次性连接，
+        // 不为每台维护会话，30 台并行时才有意义
+        None => ExecMode::Exec,
+    };
+    let timeout = Duration::from_secs(
+        params
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .map(|ms| ms / 1000)
+            .unwrap_or(default_timeout_secs)
+            .clamp(1, 3600),
+    );
+    let max_output_bytes = params
+        .get("max_output_bytes")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(default_max_bytes)
+        .clamp(1024, 16 * 1024 * 1024);
+    let concurrency = params
+        .get("concurrency")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(default_concurrency)
+        .clamp(1, 256);
+
+    Ok(BatchRequest {
+        selector,
+        cmd,
+        timeout,
+        max_output_bytes,
+        mode,
+        concurrency,
+        fail_fast: params.get("fail_fast").and_then(|v| v.as_bool()).unwrap_or(false),
+        actor: params
+            .get("actor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ai")
+            .to_string(),
+        trace_id: params
+            .get("trace_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// exec.rs 不该依赖 daemon 的错误类型，这里放一个最小错误体
+#[derive(Debug, Clone)]
+pub struct ErrorBodyLite {
+    pub code: String,
+    pub message: String,
+}
+
+/// 一次性会话等待就绪的宽限（秒）：连接失败不该把 exec 的整体超时吃光
+const CONNECT_GRACE_SECS: u64 = 20;
+
+/// 屏幕文本里扫描哨兵**输出行**（整行恰为 `SENTINEL:<整数>`），返回其退出码。
+///
+/// 与 `extract_output` 内部分开：那边输入是"已判定出现"的文本；
+/// 这边在轮询里被反复调用，提前命中就能少等一轮。
+/// 只管"跑完了没有"——输出内容由 `extract_output` 结合屏底样截取。
+pub fn scan_sentinel(text: &str, sentinel: &str) -> Option<i32> {
+    let pat = format!("{sentinel}:");
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix(&pat)
+            && let Ok(code) = rest.trim().parse::<i32>()
+        {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// 在一个会话上跑一条命令（shell 哨兵法）。
+///
+/// 抽成自由函数而非 `DaemonState` 的方法，是因为批量执行要在并发任务里
+/// 跑它——tokio 任务要求 'static，拿不到 `&DaemonState`（FR-5.4）。
+pub async fn exec_sentinel_on(
+    handle: &SessionHandle,
+    cmd: &str,
+    timeout: Duration,
+    max_output_bytes: usize,
+    host_name: &str,
+) -> std::result::Result<ExecData, ErrorBodyLite> {
+    use sh0_core::SessionState;
+
+    let started = Instant::now();
+
+    // 一次性会话：等它就绪（或失败）。别把整体超时吃光。
+    if handle.state().await != SessionState::Ready {
+        let grace = Duration::from_secs(CONNECT_GRACE_SECS).min(timeout);
+        let deadline = Instant::now() + grace;
+        loop {
+            let st = handle.state().await;
+            if st == SessionState::Ready {
+                break;
+            }
+            if st == SessionState::Closed {
+                let snap = handle.snapshot().await;
+                return Err(ErrorBodyLite {
+                    code: "session_unavailable".into(),
+                    message: format!(
+                        "连接失败: {}",
+                        snap.last_error.unwrap_or_else(|| "会话已关闭".into())
+                    ),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(ErrorBodyLite {
+                    code: "session_unavailable".into(),
+                    message: format!("等待连接就绪超时（{grace:?} 后仍未 ready）"),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let sentinel = new_sentinel();
+    let screen = handle.screen();
+    let cols = {
+        let s = screen.lock().await;
+        s.cols()
+    };
+    let before = {
+        let s = screen.lock().await;
+        s.plain_text(true)
+    };
+    let payload = format!("{cmd}\necho {sentinel}:$?\n");
+    handle
+        .send(payload.as_bytes())
+        .await
+        .map_err(|e| ErrorBodyLite {
+            code: "session_unavailable".into(),
+            message: format!("发送命令失败: {e}"),
+        })?;
+
+    let deadline = started + timeout;
+    let mut last_after;
+    let (scan, timed_out) = loop {
+        let after = {
+            let s = screen.lock().await;
+            s.plain_text(true)
+        };
+        last_after = after.clone();
+        if scan_sentinel(&after, &sentinel).is_some() {
+            break (
+                extract_output(&before, &after, cmd, &sentinel, cols),
+                false,
+            );
+        }
+        if Instant::now() >= deadline {
+            break (extract_output(&before, &after, cmd, &sentinel, cols), true);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    tracing::debug!(
+        "exec 抓取 timed_out={timed_out} sentinel={sentinel} before={before:?} after={last_after:?}"
+    );
+    let (raw_stdout, exit_code) = match scan {
+        SentinelScan::Complete { output, exit_code } => (output, Some(exit_code)),
+        SentinelScan::Partial { output } => (output, None),
+    };
+    let (stdout, stderr, truncated) = truncate_output(raw_stdout, String::new(), max_output_bytes);
+
+    Ok(ExecData {
+        session_id: Some(handle.id.clone()),
+        host: host_name.to_string(),
+        exit_code,
+        stdout,
+        stderr,
+        duration_ms: started.elapsed().as_millis() as i64,
+        truncated,
+        mode: ExecMode::Shell,
+        risk: RiskLevel::Auto,
+        timeout: timed_out,
+    })
+}
+
 /// 待确认条目（FR-7.4 的无人值守令牌）
 #[derive(Debug, Clone)]
 pub struct PendingConfirm {
@@ -93,6 +370,8 @@ pub struct PendingConfirm {
     pub risk: RiskLevel,
     pub reason: Option<String>,
     pub expires_at: Instant,
+    /// 批量请求（FR-5.5）：Some 表示这次确认放行的是一整批
+    pub batch: Option<BatchRequest>,
 }
 
 /// 一次性确认令牌存储。令牌取出即消费——防止重放。
@@ -694,6 +973,7 @@ mod tests {
                 risk: RiskLevel::Confirm,
                 reason: None,
                 expires_at: Instant::now() + Duration::from_secs(60),
+                batch: None,
             },
         );
         assert!(store.take("cf_1").is_some());

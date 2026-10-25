@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use sh0_core::RiskLevel;
+use sh0_core::{Host, HostSelector, RiskLevel};
 
 use crate::error::{Result, StoreError};
 use crate::paths::Paths;
@@ -154,6 +154,10 @@ pub struct LimitsConfig {
     /// 单 actor 每分钟 exec 次数上限，0 = 关闭（FR-7.7）
     #[serde(default)]
     pub rate_limit_per_min: u32,
+    /// 批量执行的默认并发数（FR-5.2）；0 或未配置 = 内置默认 16。
+    /// 30 台各跑一个 `df -h`，并发 16 时总耗时应控制在 10s 内。
+    #[serde(default = "default_batch_concurrency")]
+    pub batch_concurrency: usize,
 }
 
 /// 风险引擎配置（需求 FR-7.5）
@@ -186,6 +190,9 @@ fn default_max_output_bytes() -> usize {
 fn default_exec_timeout() -> u64 {
     30
 }
+fn default_batch_concurrency() -> usize {
+    16
+}
 fn default_rules_file() -> String {
     "risk.toml".to_string()
 }
@@ -210,6 +217,7 @@ impl Default for LimitsConfig {
             max_output_bytes: default_max_output_bytes(),
             exec_timeout_secs: default_exec_timeout(),
             rate_limit_per_min: 0,
+            batch_concurrency: default_batch_concurrency(),
         }
     }
 }
@@ -336,6 +344,65 @@ impl Store {
             },
             None => Err(sh0_core::CoreError::HostNotFound(selector.to_string())),
         }
+    }
+
+    /// 批量选择主机（FR-5.2）：显式列表 / 分组前缀 / 标签，取并集去重。
+    ///
+    /// 显式列表里的名字找不到就**整个失败**——批量场景里"少跑了一台"
+    /// 比"跑不了"更难发现，宁可提前报错。
+    pub fn select_hosts(
+        &self,
+        sel: &HostSelector,
+    ) -> std::result::Result<Vec<Host>, sh0_core::CoreError> {
+        let all = self.load_hosts().map_err(|e| {
+            sh0_core::CoreError::Credential(format!("failed to read hosts.toml: {e}"))
+        })?;
+        if sel.is_empty() {
+            return Err(sh0_core::CoreError::HostNotFound("选择器为空".into()));
+        }
+        if sel.all {
+            return Ok(all.hosts);
+        }
+
+        let mut out: Vec<Host> = Vec::new();
+        let push = |h: &Host, out: &mut Vec<Host>| {
+            if !out.iter().any(|x| x.id == h.id) {
+                out.push(h.clone());
+            }
+        };
+
+        for name in &sel.hosts {
+            let Some(h) = all
+                .hosts
+                .iter()
+                .find(|h| h.name == *name || h.id == *name)
+            else {
+                return Err(sh0_core::CoreError::HostNotFound(name.clone()));
+            };
+            push(h, &mut out);
+        }
+        if let Some(g) = &sel.group {
+            let prefix = format!("{g}/");
+            for h in all
+                .hosts
+                .iter()
+                .filter(|h| h.group_path() == g.as_str() || h.group_path().starts_with(&prefix))
+            {
+                push(h, &mut out);
+            }
+        }
+        if let Some(t) = &sel.tag {
+            for h in all.hosts.iter().filter(|h| h.tags.iter().any(|x| x == t)) {
+                push(h, &mut out);
+            }
+        }
+        if out.is_empty() {
+            return Err(sh0_core::CoreError::HostNotFound(format!(
+                "没有任何主机匹配：{:?}",
+                sel
+            )));
+        }
+        Ok(out)
     }
 
     /// 用户风险规则文件路径（FR-7.5）。`rules_file` 来自 `cfg.risk.rules_file`

@@ -10,18 +10,21 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use sh0_core::session::{SessionConfig, SessionEvent, SessionHandle, spawn_session};
 use sh0_core::sftp::{SftpClient, SftpError, SftpResult};
 use sh0_core::{
-    RiskEngine, RiskLevel, SessionSnapshot, SessionState, TransportFactory, new_session_id,
+    Host, HostSelector, RiskEngine, RiskLevel, SessionSnapshot, SessionState, TransportFactory,
+    new_session_id,
 };
 use sh0_ipc::protocol::{DaemonInfo, ErrorBody, events, methods};
 use sh0_ipc::{EventHub, Handler, ServerMsg, serve};
@@ -30,8 +33,9 @@ use sh0_store::{AppConfig, AuditDb, AuditFilter, AuditRecord, CredentialStore, S
 use sh0_term::{GridView, MemoryBudget};
 
 use crate::exec::{
-    ConfirmStore, ExecData, ExecMode, ExecRequest, PendingConfirm, RateLimiter, SentinelScan,
-    extract_output, new_sentinel, truncate_output,
+    BatchRequest, ConfirmStore, ExecData, ExecMode, ExecRequest, PendingConfirm, RateLimiter,
+    SentinelScan, exec_sentinel_on, extract_output, new_sentinel, parse_batch_request,
+    truncate_output,
 };
 
 /// 保留多少个已结束会话的快照，供事后查询
@@ -593,6 +597,7 @@ impl DaemonState {
                             risk: RiskLevel::Confirm,
                             reason: assessment.reason.clone(),
                             expires_at: Instant::now() + Duration::from_secs(CONFIRM_TTL_SECS),
+                            batch: None,
                         },
                     );
                     self.audit(AuditRecord {
@@ -837,116 +842,21 @@ impl DaemonState {
         result
     }
 
-    /// 哨兵回显法本体
+    /// 哨兵回显法本体：纯逻辑在 `exec.rs::exec_sentinel_on`
+    /// （批量执行要在并发任务里复用它，那里拿不到 `&self`）
     async fn exec_sentinel(
         &self,
         handle: &SessionHandle,
         req: &ExecRequest,
         host_name: &str,
     ) -> std::result::Result<ExecData, ErrorBody> {
-        let started = Instant::now();
-
-        // 一次性会话：等它就绪（或失败）。别把整体超时吃光。
-        if handle.state().await != SessionState::Ready {
-            let grace = Duration::from_secs(CONNECT_GRACE_SECS).min(req.timeout);
-            let deadline = Instant::now() + grace;
-            loop {
-                let st = handle.state().await;
-                if st == SessionState::Ready {
-                    break;
-                }
-                if st == SessionState::Closed {
-                    let snap = handle.snapshot().await;
-                    return Err(ErrorBody {
-                        code: "session_unavailable".into(),
-                        message: format!(
-                            "连接失败: {}",
-                            snap.last_error.unwrap_or_else(|| "会话已关闭".into())
-                        ),
-                        data: None,
-                    });
-                }
-                if Instant::now() >= deadline {
-                    return Err(ErrorBody {
-                        code: "session_unavailable".into(),
-                        message: format!("等待连接就绪超时（{grace:?} 后仍未 ready）"),
-                        data: None,
-                    });
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-
-        let sentinel = new_sentinel();
-        // 发送前先留一份屏幕底样：回显定位与"新输出"边界都靠它
-        let screen = handle.screen();
-        // 列宽用于把 PTY 硬折的行还原成逻辑行（长命令回显会折行）
-        let cols = {
-            let s = screen.lock().await;
-            s.cols()
-        };
-        let before = {
-            let s = screen.lock().await;
-            s.plain_text(true)
-        };
-        let payload = format!("{}\necho {}:$?\n", req.cmd, sentinel);
-        handle
-            .send(payload.as_bytes())
+        exec_sentinel_on(handle, &req.cmd, req.timeout, req.max_output_bytes, host_name)
             .await
             .map_err(|e| ErrorBody {
-                code: "session_unavailable".into(),
-                message: format!("发送命令失败: {e}"),
+                code: e.code,
+                message: e.message,
                 data: None,
-            })?;
-
-        // 轮询哨兵**输出行**（不是 contains——echo 命令的回显行也含哨兵 id，
-        // 会在命令还没跑完时就误判结束）
-        let deadline = started + req.timeout;
-        let mut last_after;
-        let (scan, timed_out) = loop {
-            let after = {
-                let s = screen.lock().await;
-                s.plain_text(true)
-            };
-            last_after = after.clone();
-            if scan_sentinel(&after, &sentinel).is_some() {
-                // 哨兵已出现：交给 extract_output 结合屏底样截输出与退出码
-                break (
-                    extract_output(&before, &after, &req.cmd, &sentinel, cols),
-                    false,
-                );
-            }
-            if Instant::now() >= deadline {
-                break (
-                    extract_output(&before, &after, &req.cmd, &sentinel, cols),
-                    true,
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-
-        tracing::debug!(
-            "exec 抓取 timed_out={timed_out} sentinel={sentinel} before={before:?} after={last_after:?}"
-        );
-        let (raw_stdout, exit_code) = match scan {
-            SentinelScan::Complete { output, exit_code } => (output, Some(exit_code)),
-            SentinelScan::Partial { output } => (output, None),
-        };
-        let (stdout, stderr, truncated) =
-            truncate_output(raw_stdout, String::new(), req.max_output_bytes);
-
-        Ok(ExecData {
-            session_id: Some(handle.id.clone()),
-            host: host_name.to_string(),
-            exit_code,
-            stdout,
-            stderr,
-            duration_ms: started.elapsed().as_millis() as i64,
-            truncated,
-            mode: ExecMode::Shell,
-            risk: RiskLevel::Auto,
-            timeout: timed_out,
-        })
+            })
     }
 
     /// exec.confirm：有人值守时 TUI 弹窗的应答入口（FR-7.4）
@@ -1211,30 +1121,455 @@ impl DaemonState {
             "failed": failed,
         }))
     }
-}
 
-/// 屏幕文本里扫描哨兵输出行（整行恰为 `SENTINEL:<整数>`）。
-///
-/// 与 `exec.rs::extract_output` 内部分开：那边输入是"已判定出现"的文本；
-/// 这边在轮询里被反复调用，提前命中就能少等一轮。
-/// 探测哨兵输出行是否已出现，返回其中携带的退出码。
-///
-/// 只管"跑完了没有"——输出内容由 `extract_output` 专门截取。
-/// 两者必须分开：本函数逐行扫的是**整行恰为** `SENTINEL:<整数>` 的那一行的
-/// 退出码，而输出需要结合发送前的屏底样才能算准。
-fn scan_sentinel(text: &str, sentinel: &str) -> Option<i32> {
-    let pat = format!("{sentinel}:");
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix(&pat)
-            && let Ok(code) = rest.trim().parse::<i32>()
-        {
-            return Some(code);
+    // ---- M3 · 批量执行（FR-5.2 / FR-5.4 / FR-5.5）----
+
+    /// batch.run：一组主机跑同一条命令。
+    ///
+    /// 与 exec.run 的差别：目标是一组主机、并发执行、逐台超时，
+    /// 而风险判定与速率配额**整批只算一次**（FR-5.5）——
+    /// 30 台各扣一次配额等于把批量直接判死。
+    async fn batch_run(&self, params: &Value) -> std::result::Result<Value, ErrorBody> {
+        let dry_run = params
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let yes = params.get("yes").and_then(|v| v.as_bool()).unwrap_or(false);
+        let token = params
+            .get("confirm_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let default_concurrency = if self.cfg.limits.batch_concurrency == 0 {
+            16
+        } else {
+            self.cfg.limits.batch_concurrency
+        };
+        let req = parse_batch_request(
+            params,
+            self.cfg.limits.exec_timeout_secs,
+            self.cfg.limits.max_output_bytes,
+            default_concurrency,
+        )
+        .map_err(|e| ErrorBody {
+            code: e.code,
+            message: e.message,
+            data: None,
+        })?;
+
+        let hosts = self.store.select_hosts(&req.selector).map_err(|e| ErrorBody {
+            code: "host_not_found".into(),
+            message: e.to_string(),
+            data: None,
+        })?;
+
+        // 风险整批判一次：多台主机的 risk_cap 取最严（cap 越小越严，None 视为不限制）
+        let cap: Option<RiskLevel> = hosts
+            .iter()
+            .map(|h| h.risk_cap.unwrap_or(RiskLevel::Deny))
+            .min();
+        let assessment = self.engine.assess(&req.cmd).capped(cap);
+
+        if dry_run {
+            return Ok(json!({
+                "dry_run": true,
+                "command": req.cmd,
+                "risk": risk_str(assessment.level),
+                "reason": assessment.reason,
+                "total": hosts.len(),
+                "concurrency": req.concurrency,
+                "hosts": hosts.iter().map(|h| h.name.clone()).collect::<Vec<_>>(),
+            }));
+        }
+
+        match assessment.level {
+            RiskLevel::Deny => {
+                self.audit(AuditRecord {
+                    ts: now_rfc3339(),
+                    trace_id: req.trace_id.clone(),
+                    session_id: None,
+                    host_name: Some(format!("batch×{}", hosts.len())),
+                    actor: req.actor.clone(),
+                    action: "batch.run".into(),
+                    command: Some(req.cmd.clone()),
+                    risk: Some("deny".into()),
+                    decision: Some("denied".into()),
+                    exit_code: None,
+                    duration_ms: None,
+                    truncated: false,
+                    error: assessment.reason.clone(),
+                    stdout: None,
+                    stderr: None,
+                });
+                Err(ErrorBody {
+                    code: "risk_denied".into(),
+                    message: format!(
+                        "命令命中禁止规则，整批拒绝: {}",
+                        assessment.reason.as_deref().unwrap_or("未说明")
+                    ),
+                    data: None,
+                })
+            }
+            RiskLevel::Confirm => {
+                let mut approved = yes;
+                if let Some(t) = token.as_deref() {
+                    approved = match self.confirms.take(t) {
+                        // 令牌里的批量请求必须与本次命令一致，防止令牌挪用
+                        Some(p) if p.batch.as_ref().is_some_and(|b| b.cmd == req.cmd) => true,
+                        Some(_) => {
+                            return Err(ErrorBody {
+                                code: "invalid_args".into(),
+                                message: "确认令牌与本次调用不匹配（命令不同或不是批量请求）".into(),
+                                data: None,
+                            })
+                        }
+                        None => {
+                            return Err(ErrorBody {
+                                code: "invalid_args".into(),
+                                message: "确认令牌无效或已过期，请重新发起调用".into(),
+                                data: None,
+                            })
+                        }
+                    };
+                }
+                if !approved {
+                    let t = format!("cf_{}", new_session_id());
+                    self.confirms.insert(
+                        t.clone(),
+                        PendingConfirm {
+                            req: req.as_exec_request(),
+                            host_name: format!("batch×{}", hosts.len()),
+                            risk: RiskLevel::Confirm,
+                            reason: assessment.reason.clone(),
+                            expires_at: Instant::now() + Duration::from_secs(CONFIRM_TTL_SECS),
+                            batch: Some(req.clone()),
+                        },
+                    );
+                    self.audit(AuditRecord {
+                        ts: now_rfc3339(),
+                        trace_id: req.trace_id.clone(),
+                        session_id: None,
+                        host_name: Some(format!("batch×{}", hosts.len())),
+                        actor: req.actor.clone(),
+                        action: "batch.run".into(),
+                        command: Some(req.cmd.clone()),
+                        risk: Some("confirm".into()),
+                        decision: Some("needs_confirmation".into()),
+                        exit_code: None,
+                        duration_ms: None,
+                        truncated: false,
+                        error: assessment.reason.clone(),
+                        stdout: None,
+                        stderr: None,
+                    });
+                    let host_names: Vec<String> = hosts.iter().map(|h| h.name.clone()).collect();
+                    self.hub.emit(ServerMsg::event(
+                        events::CONFIRM_REQUESTED,
+                        None,
+                        json!({
+                            "token": t,
+                            "host": format!("batch×{}", hosts.len()),
+                            "command": req.cmd,
+                            "risk": "confirm",
+                            "reason": assessment.reason,
+                        }),
+                    ));
+                    return Err(ErrorBody {
+                        code: "needs_confirmation".into(),
+                        message: format!(
+                            "批量命令需确认后执行（{} 台）: {}",
+                            hosts.len(),
+                            assessment.reason.as_deref().unwrap_or("命中确认规则")
+                        ),
+                        data: Some(json!({
+                            "confirm_token": t,
+                            "hosts": host_names,
+                            "command": req.cmd,
+                            "risk": "confirm",
+                            "reason": assessment.reason,
+                            "expires_in_secs": CONFIRM_TTL_SECS,
+                        })),
+                    });
+                }
+                self.batch_execute(&req, &hosts, assessment.level, true)
+                    .await
+            }
+            RiskLevel::Auto => {
+                self.batch_execute(&req, &hosts, assessment.level, false)
+                    .await
+            }
         }
     }
-    None
+
+    /// 风险放行后的并发执行：并发池 + 逐台超时 + 汇总
+    async fn batch_execute(
+        &self,
+        req: &BatchRequest,
+        hosts: &[Host],
+        risk: RiskLevel,
+        confirmed: bool,
+    ) -> std::result::Result<Value, ErrorBody> {
+        // 速率：整批算一次（FR-5.5）
+        let limit = self.cfg.limits.rate_limit_per_min;
+        if !self.rate.check(&req.actor, limit) {
+            return Err(ErrorBody {
+                code: "rate_limited".into(),
+                message: format!(
+                    "actor {actor} 超出每分钟 {limit} 次的上限",
+                    actor = req.actor
+                ),
+                data: None,
+            });
+        }
+
+        let started = Instant::now();
+        let run_id = format!("br_{}", new_session_id());
+        let concurrency = req.concurrency.max(1);
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let mut set: JoinSet<(usize, BatchOutcome)> = JoinSet::new();
+        for (idx, host) in hosts.iter().enumerate() {
+            let factory = self.factory.clone();
+            let host = host.clone();
+            let cmd = req.cmd.clone();
+            let mode = req.mode;
+            let timeout = req.timeout;
+            let max_bytes = req.max_output_bytes;
+            let fail_fast = req.fail_fast;
+            let sem = sem.clone();
+            let cancelled = cancelled.clone();
+            let scfg = self.session_config(self.cfg.cols, self.cfg.rows);
+            set.spawn(async move {
+                // 并发闸门：信号量决定"同时在跑几台"（FR-5.4）
+                let _permit = sem.acquire().await;
+                if cancelled.load(Ordering::Relaxed) {
+                    return (idx, BatchOutcome::Skipped);
+                }
+                let t0 = Instant::now();
+                let r = match mode {
+                    ExecMode::Exec => match factory.exec(&host, &cmd, timeout).await {
+                        Ok(out) => {
+                            let (stdout, stderr, truncated) =
+                                truncate_output(out.stdout, out.stderr, max_bytes);
+                            let timed_out = t0.elapsed() >= timeout && out.exit_code.is_none();
+                            Ok(ExecData {
+                                session_id: None,
+                                host: host.name.clone(),
+                                exit_code: out.exit_code,
+                                stdout,
+                                stderr,
+                                duration_ms: t0.elapsed().as_millis() as i64,
+                                truncated,
+                                mode,
+                                risk: RiskLevel::Auto,
+                                timeout: timed_out,
+                            })
+                        }
+                        Err(e) => Err(format!("{e}")),
+                    },
+                    ExecMode::Shell => {
+                        // 一次性会话：不进会话表（批量不该污染 session.list）
+                        let handle = spawn_oneshot_session(host.clone(), factory.clone(), scfg);
+                        let r = exec_sentinel_on(&handle, &cmd, timeout, max_bytes, &host.name).await;
+                        let _ = handle.close().await;
+                        r.map_err(|e| e.message)
+                    }
+                };
+                let outcome = match r {
+                    Ok(d) => BatchOutcome::Done {
+                        ok: d.exit_code.unwrap_or(0) == 0 && !d.timeout,
+                        exit_code: d.exit_code,
+                        stdout: d.stdout,
+                        stderr: d.stderr,
+                        duration_ms: d.duration_ms,
+                        truncated: d.truncated,
+                        timeout: d.timeout,
+                        error: None,
+                    },
+                    Err(msg) => BatchOutcome::Done {
+                        ok: false,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        duration_ms: t0.elapsed().as_millis() as i64,
+                        truncated: false,
+                        timeout: false,
+                        error: Some(msg),
+                    },
+                };
+                // fail_fast：第一台失败就把其余还在排队的标记为跳过
+                if fail_fast && !outcome.is_ok() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                (idx, outcome)
+            });
+        }
+
+        let mut slots: Vec<Option<BatchOutcome>> = (0..hosts.len()).map(|_| None).collect();
+        let mut panicked = 0usize;
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((idx, o)) => slots[idx] = Some(o),
+                Err(_) => panicked += 1,
+            }
+        }
+
+        let results: Vec<Value> = hosts
+            .iter()
+            .zip(slots.into_iter())
+            .map(|(h, o)| {
+                o.unwrap_or(BatchOutcome::Skipped).to_json(&h.name)
+            })
+            .collect();
+        let ok_n = results
+            .iter()
+            .filter(|r| r["status"] == "ok")
+            .count();
+        let skipped_n = results
+            .iter()
+            .filter(|r| r["status"] == "skipped")
+            .count();
+        let failed_n = results.len() - ok_n - skipped_n;
+        let duration_ms = started.elapsed().as_millis() as i64;
+
+        let summary = if failed_n == 0 && panicked == 0 {
+            None
+        } else {
+            let names: Vec<String> = results
+                .iter()
+                .filter(|r| r["status"] != "ok")
+                .filter_map(|r| r["host"].as_str().map(str::to_string))
+                .collect();
+            Some(format!("{} 台未成功: {}", names.len(), names.join(", ")))
+        };
+
+        self.audit(AuditRecord {
+            ts: now_rfc3339(),
+            trace_id: req.trace_id.clone(),
+            session_id: None,
+            host_name: Some(format!("batch×{}", hosts.len())),
+            actor: req.actor.clone(),
+            action: "batch.run".into(),
+            command: Some(req.cmd.clone()),
+            risk: Some(risk_str(risk)),
+            decision: Some(if failed_n > 0 || panicked > 0 {
+                "partial".into()
+            } else if confirmed {
+                "confirmed".into()
+            } else {
+                "executed".into()
+            }),
+            exit_code: None,
+            duration_ms: Some(duration_ms),
+            truncated: false,
+            error: summary,
+            stdout: None,
+            stderr: None,
+        });
+
+        Ok(json!({
+            "run_id": run_id,
+            "command": req.cmd,
+            "mode": req.mode.as_str(),
+            "risk": risk_str(risk),
+            "concurrency": concurrency,
+            "total": hosts.len(),
+            "ok": ok_n,
+            "failed": failed_n,
+            "skipped": skipped_n,
+            "duration_ms": duration_ms,
+            "results": results,
+        }))
+    }
 }
 
+/// 一台主机的批量结果
+enum BatchOutcome {
+    /// fail_fast 之后被跳过的
+    Skipped,
+    Done {
+        ok: bool,
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        duration_ms: i64,
+        truncated: bool,
+        timeout: bool,
+        error: Option<String>,
+    },
+}
+
+impl BatchOutcome {
+    fn is_ok(&self) -> bool {
+        matches!(self, BatchOutcome::Done { ok: true, .. })
+    }
+
+    fn to_json(&self, host: &str) -> Value {
+        match self {
+            BatchOutcome::Skipped => json!({
+                "host": host,
+                "status": "skipped",
+                "ok": false,
+                "exit_code": Value::Null,
+                "stdout": "",
+                "stderr": "",
+                "duration_ms": 0,
+                "truncated": false,
+                "timeout": false,
+                "error": "fail_fast：前面的主机已失败，未执行",
+            }),
+            BatchOutcome::Done {
+                ok,
+                exit_code,
+                stdout,
+                stderr,
+                duration_ms,
+                truncated,
+                timeout,
+                error,
+            } => {
+                let status = if *timeout {
+                    "timeout"
+                } else if error.is_some() {
+                    "error"
+                } else if *ok {
+                    "ok"
+                } else {
+                    "failed"
+                };
+                json!({
+                    "host": host,
+                    "status": status,
+                    "ok": ok,
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "duration_ms": duration_ms,
+                    "truncated": truncated,
+                    "timeout": timeout,
+                    "error": error,
+                })
+            }
+        }
+    }
+}
+
+/// 不在会话表登记的一次性会话（批量 shell 模式用）。
+///
+/// 批量一次建几十条连接，若都塞进 `sessions`，`session.list` 会被临时会话淹没；
+/// 事件无人订阅，但接收端必须有人读，否则 channel 会一直堆积。
+fn spawn_oneshot_session(
+    host: Host,
+    factory: Arc<dyn TransportFactory>,
+    cfg: SessionConfig,
+) -> SessionHandle {
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    let handle = spawn_session(host, factory, cfg, ev_tx);
+    tokio::spawn(async move { while ev_rx.recv().await.is_some() {} });
+    handle
+}
 fn risk_str(level: RiskLevel) -> String {
     match level {
         RiskLevel::Auto => "auto",
@@ -1573,6 +1908,7 @@ impl Handler for DaemonState {
             methods::BROADCAST_SET => self.broadcast_set(&params).await,
             methods::BROADCAST_STATUS => Ok(self.broadcast_status().await),
             methods::BROADCAST_SEND => self.broadcast_send(&params).await,
+            methods::BATCH_RUN => self.batch_run(&params).await,
 
             // ---- M4 · SFTP（FR-4.x / FR-6.6）----
             methods::FILE_LIST => {
