@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use serde_json::json;
 use sh0_ipc::ServerMsg;
 use sh0_ipc::protocol::methods;
@@ -31,6 +31,8 @@ use sh0_term::{Keymap, Screen, ScreenOptions};
 use crate::files::{FilePane, entry_line};
 use crate::hosts::{HostForm, HostTree, Row};
 use crate::render::{render_line, render_line_with_cursor};
+use crate::palette;
+use crate::palette::Palette;
 use crate::theme::Theme;
 use sh0_core::sftp::FileEntry;
 use sh0_term::keymap::Action;
@@ -246,6 +248,10 @@ pub struct App {
     tree_area: Cell<Rect>,
     /// 上一次点击 `(时刻, 行号)`，用于双击判定
     last_click: Option<(Instant, usize)>,
+    /// 命令面板（FR-3.6 / W5.1）；Some 时拦截全部按键
+    palette: Option<Palette>,
+    /// 当前主题名，供面板显示"当前"标记与切换后回写配置
+    theme_name: String,
 }
 
 impl App {
@@ -258,6 +264,7 @@ impl App {
         let hosts = store.load_hosts().map(|h| h.hosts).unwrap_or_default();
         let mut keymap = Keymap::preset(&cfg.keymap);
         keymap.apply_overrides(&cfg.keys);
+        let theme = Theme::preset(&cfg.theme);
         let budget = if cfg.memory_budget_mb == 0 {
             None
         } else {
@@ -274,7 +281,7 @@ impl App {
             active: 0,
             focus: Focus::Tree,
             keymap,
-            theme: Theme::default(),
+            theme,
             tree: HostTree::new(hosts),
             store,
             query: None,
@@ -303,6 +310,8 @@ impl App {
             mouse_captured: false,
             tree_area: Cell::new(Rect::default()),
             last_click: None,
+            palette: None,
+            theme_name: cfg.theme.clone(),
         }
     }
 
@@ -329,6 +338,7 @@ impl App {
             || self.pending_delete.is_some()
             || self.file_prompt.is_some()
             || self.file_delete.is_some()
+            || self.palette.is_some()
         {
             return Ok(());
         }
@@ -420,6 +430,11 @@ impl App {
     /// 当前选中的主机树行号（测试用）
     pub fn tree_selection(&self) -> usize {
         self.tree.selected
+    }
+
+    /// 当前主题名（测试用）
+    pub fn theme_name(&self) -> &str {
+        &self.theme_name
     }
 
     /// 已打开的会话（标签）数量（测试用）
@@ -514,7 +529,8 @@ impl App {
 
     // ---- 事件 ----
 
-    async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+    /// 按键入口。pub 是为了让契约测试能直接喂按键，不必真的跑一个终端。
+    pub async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         // 鼠标捕获可能因为 Shift 拖选被挂起，按键回来时顺手恢复
         self.restore_mouse();
         // 0) 风险确认弹窗优先：AI 在等一个"人"拍板，此刻任何键都属于这次决定
@@ -552,7 +568,35 @@ impl App {
             return Ok(());
         }
 
-        // 1) 主机编辑表单优先
+        // 1) 命令面板：它自己就是个输入框，按键全归它
+        if self.palette.is_some() {
+            // 先按当前输入算好候选，再进可变分支，免得借用打架
+            let total = self.palette_matches().len();
+            let Some(p) = self.palette.as_mut() else {
+                return Ok(());
+            };
+            match key.code {
+                KeyCode::Esc => self.palette = None,
+                KeyCode::Up => p.move_sel(-1, total),
+                KeyCode::Down => p.move_sel(1, total),
+                KeyCode::Backspace => p.backspace(),
+                KeyCode::Enter => {
+                    let sel = p.sel;
+                    let input = p.input.clone();
+                    self.palette = None;
+                    // 用关闭前的输入重算候选：面板已关，palette_matches() 会退回全量
+                    let picked = self.matches_for(&input).get(sel).map(|i| i.cmd.clone());
+                    if let Some(cmd) = picked {
+                        self.run_palette_cmd(cmd).await?;
+                    }
+                }
+                KeyCode::Char(c) => p.push(c),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // 2) 主机编辑表单优先
         if let Some(form) = self.form.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -591,7 +635,7 @@ impl App {
             return Ok(());
         }
 
-        // 2) 删除确认
+        // 3) 删除确认
         if let Some(host) = self.pending_delete.take() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -606,7 +650,7 @@ impl App {
             return Ok(());
         }
 
-        // 3) 搜索输入
+        // 4) 搜索输入
         if let Some(q) = self.query.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -634,7 +678,7 @@ impl App {
             return Ok(());
         }
 
-        // 4) 选择模式：方向键用来移动选区，不发给远端
+        // 5) 选择模式：方向键用来移动选区，不发给远端
         if self.selection.is_some() {
             match key.code {
                 KeyCode::Esc => {
@@ -654,12 +698,12 @@ impl App {
             return Ok(());
         }
 
-        // 5) 键位映射（命中的按键不会发给远端）
+        // 6) 键位映射（命中的按键不会发给远端）
         if let Some(action) = self.keymap.get(key) {
             return self.on_action(action).await;
         }
 
-        // 6) 焦点相关的裸按键
+        // 7) 焦点相关的裸按键
         match self.focus {
             Focus::Tree => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.tree.move_selection(-1),
@@ -877,6 +921,7 @@ impl App {
             Action::FileRefresh => self.file_refresh().await,
             Action::FileCopy => self.file_transfer().await,
             Action::HostSearch => self.query = Some(String::new()),
+            Action::CommandPalette => self.open_palette(),
             Action::HostNew => self.form = Some(HostForm::new(None)),
             Action::HostEdit => {
                 let host = self.tree.current_host();
@@ -1003,6 +1048,74 @@ impl App {
 
     pub fn broadcast(&self) -> bool {
         self.broadcast
+    }
+
+    // --- 命令面板（FR-3.6 / W5.1）-----------------------------------------
+
+    /// 打开命令面板
+    pub fn open_palette(&mut self) {
+        self.palette = Some(Palette::new());
+    }
+
+    /// 面板是否打开（测试用）
+    pub fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    /// 面板当前输入（测试用）
+    pub fn palette_input(&self) -> String {
+        self.palette.as_ref().map(|p| p.input.clone()).unwrap_or_default()
+    }
+
+    /// 展示用：按面板当前输入过滤后的候选项（复制一份，避免借用打架）
+    pub fn palette_matches(&self) -> Vec<palette::PaletteItem> {
+        let q = self.palette.as_ref().map(|p| p.input.clone()).unwrap_or_default();
+        self.matches_for(&q)
+    }
+
+    /// 按指定查询串过滤。执行选中项时面板已关闭，必须拿关闭前的输入来算，
+    /// 否则 query 变空、候选集变了，`sel` 就指向了另一条命令。
+    fn matches_for(&self, query: &str) -> Vec<palette::PaletteItem> {
+        let hosts: Vec<(String, String)> = self
+            .tree
+            .hosts_snapshot()
+            .into_iter()
+            .map(|h| (h.name.clone(), h.endpoint()))
+            .collect();
+        let all = palette::items(&hosts, &self.theme_name);
+        palette::filter(&all, query).into_iter().cloned().collect()
+    }
+
+    /// 执行面板选中项。连接主机走的是和回车/双击同一条 `open` 路径
+    pub async fn run_palette_cmd(&mut self, cmd: palette::PaletteCmd) -> anyhow::Result<()> {
+        match cmd {
+            palette::PaletteCmd::Action(a) => {
+                self.on_action(a).await?;
+            }
+            palette::PaletteCmd::Connect(name) => {
+                self.open(&name).await?;
+            }
+            palette::PaletteCmd::Theme(t) => {
+                self.theme = Theme::preset(t);
+                self.theme_name = t.to_string();
+                // 主题写回 config.toml，下次启动保持一致
+                match self.store.load_config() {
+                    Ok(mut cfg) => {
+                        cfg.theme = t.to_string();
+                        if let Err(e) = self.store.save_config(&cfg) {
+                            self.notice = format!("主题已切换，但写回配置失败：{e}");
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        self.notice = format!("主题已切换，但读配置失败：{e}");
+                        return Ok(());
+                    }
+                }
+                self.notice = format!("主题已切换为 {t}");
+            }
+        }
+        Ok(())
     }
 
     /// 把选区内容送出：先写父终端剪贴板（OSC 52），失败则发回会话。
@@ -1898,6 +2011,11 @@ impl App {
         if let Some(pc) = &self.confirm {
             self.draw_confirm(f, pc);
         }
+
+        // 命令面板压在最上层
+        if let Some(p) = &self.palette {
+            self.draw_palette(f, p);
+        }
     }
 
     /// 风险确认弹窗（FR-7.4）：AI 发起的 confirm 档命令在这里等一个"人"拍板
@@ -1943,6 +2061,78 @@ impl App {
             Style::default().fg(self.theme.warn),
         )));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    /// 命令面板：顶部输入框 + 下方候选列表，居中浮层（FR-3.6 / W5.1）
+    fn draw_palette(&self, f: &mut ratatui::Frame, p: &Palette) {
+        let area = centered_rect(60, 16, f.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.accent))
+            .title(" 命令面板 ");
+        f.render_widget(Clear, area);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+
+        f.render_widget(
+            Paragraph::new(format!("> {}", p.input)).style(
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rows[0],
+        );
+
+        let matches = self.palette_matches();
+        let visible = rows[1].height as usize;
+        // 选中行永远可见：滚到它越过可视区下沿时把窗口往下推
+        let start = if p.sel >= visible.saturating_add(0) && visible > 0 {
+            p.sel + 1 - visible
+        } else {
+            0
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        if matches.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（无匹配）",
+                Style::default().fg(self.theme.border_dim),
+            )));
+        }
+        for (i, item) in matches.iter().enumerate().skip(start).take(visible) {
+            let selected = i == p.sel;
+            let style = if selected {
+                Style::default()
+                    .fg(self.theme.status_fg)
+                    .bg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.theme.fg)
+            };
+            let w = rows[1].width as usize;
+            let title_w = item.title.chars().count();
+            let hint_w = w.saturating_sub(title_w + 3);
+            let hint = if hint_w > 2 {
+                let h: String = item.hint.chars().take(hint_w - 1).collect();
+                format!(" {h}")
+            } else {
+                String::new()
+            };
+            let mut spans = vec![Span::styled(
+                format!(" {}{}", item.title, " ".repeat(w.saturating_sub(title_w + 1 + hint.chars().count()))),
+                style,
+            )];
+            spans.push(Span::styled(
+                hint,
+                if selected { style } else { Style::default().fg(self.theme.border_dim) },
+            ));
+            lines.push(Line::from(spans));
+        }
+        f.render_widget(Paragraph::new(lines), rows[1]);
     }
 
     /// 双栏文件视图：左本地、右远程（FR-4.2）+ 底部传输队列（FR-4.4）

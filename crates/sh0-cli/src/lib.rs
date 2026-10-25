@@ -5,6 +5,7 @@
 //! IPC → daemon → mock 传输链路——这是 M2 契约测试（NFR-10）的前提。
 
 pub mod cli;
+pub mod config_cmd;
 pub mod creds_bridge;
 pub mod daemon;
 pub mod ensure;

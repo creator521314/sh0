@@ -1995,3 +1995,222 @@ async fn batch_history_is_persisted_and_replayable() {
         .await;
     assert_eq!(err_code(&e), "not_found");
 }
+
+// ---------------------------------------------------------------------------
+// M5 W5.1：命令面板（Ctrl+Shift+P）与主题切换（FR-3.6 / FR-3.7）
+// ---------------------------------------------------------------------------
+
+fn key(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(code, mods)
+}
+
+/// Ctrl+Shift+P 唤出面板，输入主机名过滤，回车直连
+#[tokio::test]
+async fn tui_command_palette_filters_and_connects() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![
+            host_named("web-01", &["prod"], &[]),
+            host_named("db-01", &["prod"], &[]),
+        ],
+    )
+    .await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+
+    // 唤出：三套预设都绑了 ctrl+shift+p
+    app.on_key(key(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+    assert!(app.palette_open(), "Ctrl+Shift+P 应打开命令面板");
+    assert_eq!(app.tab_count(), 0);
+
+    // 输入主机名过滤
+    for c in "web".chars() {
+        app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE)).await.unwrap();
+    }
+    assert_eq!(app.palette_input(), "web");
+    let hits = app.palette_matches();
+    assert!(
+        hits.iter().any(|i| i.title == "连接 web-01"),
+        "过滤应命中 web-01: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|i| i.title == "连接 db-01"),
+        "不该再出现 db-01: {hits:?}"
+    );
+
+    // 回车执行第一项 = 连接 web-01
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)).await.unwrap();
+    assert!(!app.palette_open(), "执行后面板应关闭");
+    assert_eq!(app.tab_count(), 1, "回车应打开会话");
+}
+
+/// 面板里能直接切主题，并且要写回 config.toml（下次启动保持一致）
+#[tokio::test]
+async fn tui_command_palette_switches_theme_and_persists() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let mut cfg = AppConfig::default();
+    cfg.theme = "dark".to_string();
+    let fx = fixture_with_hosts_cfg(EchoShellFactory::default(), cfg, vec![]).await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        fx.store.load_config().unwrap(),
+    );
+
+    app.open_palette();
+    for c in "light".chars() {
+        app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE)).await.unwrap();
+    }
+    let hits = app.palette_matches();
+    let light = hits.iter().find(|i| i.title.contains("light")).expect("应能搜到 light 主题");
+    assert_eq!(light.cmd, sh0_tui::palette::PaletteCmd::Theme("light"));
+
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)).await.unwrap();
+    assert_eq!(app.theme_name(), "light", "主题应切到 light");
+    assert_eq!(
+        fx.store.load_config().unwrap().theme,
+        "light",
+        "主题要写回 config.toml"
+    );
+}
+
+/// Esc 关闭面板，且关闭后按键恢复正常路由（不会被面板吃掉）
+#[tokio::test]
+async fn tui_command_palette_esc_cancels() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![host_named("h1", &[], &[])]).await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+
+    app.open_palette();
+    app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).await.unwrap();
+    assert_eq!(app.palette_input(), "x");
+    app.on_key(key(KeyCode::Esc, KeyModifiers::NONE)).await.unwrap();
+    assert!(!app.palette_open(), "Esc 应关闭面板");
+
+    // 退格不该再被面板吃掉：面板关闭后走的是普通路由
+    app.on_key(key(KeyCode::Backspace, KeyModifiers::NONE)).await.unwrap();
+    assert!(!app.palette_open(), "关闭后按键不该重新唤出面板");
+}
+
+/// 键位归一：终端对 Shift+G 上报大写 G，配置里写的却是 `shift+g`
+#[test]
+fn keymap_matches_uppercase_shift_letters() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use sh0_term::keymap::{Action, Keymap};
+
+    let km = Keymap::preset("vim");
+    let upper = key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+    let lower = key(KeyCode::Char('g'), KeyModifiers::SHIFT);
+    assert_eq!(
+        km.get(upper),
+        Some(Action::ScrollBottom),
+        "Shift+G（上报为大写）应命中 shift+g 绑定"
+    );
+    assert_eq!(km.get(lower), Some(Action::ScrollBottom));
+
+    // 三套预设都要能唤出命令面板
+    for preset in ["default", "vim", "xshell"] {
+        let km = Keymap::preset(preset);
+        let ctrl_shift_p = key(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(
+            km.get(ctrl_shift_p),
+            Some(Action::CommandPalette),
+            "{preset} 预设应绑定 ctrl+shift+p"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M5 W5.2：配置读写与热重载（FR-9.3 / FR-9.4）
+// ---------------------------------------------------------------------------
+
+/// `config.get` / `config.set` 走点路径，拼错键名要报错而不是静默成功
+#[tokio::test]
+async fn config_get_and_set_roundtrip() {
+    let fx = fixture().await;
+
+    // 默认值
+    let v = fx.store.config_get("limits.exec_timeout_secs").unwrap().unwrap();
+    assert_eq!(v, 30, "默认 exec 超时应是 30s");
+
+    // 写入并回读：数字不能变字符串
+    fx.store.config_set("limits.exec_timeout_secs", "60").unwrap();
+    let v2 = fx.store.config_get("limits.exec_timeout_secs").unwrap().unwrap();
+    assert_eq!(v2, 60);
+    let cfg = fx.store.load_config().unwrap();
+    assert_eq!(cfg.limits.exec_timeout_secs, 60);
+
+    // 布尔
+    fx.store.config_set("mouse", "false").unwrap();
+    assert_eq!(fx.store.config_get("mouse").unwrap().unwrap(), false);
+
+    // 字符串项：get 出来不该带引号
+    fx.store.config_set("theme", "light").unwrap();
+    let t = fx.store.config_get("theme").unwrap().unwrap();
+    assert_eq!(t.as_str().unwrap(), "light");
+    assert_eq!(sh0::config_cmd::value_to_string(&t), "light");
+
+    // 未知键名 → 报错（拼写错误不能假装成功）
+    let e = fx.store.config_set("limits.exec_timeut", "5");
+    assert!(e.is_err(), "拼错的键名必须报错");
+    assert!(fx.store.config_get("limits.exec_timeut").unwrap().is_none());
+}
+
+/// daemon 内存里的配置要能被热重载替换：改文件 → config.reload → 立即生效
+#[tokio::test]
+async fn config_reload_applies_without_restart() {
+    let fx = fixture().await;
+
+    // daemon 当前生效的超时
+    let cur = fx.call(methods::CONFIG_GET, json!({})).await.unwrap();
+    assert_eq!(cur["config"]["limits"]["exec_timeout_secs"], 30);
+
+    // 改文件
+    fx.store.config_set("limits.exec_timeout_secs", "90").unwrap();
+
+    // 没重载前，daemon 里还是旧值（证明"改文件不会自动生效"）
+    let before = fx.call(methods::CONFIG_GET, json!({})).await.unwrap();
+    assert_eq!(before["config"]["limits"]["exec_timeout_secs"], 30);
+
+    let r = fx.call(methods::CONFIG_RELOAD, json!({})).await.unwrap();
+    assert!(r["changed"].as_bool().unwrap(), "有改动应报告 changed");
+    let after = fx.call(methods::CONFIG_GET, json!({})).await.unwrap();
+    assert_eq!(
+        after["config"]["limits"]["exec_timeout_secs"], 90,
+        "重载后 daemon 应立刻用上新值"
+    );
+
+    // 再重载一次：无变化
+    let again = fx.call(methods::CONFIG_RELOAD, json!({})).await.unwrap();
+    assert!(!again["changed"].as_bool().unwrap(), "无改动不该重复应用");
+}
+
+/// 改了只有重启才生效的项时，重载提示要点出来（免得用户以为改了没用）
+#[tokio::test]
+async fn config_reload_notes_restart_only_keys() {
+    let fx = fixture().await;
+    fx.store.config_set("keepalive_secs", "15").unwrap();
+    let r = fx.call(methods::CONFIG_RELOAD, json!({})).await.unwrap();
+    let note = r["note"].as_str().unwrap();
+    assert!(note.contains("keepalive_secs"), "提示应点名 keepalive_secs: {note}");
+    assert!(note.contains("重启"), "提示应说明要重启: {note}");
+}

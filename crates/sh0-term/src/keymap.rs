@@ -45,6 +45,8 @@ pub enum Action {
     BroadcastToggle,
     /// 勾选/取消当前会话是否参与广播（FR-5.1）
     BroadcastMark,
+    /// 命令面板：模糊搜索并执行动作 / 连接主机 / 切换主题（FR-3.6）
+    CommandPalette,
 }
 
 impl Action {
@@ -74,6 +76,7 @@ impl Action {
             Action::FileCopy => "file.copy",
             Action::BroadcastToggle => "broadcast.toggle",
             Action::BroadcastMark => "broadcast.mark",
+            Action::CommandPalette => "command.palette",
         }
     }
 
@@ -103,6 +106,7 @@ impl Action {
             Action::FileCopy,
             Action::BroadcastToggle,
             Action::BroadcastMark,
+            Action::CommandPalette,
         ]
         .into_iter()
         .find(|a| a.as_str() == s)
@@ -134,6 +138,7 @@ impl Action {
             Action::FileCopy => "传文件到对面",
             Action::BroadcastToggle => "广播开关",
             Action::BroadcastMark => "勾选本会话广播",
+            Action::CommandPalette => "命令面板",
         }
     }
 }
@@ -177,6 +182,7 @@ impl Keymap {
             ("f5", Action::FileCopy),
             ("alt+b", Action::BroadcastToggle),
             ("alt+m", Action::BroadcastMark),
+            ("ctrl+shift+p", Action::CommandPalette),
         ])
     }
 
@@ -202,6 +208,7 @@ impl Keymap {
             ("f5", Action::FileCopy),
             ("alt+b", Action::BroadcastToggle),
             ("alt+m", Action::BroadcastMark),
+            ("ctrl+shift+p", Action::CommandPalette),
         ])
     }
 
@@ -227,6 +234,7 @@ impl Keymap {
             ("f5", Action::FileCopy),
             ("alt+b", Action::BroadcastToggle),
             ("alt+m", Action::BroadcastMark),
+            ("ctrl+shift+p", Action::CommandPalette),
         ])
     }
 
@@ -234,7 +242,7 @@ impl Keymap {
         let mut bindings = Vec::new();
         for (k, a) in pairs {
             match parse_key(k) {
-                Some(ev) => bindings.push((ev, *a)),
+                Some(ev) => bindings.push((normalize(ev), *a)),
                 None => tracing::warn!("键位预设里的 `{}` 无法解析，已跳过", k),
             }
         }
@@ -242,6 +250,7 @@ impl Keymap {
     }
 
     pub fn get(&self, key: KeyEvent) -> Option<Action> {
+        let key = normalize(key);
         self.bindings
             .iter()
             .find(|(k, _)| *k == key)
@@ -249,6 +258,7 @@ impl Keymap {
     }
 
     pub fn bind(&mut self, key: KeyEvent, action: Action) {
+        let key = normalize(key);
         self.bindings.retain(|(k, _)| *k != key);
         self.bindings.push((key, action));
     }
@@ -308,4 +318,15 @@ pub fn key_label(key: KeyEvent) -> String {
         _ => return format!("{s}{:?}", key.code),
     });
     s
+}
+
+/// 键位归一：终端对 `Shift+G` 上报的是 `Char('G')`，而配置里写的是 `shift+g`。
+/// 两边都折成小写再比，否则凡带 Shift 的字母绑定一律命中不了。
+fn normalize(key: KeyEvent) -> KeyEvent {
+    match key.code {
+        KeyCode::Char(c) if c.is_ascii_uppercase() => {
+            KeyEvent::new(KeyCode::Char(c.to_ascii_lowercase()), key.modifiers)
+        }
+        _ => key,
+    }
 }

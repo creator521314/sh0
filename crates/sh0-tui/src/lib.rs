@@ -7,9 +7,11 @@
 pub mod app;
 pub mod files;
 pub mod hosts;
+pub mod palette;
 pub mod render;
 pub mod theme;
 
 pub use app::{App, Focus, Tab, View, run};
 pub use hosts::{HostForm, HostTree};
+pub use palette::Palette;
 pub use theme::Theme;

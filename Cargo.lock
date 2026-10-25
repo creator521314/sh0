@@ -3238,6 +3238,7 @@ dependencies = [
  "sh0-tui",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

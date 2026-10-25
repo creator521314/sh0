@@ -163,6 +163,10 @@ pub mod methods {
     /// 批量历史回看（FR-5.3 / OQ-5）
     pub const BATCH_LIST: &str = "batch.list";
     pub const BATCH_SHOW: &str = "batch.show";
+    /// 重新加载 config.toml / hosts.toml / risk.toml（FR-9.3 配置热重载）
+    pub const CONFIG_RELOAD: &str = "config.reload";
+    /// 回看 daemon 当前生效的配置（AI 用它确认"改的是不是生效的那份"）
+    pub const CONFIG_GET: &str = "config.get";
 }
 
 /// 事件名常量

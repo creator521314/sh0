@@ -34,6 +34,11 @@ impl HostTree {
         Self { hosts, query: None, selected: 0, expanded }
     }
 
+    /// 全部主机（不过滤、不折叠），命令面板与批量选择用
+    pub fn hosts_snapshot(&self) -> Vec<Host> {
+        self.hosts.clone()
+    }
+
     /// 当前可见行（已应用搜索过滤与折叠状态）
     pub fn rows(&self) -> Vec<Row> {
         let hosts: Vec<&Host> = match &self.query {

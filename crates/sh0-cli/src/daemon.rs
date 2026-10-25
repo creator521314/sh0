@@ -11,6 +11,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -72,12 +73,14 @@ pub struct DaemonState {
     recent: Mutex<VecDeque<SessionSnapshot>>,
     hub: EventHub,
     store: Arc<Store>,
-    cfg: AppConfig,
+    /// 全局配置。`RwLock` 是因为它支持热重载（FR-9.3）：改完 config.toml
+    /// 不用重启 daemon。读的地方取一份快照即可，AppConfig 很小。
+    cfg: RwLock<AppConfig>,
     factory: Arc<dyn TransportFactory>,
     budget: Option<MemoryBudget>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
-    /// 风险引擎（内置 + 用户规则，FR-7）
-    engine: Arc<RiskEngine>,
+    /// 风险引擎（内置 + 用户规则，FR-7）。可替换：risk.toml 改完要热重载
+    engine: RwLock<Arc<RiskEngine>>,
     /// 审计库；None = 关闭或打开失败
     audit: Option<Arc<AuditDb>>,
     /// 待确认令牌（FR-7.4）
@@ -109,11 +112,11 @@ impl DaemonState {
             recent: Mutex::new(VecDeque::new()),
             hub,
             store,
-            cfg,
+            cfg: RwLock::new(cfg),
             factory,
             budget,
             shutdown: Mutex::new(Some(tx)),
-            engine,
+            engine: RwLock::new(engine),
             audit,
             confirms: ConfirmStore::new(),
             rate: RateLimiter::new(),
@@ -123,11 +126,13 @@ impl DaemonState {
     }
 
     fn session_config(&self, cols: u16, rows: u16) -> SessionConfig {
-        let r = &self.cfg.reconnect;
+        // 配置可能被热重载过，这里取一份快照（AppConfig 很小，克隆成本可忽略）
+        let cfg = self.cfg.read().unwrap().clone();
+        let r = &cfg.reconnect;
         SessionConfig {
             cols,
             rows,
-            scrollback_lines: self.cfg.scrollback_lines,
+            scrollback_lines: cfg.scrollback_lines,
             reconnect: sh0_core::session::ReconnectPolicy {
                 base: Duration::from_millis(r.base_ms),
                 max_delay: Duration::from_millis(r.max_delay_ms),
@@ -408,6 +413,8 @@ impl DaemonState {
 
     /// exec.run 的参数解析与校验（不执行）
     fn parse_exec_request(&self, params: &Value) -> std::result::Result<ExecRequest, ErrorBody> {
+        // 配置可能被热重载过，这里取一份快照（AppConfig 很小，克隆成本可忽略）
+        let cfg = self.cfg.read().unwrap().clone();
         let session = params
             .get("session")
             .and_then(|v| v.as_str())
@@ -449,13 +456,13 @@ impl DaemonState {
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
             .map(|ms| ms / 1000)
-            .unwrap_or(self.cfg.limits.exec_timeout_secs)
+            .unwrap_or(cfg.limits.exec_timeout_secs)
             .clamp(1, 3600);
         let max_output_bytes = params
             .get("max_output_bytes")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
-            .unwrap_or(self.cfg.limits.max_output_bytes)
+            .unwrap_or(cfg.limits.max_output_bytes)
             .clamp(1024, 16 * 1024 * 1024);
 
         Ok(ExecRequest {
@@ -515,7 +522,7 @@ impl DaemonState {
             })?,
             _ => unreachable!("parse_exec_request 已保证二者其一存在"),
         };
-        let assessment = self.engine.assess(&req.cmd).capped(host.risk_cap);
+        let assessment = self.engine.read().unwrap().assess(&req.cmd).capped(host.risk_cap);
 
         // 2) dry-run：只判定不执行（AI 自检用）
         if dry_run {
@@ -661,8 +668,10 @@ impl DaemonState {
         // 是否经人工放行（令牌确认或 `--yes`）：审计要能区分"判定就放行"与"人拍板过"
         confirmed: bool,
     ) -> std::result::Result<ExecData, ErrorBody> {
+        // 配置可能被热重载过，这里取一份快照（AppConfig 很小，克隆成本可忽略）
+        let cfg = self.cfg.read().unwrap().clone();
         // 速率限制（FR-7.7）：超限的调用不执行、不审计（避免刷屏）
-        let limit = self.cfg.limits.rate_limit_per_min;
+        let limit = cfg.limits.rate_limit_per_min;
         if !self.rate.check(&req.actor, limit) {
             return Err(ErrorBody {
                 code: "rate_limited".into(),
@@ -800,6 +809,8 @@ impl DaemonState {
         req: &ExecRequest,
         host_name: &str,
     ) -> std::result::Result<ExecData, ErrorBody> {
+        // 配置可能被热重载过，这里取一份快照（AppConfig 很小，克隆成本可忽略）
+        let cfg = self.cfg.read().unwrap().clone();
         // 1) 找到（或临时建立）会话
         let (handle, oneshot) = match &req.session {
             Some(sid) => {
@@ -827,7 +838,7 @@ impl DaemonState {
             None => {
                 // 一键式调用（FR-6.8）：自动建连 → 执行 → 关闭
                 let sel = req.host.clone().unwrap_or_default();
-                let h = self.open(&sel, self.cfg.cols, self.cfg.rows).await?;
+                let h = self.open(&sel, cfg.cols, cfg.rows).await?;
                 (h, true)
             }
         };
@@ -1008,6 +1019,64 @@ impl DaemonState {
         Ok(b.json())
     }
 
+    /// 重新读取 config.toml / risk.toml（FR-9.3 配置热重载）。
+    ///
+    /// hosts.toml 不用管——`find_host` / `select_hosts` 每次都现读文件，改完即生效。
+    /// 返回 `(是否有变化, 给人看的提示)`。
+    ///
+    /// 有意不放宽的部分：`keepalive`、`term`、`cols/rows`、`memory_budget`、
+    /// `audit` 开关都是建连接时就已经用掉的，改了只能等下次建会话 / 重启 daemon。
+    pub fn reload_config(&self) -> std::result::Result<(bool, String), ErrorBody> {
+        let fresh = self
+            .store
+            .load_config()
+            .map_err(|e| ErrorBody {
+                code: "config_invalid".into(),
+                message: format!("config.toml 解析失败，已保留旧配置：{e}"),
+                data: None,
+            })?;
+        let old = self.cfg.read().unwrap().clone();
+        let old_v = serde_json::to_value(&old).unwrap_or_default();
+        let new_v = serde_json::to_value(&fresh).unwrap_or_default();
+        if old_v == new_v {
+            return Ok((false, "配置无变化".into()));
+        }
+
+        // 规则文件跟着重载：risk.toml 是"改一条就能拦住下一句"的东西，
+        // 让它等重启等于没拦住
+        let user_rules = self
+            .store
+            .load_risk_rules(&fresh.risk.rules_file)
+            .unwrap_or_else(|e| {
+                tracing::warn!("风险规则文件解析失败（{e}），沿用内置规则");
+                Vec::new()
+            });
+        let mut engine = RiskEngine::builtin().with_user_rules(&user_rules);
+        engine.default_level = fresh.risk.unmatched;
+        *self.engine.write().unwrap() = Arc::new(engine);
+
+        *self.cfg.write().unwrap() = fresh.clone();
+
+        let mut note: Vec<&str> = Vec::new();
+        for (k, msg) in RESTART_ONLY_KEYS {
+            if old_v.pointer(&format!("/{}", k.replace('.', "/")))
+                != new_v.pointer(&format!("/{}", k.replace('.', "/")))
+            {
+                note.push(msg);
+            }
+        }
+        let note = if note.is_empty() {
+            "已热重载：配置与风险规则即时生效".to_string()
+        } else {
+            format!(
+                "已热重载，但 {} 需重启 daemon 才生效",
+                note.join("、")
+            )
+        };
+        tracing::info!("配置热重载：{note}");
+        Ok((true, note))
+    }
+
     async fn broadcast_status(&self) -> Value {
         self.broadcast.lock().await.json()
     }
@@ -1128,6 +1197,8 @@ impl DaemonState {
     /// 而风险判定与速率配额**整批只算一次**（FR-5.5）——
     /// 30 台各扣一次配额等于把批量直接判死。
     async fn batch_run(&self, params: &Value) -> std::result::Result<Value, ErrorBody> {
+        // 配置可能被热重载过，这里取一份快照（AppConfig 很小，克隆成本可忽略）
+        let cfg = self.cfg.read().unwrap().clone();
         let dry_run = params
             .get("dry_run")
             .and_then(|v| v.as_bool())
@@ -1139,15 +1210,15 @@ impl DaemonState {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
-        let default_concurrency = if self.cfg.limits.batch_concurrency == 0 {
+        let default_concurrency = if cfg.limits.batch_concurrency == 0 {
             16
         } else {
-            self.cfg.limits.batch_concurrency
+            cfg.limits.batch_concurrency
         };
         let req = parse_batch_request(
             params,
-            self.cfg.limits.exec_timeout_secs,
-            self.cfg.limits.max_output_bytes,
+            cfg.limits.exec_timeout_secs,
+            cfg.limits.max_output_bytes,
             default_concurrency,
         )
         .map_err(|e| ErrorBody {
@@ -1167,7 +1238,7 @@ impl DaemonState {
             .iter()
             .map(|h| h.risk_cap.unwrap_or(RiskLevel::Deny))
             .min();
-        let assessment = self.engine.assess(&req.cmd).capped(cap);
+        let assessment = self.engine.read().unwrap().assess(&req.cmd).capped(cap);
 
         if dry_run {
             return Ok(json!({
@@ -1308,8 +1379,10 @@ impl DaemonState {
         risk: RiskLevel,
         confirmed: bool,
     ) -> std::result::Result<Value, ErrorBody> {
+        // 配置可能被热重载过，这里取一份快照（AppConfig 很小，克隆成本可忽略）
+        let cfg = self.cfg.read().unwrap().clone();
         // 速率：整批算一次（FR-5.5）
-        let limit = self.cfg.limits.rate_limit_per_min;
+        let limit = cfg.limits.rate_limit_per_min;
         if !self.rate.check(&req.actor, limit) {
             return Err(ErrorBody {
                 code: "rate_limited".into(),
@@ -1338,7 +1411,7 @@ impl DaemonState {
             let fail_fast = req.fail_fast;
             let sem = sem.clone();
             let cancelled = cancelled.clone();
-            let scfg = self.session_config(self.cfg.cols, self.cfg.rows);
+            let scfg = self.session_config(cfg.cols, cfg.rows);
             set.spawn(async move {
                 // 并发闸门：信号量决定"同时在跑几台"（FR-5.4）
                 let _permit = sem.acquire().await;
@@ -2001,6 +2074,16 @@ impl Handler for DaemonState {
             methods::BATCH_LIST => self.batch_list(&params).await,
             methods::BATCH_SHOW => self.batch_show(&params).await,
 
+            // ---- M5 · 配置热重载（FR-9.3）----
+            methods::CONFIG_RELOAD => {
+                let (changed, note) = self.reload_config()?;
+                Ok(json!({ "changed": changed, "note": note }))
+            }
+            methods::CONFIG_GET => {
+                let cfg = self.cfg.read().unwrap().clone();
+                Ok(json!({ "config": cfg }))
+            }
+
             // ---- M4 · SFTP（FR-4.x / FR-6.6）----
             methods::FILE_LIST => {
                 let path = file_path(&params)?;
@@ -2291,6 +2374,16 @@ pub fn seed_example_host(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 改了必须重启才生效的配置项（热重载提示用）
+const RESTART_ONLY_KEYS: [(&str, &str); 6] = [
+    ("term", "term"),
+    ("keepalive_secs", "keepalive_secs"),
+    ("cols", "cols"),
+    ("rows", "rows"),
+    ("memory_budget_mb", "memory_budget_mb"),
+    ("audit.enabled", "audit.enabled"),
+];
+
 /// M2 组件装配：风险引擎 + 审计库。run_foreground 与契约测试共用，
 /// 保证测试验的就是生产装配（而不是另起一套宽松配置）。
 fn assemble_m2(store: &Store, cfg: &AppConfig) -> (Arc<RiskEngine>, Option<Arc<AuditDb>>) {
@@ -2374,6 +2467,30 @@ pub async fn run_foreground(
 
     let (state, shutdown_rx) = DaemonState::new(store, cfg, hub.clone(), factory, engine, audit);
 
+    // 配置文件监视：改完 config.toml 不必重启（FR-9.3）。
+    // 用 mtime 轮询而不是 inotify——跨平台要三套实现，而这里 2 秒一次
+    // 的 stat 开销可以忽略，换来的是零额外依赖。
+    let watcher = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut last = state.store.config_mtime();
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let now = state.store.config_mtime();
+                if now == last {
+                    continue;
+                }
+                last = now;
+                match state.reload_config() {
+                    Ok((true, note)) => tracing::info!("检测到配置变更：{note}"),
+                    Ok((false, _)) => {}
+                    Err(e) => tracing::warn!("配置重载失败：{}", e.message),
+                }
+            }
+        })
+    };
+
     // 后台模式下进程没有控制台，注册 ctrl_c 会立即就绪、导致 daemon 启动即退出。
     // 因此只在手动前台运行时才监听 Ctrl+C；后台一律通过 shutdown 方法优雅停止。
     if background {
@@ -2398,6 +2515,7 @@ pub async fn run_foreground(
             }
         }
     }
+    watcher.abort();
 
     let _ = std::fs::remove_file(paths.daemon_info());
     let _ = std::fs::remove_file(paths.pid_file());

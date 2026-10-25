@@ -119,6 +119,44 @@ async fn main() -> anyhow::Result<()> {
                 println!("hosts_file  : {}", p.hosts_file().display());
                 println!("audit_db    : {}", p.audit_db().display());
             }
+            ConfigCmd::Show { json } => {
+                let cfg = store.load_config()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&cfg)?);
+                } else {
+                    println!("{}", toml::to_string_pretty(&cfg)?);
+                }
+            }
+            ConfigCmd::Get { key } => match store.config_get(&key)? {
+                Some(v) => println!("{}", sh0::config_cmd::value_to_string(&v)),
+                None => {
+                    eprintln!("未知配置项：{key}（用 `sh0 config show` 看有哪些）");
+                    std::process::exit(2);
+                }
+            },
+            ConfigCmd::Set { key, value } => {
+                store.config_set(&key, &value)?;
+                println!("已写入 {key} = {value}");
+                // 有 daemon 在跑就顺手热重载，省得用户改完以为没生效
+                if let Some(note) = sh0::config_cmd::notify_daemon(&store).await {
+                    println!("{note}");
+                } else {
+                    println!("（daemon 未运行，下次启动生效）");
+                }
+            }
+            ConfigCmd::Reload => match sh0::config_cmd::notify_daemon(&store).await {
+                Some(note) => println!("{note}"),
+                None => println!("daemon 未运行，无需重载（下次启动自动读取）"),
+            },
+            ConfigCmd::Check => {
+                // 解析失败会直接以错误退出
+                let cfg = store.load_config()?;
+                let hosts = store.load_hosts()?;
+                let rules = store.load_risk_rules(&cfg.risk.rules_file).unwrap_or_default();
+                println!("config.toml  OK（version {}）", cfg.version);
+                println!("hosts.toml   OK（{} 台）", hosts.hosts.len());
+                println!("risk.toml    OK（{} 条自定义规则）", rules.len());
+            }
         },
 
         Cmd::Secret { cmd } => match cmd {

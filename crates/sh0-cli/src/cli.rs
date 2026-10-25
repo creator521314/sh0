@@ -111,4 +111,18 @@ pub enum HostCmd {
 pub enum ConfigCmd {
     /// 打印配置、数据、运行时目录
     Path,
+    /// 打印当前生效的配置（TOML）
+    Show {
+        /// 输出结构化 JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// 取一项配置，如 `sh0 config get limits.exec_timeout_sec`
+    Get { key: String },
+    /// 写一项配置，如 `sh0 config set limits.exec_timeout_sec 60`
+    Set { key: String, value: String },
+    /// 让运行中的 daemon 重新加载配置与主机清单
+    Reload,
+    /// 校验配置文件能否解析（不给改动就报错退出）
+    Check,
 }

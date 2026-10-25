@@ -41,6 +41,9 @@ pub struct AppConfig {
     /// 关闭后鼠标事件全部交回父终端——想用系统自带的"拖选复制"时关掉它。
     #[serde(default = "default_mouse")]
     pub mouse: bool,
+    /// 配色主题：dark / light / high-contrast（需求 FR-3.7）
+    #[serde(default = "default_theme")]
+    pub theme: String,
     /// 键位覆盖表，形如 `quit = "ctrl+x"`，优先级高于预设
     #[serde(default)]
     pub keys: HashMap<String, String>,
@@ -101,6 +104,9 @@ fn default_keymap() -> String {
 }
 fn default_mouse() -> bool {
     true
+}
+fn default_theme() -> String {
+    "dark".to_string()
 }
 fn default_max_attempts() -> Option<u32> {
     Some(10)
@@ -250,6 +256,7 @@ impl Default for AppConfig {
             memory_budget_mb: default_budget_mb(),
             keymap: default_keymap(),
             mouse: default_mouse(),
+            theme: default_theme(),
             keys: HashMap::new(),
             reconnect: ReconnectConfig::default(),
             audit: AuditConfig::default(),
@@ -307,6 +314,53 @@ impl Store {
         let raw = toml::to_string_pretty(cfg).map_err(StoreError::Serialize)?;
         std::fs::write(self.paths.config_file(), raw)?;
         Ok(())
+    }
+
+    /// 取一项配置，key 用点路径（`limits.exec_timeout_sec`）。
+    /// 返回 JSON 值便于 CLI 直接打印；找不到返回 None（而不是报错，
+    /// 让调用方决定"拼错键名"算不算错误）。
+    pub fn config_get(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        let cfg = self.load_config()?;
+        let mut v = serde_json::to_value(&cfg)?;
+        for part in key.split('.') {
+            match v.get(part) {
+                Some(next) => v = next.clone(),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(v))
+    }
+
+    /// 写一项配置并落盘。未知键名直接报错——宁可拒绝也不静默忽略，
+    /// 否则 `sh0 config set limits.exec_timeut 5` 这种拼写错误会假装成功。
+    pub fn config_set(&self, key: &str, value: &str) -> Result<()> {
+        let mut cfg = self.load_config()?;
+        let mut v = serde_json::to_value(&cfg)?;
+
+        // 先确认路径存在，再写入
+        {
+            let mut cur = &v;
+            for part in key.split('.') {
+                cur = cur
+                    .get(part)
+                    .ok_or_else(|| StoreError::UnknownConfigKey(key.to_string()))?;
+            }
+        }
+        let parsed = parse_scalar(value);
+        let mut cur = &mut v;
+        let parts: Vec<&str> = key.split('.').collect();
+        for part in &parts[..parts.len() - 1] {
+            cur = cur.get_mut(*part).expect("路径已校验过");
+        }
+        cur[parts[parts.len() - 1]] = parsed;
+
+        cfg = serde_json::from_value(v)?;
+        self.save_config(&cfg)
+    }
+
+    /// 配置文件与主机清单的修改时间，热重载据此判断要不要重新读
+    pub fn config_mtime(&self) -> Option<std::time::SystemTime> {
+        mtime_of(&self.paths.config_file()).max(mtime_of(&self.paths.hosts_file()))
     }
 
     pub fn load_hosts(&self) -> Result<HostsFile> {
@@ -438,4 +492,25 @@ impl Store {
                 source: e,
             })
     }
+}
+
+/// 把命令行里的字符串转成 JSON 标量：`true`/`false`、整数、或字符串。
+///
+/// 不支持数组与对象——`sh0 config set` 的定位是"改一两项开关"，
+/// 复杂结构请直接编辑 config.toml。
+fn parse_scalar(value: &str) -> serde_json::Value {
+    if let Ok(b) = value.parse::<bool>() {
+        return serde_json::Value::Bool(b);
+    }
+    if let Ok(n) = value.parse::<i64>() {
+        return serde_json::Value::from(n);
+    }
+    if let Ok(n) = value.parse::<f64>() {
+        return serde_json::Value::from(n);
+    }
+    serde_json::Value::String(value.to_string())
+}
+
+fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
