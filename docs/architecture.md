@@ -3,10 +3,14 @@
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | 架构设计（Architecture Design）+ AI 接口契约 |
-| 版本 | v1.0（初稿） |
-| 日期 | 2026-10-24 |
-| 状态 | 待评审 |
+| 版本 | v1.2（M3 批量与广播 + M4 SFTP 已落地） |
+| 日期 | 2026-10-25 |
+| 状态 | 已实现至 M4；M5 打磨项待设计 |
 | 上游文档 | `docs/requirements.md` |
+| 配套文档 | `docs/usage.md`（使用说明：怎么用）、`docs/development-plan.md`（里程碑进度） |
+
+> 本文描述**设计与契约**（为什么这么设计、字段与错误码是什么）；
+> 具体怎么用（命令参数、键位、配置字段、排查）见 `docs/usage.md`。
 
 ---
 
@@ -730,7 +734,8 @@ max_level = "confirm"      # 生产环境不自动放行 confirm
 
 ### 7.3 速率限制
 
-- 默认：单 actor 每分钟 60 条命令、每分钟 20 次文件上传。
+- 默认**关闭**：`limits.rate_limit_per_min = 0` 表示不限；配成正整数后生效
+  （需求文档给的参考值是单 actor 每分钟 60 条命令）。
 - 超限返回 `rate_limited`，`detail.retry_after_sec` 给出建议等待时间。
 - 批量执行按整体计为 1 次配额（避免 30 台机器瞬间打满）。
 
@@ -745,11 +750,14 @@ max_level = "confirm"      # 生产环境不自动放行 confirm
 ├── config.toml          # 全局偏好：主题、键位、缓冲、并发、超时、审计与限速
 ├── hosts.toml           # 主机与分组（无明文密钥）
 ├── risk.toml            # 风险规则（用户自定义，覆盖内置默认值）
-├── known_hosts          # OpenSSH 兼容格式
 <data_dir>/sh0/
+├── known_hosts          # OpenSSH 兼容格式（注意在数据目录，不在配置目录）
 ├── creds.vault          # 主密码加密的凭据（钥匙串不可用时的回落）
 ├── audit.db             # SQLite：审计与输出归档
-└── run/daemon.json      # 运行时 IPC 端点 + token（daemon 存活时才存在）
+└── run/
+    ├── daemon.json      # 运行时 IPC 端点 + token（daemon 存活时才存在）
+    ├── daemon.log       # 后台 daemon 日志
+    └── sh0.pid
 ```
 
 ### 8.2 SQLite 表（M2 实现）

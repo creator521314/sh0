@@ -3,12 +3,12 @@
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | 需求说明书（Requirements Specification） |
-| 版本 | v1.0（初稿） |
-| 日期 | 2026-10-24 |
-| 状态 | 待评审 |
+| 版本 | v1.1（M3 / M4 需求已实现） |
+| 日期 | 2026-10-25 |
+| 状态 | 已实现至 M4（FR-4.1~4.4、FR-5.1~5.5、FR-6.6 已交付） |
 | 项目代号 | sh0（命令行名，可重命名） |
 | 实现语言 | Rust |
-| 相关文档 | `docs/architecture.md`（架构设计与 AI 接口契约） |
+| 相关文档 | `docs/architecture.md`（架构设计与 AI 接口契约）、`docs/usage.md`（使用说明） |
 
 ---
 
@@ -280,8 +280,8 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 | M0 | 骨架与连通 ✅ | Cargo workspace、daemon 进程、russh 建连 + 密码/密钥认证、最小 TUI 显示裸输出 |
 | M1 | 终端与会话 ✅ | xterm 仿真网格 + 滚动缓冲、标签页、主机树、resize、断线重连 |
 | M2 | AI 接口 MVP ✅ | `ai` 子命令全套（session/exec/screen/input/log）、`--json` 输出、风险三档引擎、审计入库、凭据无明文 |
-| M3 | 批量与广播 | 广播输入、批量执行与结果汇总视图 |
-| M4 | SFTP 落地 | 双栏文件管理、传输队列、进度与重试 |
+| M3 | 批量与广播 ✅ | 广播输入、批量执行与结果汇总视图、批量风险与配额、批量历史持久化 |
+| M4 | SFTP 落地 ✅ | 双栏文件管理、传输队列、进度与重试、`ai file *` 全套子命令 |
 | M5 | 打磨 | 主题/键位配置、命令面板、导入导出、性能与体积优化、跨平台 CI 产物 |
 
 ---
@@ -299,6 +299,9 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 | AC-7 ✅ | 配置文件中 grep 不到任何明文密码 |
 | AC-8 ✅ | AI 与 TUI 操作同一批会话，双方动作都出现在同一份审计日志中 |
 | AC-9 | 中文/emoji 在远端输出中正确显示且光标位置不错乱 |
+| AC-10 ✅ | 批量执行：主机选择器（分组/标签/显式列表/`--all`）+ 并发池 + 逐台超时，结果可汇总并导出 JSON / CSV；危险命令整批被风险引擎拦截 |
+| AC-11 ✅ | 广播：一次输入发到多个参与会话，开关与名单可查（`ai broadcast enable/disable/status/send`） |
+| AC-12 ✅ | 文件传输：600 KB 文件分块上传下载与本地逐字节一致（Debian 13 / aarch64 真机 sha256 校验通过） |
 
 ---
 
@@ -329,13 +332,17 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 
 ## 11. 待定问题（Open Questions）
 
-> **2026-10-24 更新**：OQ-1 与 OQ-6 已在 M0 开工时定稿（见下表「结论」列），
+> **2026-10-25 更新**：OQ-1、OQ-6 已在 M0 开工时定稿；**OQ-5 已在 M3（W3.5）落地**——
+> 批量历史落 SQLite（`batch_run` / `batch_result`），`ai batch list/show` 可回看；
+> **OQ-7 已实现**——`sh0 ai` 全局提供 `--dry-run`（只做风险判定不执行）。
 > 其余条目仍待定。
 
 | 编号 | 结论 |
 | --- | --- |
 | OQ-1 | ✅ 已定：**M0 采用 loopback TCP + 一次性令牌**；UDS / Named Pipe 留到 M2 评估替换 |
+| OQ-5 | ✅ 已实现（M3 W3.5）：批量执行结果落 SQLite，保留策略同审计（默认 30 天） |
 | OQ-6 | ✅ 已定：命令名为 **`sh0`** |
+| OQ-7 | ✅ 已实现：`sh0 ai ... --dry-run` 只做风险判定不执行 |
 
 | # | 问题 | 建议默认值 | 影响 |
 | --- | --- | --- | --- |

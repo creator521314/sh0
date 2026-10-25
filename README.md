@@ -77,10 +77,26 @@ TOKEN=$(sh0 ai exec run --host web-01 --cmd "systemctl restart nginx" --json \
 sh0 ai exec run --host web-01 --cmd "systemctl restart nginx" --confirm-token "$TOKEN" --json
 
 sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json  # 审计回溯
+
+# 批量：一组机器同一条命令，汇总可导出
+sh0 ai batch exec --group prod --cmd "df -h / | tail -1" --out csv --output ./df.csv
+sh0 ai batch list                 # 回看历史；sh0 ai batch show --run-id <id>
+
+# 广播：开会话 → 开广播 → 一份输入发给所有参与会话
+sh0 ai broadcast enable --session <id> --session <id2> --json
+sh0 ai broadcast send --text "uptime" --enter --json
+sh0 ai broadcast disable --json
+
+# 文件：--session 复用连接，--host 一键式；upload/download 分块、二进制安全
+sh0 ai file list --session <id> --path /var/log --json
+sh0 ai file upload --host web-01 --local ./app.tar --remote /tmp/app.tar --json
+
 printf '%s' "$PW" | sh0 secret set sh0 web-01 --stdin                   # 存凭据（无明文）
 
 sh0 daemon stop                   # 优雅停止后台 daemon
 ```
+
+完整的 TUI 键位、AI 子命令参数、配置字段与故障排查见 **`docs/usage.md`**。
 
 配置目录：
 
@@ -141,6 +157,7 @@ crates/
 ├── sh0-tui/     ratatui 前端（含风险确认弹窗）
 └── sh0-cli/     二进制入口、daemon、exec 编排（哨兵截取 / 确认 / 审计 / 限速）
 docs/
+├── usage.md               使用说明（TUI / AI 接口 / 配置 / 排查）
 ├── requirements.md        需求说明书
 ├── architecture.md        架构设计与 AI 接口契约
 └── development-plan.md    开发计划与里程碑
@@ -148,6 +165,8 @@ docs/
 
 ## 文档
 
+- `docs/usage.md` —— **使用说明**：安装、TUI 键位与广播、AI 全套子命令、配置与凭据、
+  风险与审计、故障排查
 - `docs/requirements.md` —— 需求说明书（FR / NFR / 验收标准 / 待定问题）
 - `docs/architecture.md` —— 架构设计、AI 子命令契约、错误码表
 - `docs/development-plan.md` —— 里程碑分解、工时估算、三条排期路线
@@ -163,7 +182,7 @@ docs/
 | Ctrl+F | 搜索主机 |
 | Ctrl+N | 新建主机 |
 | PageUp / PageDown | 回看历史输出 |
-| Alt+G / Ctrl+PageUp | 回到顶部 |
+| Ctrl+PageUp / Ctrl+PageDown | 回到顶部 / 回到底部（vim 预设为 Alt+G / Shift+G） |
 | Alt+V | 进入/退出文本选择模式 |
 | Alt+C | 复制选区 |
 | Alt+R | 手动重连 |
