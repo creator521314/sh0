@@ -8,7 +8,7 @@
 //! 并持有风险引擎、审计库、确认令牌与速率限制器。exec 的纯逻辑
 //! （哨兵截取、令牌、限速）在 `exec.rs`，可单测。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +43,27 @@ const CONNECT_GRACE_SECS: u64 = 20;
 /// 确认令牌有效期（FR-7.4：无人值守时 AI 拿着 token 二次调用）
 const CONFIRM_TTL_SECS: u64 = 300;
 
+/// 广播态（FR-5.1）。
+///
+/// `targets` 为空表示"全部已打开会话"——这是最常用的广播语义：
+/// 新开的标签自动加入，不必维护名单；TUI 里再逐台取消勾选做例外。
+#[derive(Debug, Default, Clone)]
+struct Broadcast {
+    enabled: bool,
+    /// 参与广播的会话 id；空 = 全部
+    targets: BTreeSet<String>,
+}
+
+impl Broadcast {
+    fn json(&self) -> Value {
+        json!({
+            "enabled": self.enabled,
+            "all": self.targets.is_empty(),
+            "sessions": self.targets.iter().cloned().collect::<Vec<_>>(),
+        })
+    }
+}
+
 pub struct DaemonState {
     sessions: Mutex<HashMap<String, SessionHandle>>,
     /// 已结束会话的最后一份快照，只查不写
@@ -61,6 +82,8 @@ pub struct DaemonState {
     confirms: ConfirmStore,
     /// 单 actor 每分钟 exec 上限（FR-7.7）
     rate: RateLimiter,
+    /// 广播开关与参与会话（FR-5.1）
+    broadcast: Mutex<Broadcast>,
 }
 
 impl DaemonState {
@@ -92,6 +115,7 @@ impl DaemonState {
             audit,
             confirms: ConfirmStore::new(),
             rate: RateLimiter::new(),
+            broadcast: Mutex::new(Broadcast::default()),
         });
         (state, rx)
     }
@@ -1055,6 +1079,138 @@ impl DaemonState {
         })?;
         Ok(json!({ "records": records, "count": records.len() }))
     }
+
+    // ---- M3 · 广播（FR-5.1）----
+
+    /// broadcast.set：改开关与参与名单。
+    ///
+    /// 只给 `enabled` 就只改开关；给了 `sessions` 就整体覆盖名单
+    /// （空数组 = 回到"全部会话"）。两者都不给等价于查询。
+    async fn broadcast_set(&self, params: &Value) -> std::result::Result<Value, ErrorBody> {
+        let mut b = self.broadcast.lock().await;
+        if let Some(v) = params.get("enabled").and_then(|v| v.as_bool()) {
+            b.enabled = v;
+        }
+        if let Some(list) = params.get("sessions").and_then(|v| v.as_array()) {
+            b.targets = list
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        }
+        Ok(b.json())
+    }
+
+    async fn broadcast_status(&self) -> Value {
+        self.broadcast.lock().await.json()
+    }
+
+    /// broadcast.send：对参与会话各发一份同样的输入。
+    ///
+    /// 目标三选一：显式 `sessions` > 已开启的广播名单 > 报错。
+    /// 未开启广播就必须显式指定——免得 AI 误按一次键打进所有会话。
+    async fn broadcast_send(&self, params: &Value) -> std::result::Result<Value, ErrorBody> {
+        let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        if data.is_empty() {
+            return Err(ErrorBody {
+                code: "invalid_args".into(),
+                message: "广播内容为空".into(),
+                data: None,
+            });
+        }
+        let explicit = params
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<BTreeSet<_>>()
+            });
+        let (enabled, targets) = {
+            let b = self.broadcast.lock().await;
+            (b.enabled, b.targets.clone())
+        };
+        let chosen = match explicit {
+            Some(s) => Some(s),
+            None if enabled => Some(targets),
+            None => None,
+        };
+        let Some(set) = chosen else {
+            return Err(ErrorBody {
+                code: "invalid_args".into(),
+                message: "广播未开启：先用 broadcast.set 打开，或用 sessions 显式指定目标".into(),
+                data: None,
+            });
+        };
+
+        // 先把句柄取出来再发：发送期间不该一直占着会话表锁
+        let targets: Vec<(String, Option<SessionHandle>)> = {
+            let sessions = self.sessions.lock().await;
+            if set.is_empty() {
+                sessions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Some(v.clone())))
+                    .collect()
+            } else {
+                set.iter()
+                    .map(|sid| (sid.clone(), sessions.get(sid).cloned()))
+                    .collect()
+            }
+        };
+
+        let mut sent = Vec::new();
+        let mut failed = Vec::new();
+        for (sid, maybe) in targets {
+            match maybe {
+                Some(h) => match h.send(data.as_bytes()).await {
+                    Ok(()) => sent.push(sid),
+                    Err(e) => failed.push(json!({ "session": sid, "error": e.to_string() })),
+                },
+                None => failed.push(json!({ "session": sid, "error": "会话不存在" })),
+            }
+        }
+
+        let actor = params
+            .get("actor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ai")
+            .to_string();
+        // 只记一条汇总：TUI 广播时每次按键都会走到这里，
+        // 逐台落审计会把审计表刷爆（FR-8 的"可追溯"不该以写放大为代价）。
+        self.audit(AuditRecord {
+            ts: now_rfc3339(),
+            trace_id: params
+                .get("trace_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            session_id: None,
+            host_name: Some(format!("broadcast×{}", sent.len())),
+            actor,
+            action: "broadcast.send".into(),
+            command: Some(data.chars().take(512).collect()),
+            risk: None,
+            decision: Some(if failed.is_empty() {
+                "sent".into()
+            } else {
+                "partial".into()
+            }),
+            exit_code: None,
+            duration_ms: None,
+            truncated: false,
+            error: if failed.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&failed).unwrap_or_default())
+            },
+            stdout: None,
+            stderr: None,
+        });
+
+        Ok(json!({
+            "sent": sent.len(),
+            "sessions": sent,
+            "failed": failed,
+        }))
+    }
 }
 
 /// 屏幕文本里扫描哨兵输出行（整行恰为 `SENTINEL:<整数>`）。
@@ -1412,6 +1568,11 @@ impl Handler for DaemonState {
             methods::EXEC_CONFIRM => self.exec_confirm(&params).await,
 
             methods::LOG_QUERY => self.log_query(&params).await,
+
+            // ---- M3 · 广播（FR-5.1）----
+            methods::BROADCAST_SET => self.broadcast_set(&params).await,
+            methods::BROADCAST_STATUS => Ok(self.broadcast_status().await),
+            methods::BROADCAST_SEND => self.broadcast_send(&params).await,
 
             // ---- M4 · SFTP（FR-4.x / FR-6.6）----
             methods::FILE_LIST => {

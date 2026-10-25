@@ -41,6 +41,10 @@ pub enum Action {
     FileRefresh,
     /// 把焦点栏的选中项传到对面栏（上传/下载，FR-4.3）
     FileCopy,
+    /// 广播开关：开时终端输入同时发给所有参与会话（FR-5.1）
+    BroadcastToggle,
+    /// 勾选/取消当前会话是否参与广播（FR-5.1）
+    BroadcastMark,
 }
 
 impl Action {
@@ -68,6 +72,8 @@ impl Action {
             Action::ToggleFiles => "file.toggle",
             Action::FileRefresh => "file.refresh",
             Action::FileCopy => "file.copy",
+            Action::BroadcastToggle => "broadcast.toggle",
+            Action::BroadcastMark => "broadcast.mark",
         }
     }
 
@@ -95,6 +101,8 @@ impl Action {
             Action::ToggleFiles,
             Action::FileRefresh,
             Action::FileCopy,
+            Action::BroadcastToggle,
+            Action::BroadcastMark,
         ]
         .into_iter()
         .find(|a| a.as_str() == s)
@@ -124,6 +132,8 @@ impl Action {
             Action::ToggleFiles => "文件管理",
             Action::FileRefresh => "刷新文件列表",
             Action::FileCopy => "传文件到对面",
+            Action::BroadcastToggle => "广播开关",
+            Action::BroadcastMark => "勾选本会话广播",
         }
     }
 }
@@ -165,6 +175,8 @@ impl Keymap {
             ("alt+c", Action::Copy),
             ("f9", Action::ToggleFiles),
             ("f5", Action::FileCopy),
+            ("alt+b", Action::BroadcastToggle),
+            ("alt+m", Action::BroadcastMark),
         ])
     }
 
@@ -188,6 +200,8 @@ impl Keymap {
             ("alt+c", Action::Copy),
             ("f9", Action::ToggleFiles),
             ("f5", Action::FileCopy),
+            ("alt+b", Action::BroadcastToggle),
+            ("alt+m", Action::BroadcastMark),
         ])
     }
 
@@ -211,6 +225,8 @@ impl Keymap {
             ("alt+c", Action::Copy),
             ("f9", Action::ToggleFiles),
             ("f5", Action::FileCopy),
+            ("alt+b", Action::BroadcastToggle),
+            ("alt+m", Action::BroadcastMark),
         ])
     }
 

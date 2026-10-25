@@ -228,6 +228,10 @@ pub struct App {
     marks_right: std::collections::HashSet<String>,
     /// 传输队列（FR-4.4）
     transfers: Vec<Transfer>,
+    /// 广播开关（FR-5.1）：开着时终端输入同时发给所有参与会话
+    broadcast: bool,
+    /// 参与广播的会话 id；空 = 全部已打开会话
+    broadcast_targets: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -279,6 +283,8 @@ impl App {
             marks_left: std::collections::HashSet::new(),
             marks_right: std::collections::HashSet::new(),
             transfers: Vec::new(),
+            broadcast: false,
+            broadcast_targets: std::collections::HashSet::new(),
         }
     }
 
@@ -523,17 +529,32 @@ impl App {
             },
             Focus::Files => return self.on_file_key(key).await,
             Focus::Terminal => {
+                // 广播开着时，这份输入要发到所有参与会话（FR-5.1）
+                let broadcast = self.broadcast;
+                let targets: Vec<String> = if broadcast && !self.broadcast_targets.is_empty() {
+                    self.broadcast_targets.iter().cloned().collect()
+                } else {
+                    Vec::new()
+                };
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let app_keys = tab.screen.grid.app_cursor_keys;
                     if let Some(bytes) = sh0_term::encode_key(key, app_keys) {
                         let text = String::from_utf8_lossy(&bytes).to_string();
-                        let _ = self
-                            .client
-                            .call(
-                                methods::INPUT_SEND,
-                                json!({ "session": tab.id, "data": text }),
-                            )
-                            .await;
+                        if broadcast {
+                            let mut params = json!({ "data": text });
+                            if !targets.is_empty() {
+                                params["sessions"] = json!(targets);
+                            }
+                            let _ = self.client.call(methods::BROADCAST_SEND, params).await;
+                        } else {
+                            let _ = self
+                                .client
+                                .call(
+                                    methods::INPUT_SEND,
+                                    json!({ "session": tab.id, "data": text }),
+                                )
+                                .await;
+                        }
                     }
                     // 有输入说明用户在看最新输出，回到底部
                     tab.screen.reset_view();
@@ -749,8 +770,88 @@ impl App {
                 }
             }
             Action::Copy => self.copy_selection().await?,
+            Action::BroadcastToggle => self.toggle_broadcast().await,
+            Action::BroadcastMark => self.mark_broadcast().await,
         }
         Ok(())
+    }
+
+    /// 广播开关（FR-5.1）。
+    ///
+    /// 名单为空表示"全部已打开会话"——最常见的用法就是连上几台、打开广播、
+    /// 敲的命令同时生效；需要例外时用 `Alt+M` 把某台剔出去。
+    pub async fn toggle_broadcast(&mut self) {
+        self.broadcast = !self.broadcast;
+        let sessions: Vec<String> = self.broadcast_targets.iter().cloned().collect();
+        let mut params = json!({ "enabled": self.broadcast });
+        if !sessions.is_empty() {
+            params["sessions"] = json!(sessions);
+        }
+        match self.client.call(methods::BROADCAST_SET, params).await {
+            Ok(_) => {
+                self.notice = if !self.broadcast {
+                    "广播已关闭".into()
+                } else if sessions.is_empty() {
+                    "广播已开启：所有会话（Alt+M 可逐台取消）".into()
+                } else {
+                    format!("广播已开启：{} 个会话", sessions.len())
+                };
+            }
+            Err(e) => {
+                // daemon 没认下这次切换，本地也别装作开了
+                self.broadcast = !self.broadcast;
+                self.notice = format!("广播切换失败：{e}");
+            }
+        }
+    }
+
+    /// 勾选/取消当前会话参与广播（FR-5.1）
+    pub async fn mark_broadcast(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.notice = "没有活动会话".into();
+            return;
+        };
+        let sid = tab.id.clone();
+        let name = tab.name.clone();
+        let joined = if self.broadcast_targets.contains(&sid) {
+            self.broadcast_targets.remove(&sid);
+            false
+        } else {
+            self.broadcast_targets.insert(sid);
+            true
+        };
+        // 名单变了要同步给 daemon：broadcast.send 的落点在 daemon 侧。
+        // 空数组必须照样发——它表示"回到全部会话"，不发就清不掉最后一个勾选。
+        let sessions: Vec<String> = self.broadcast_targets.iter().cloned().collect();
+        let params = json!({ "sessions": sessions });
+        match self.client.call(methods::BROADCAST_SET, params).await {
+            Ok(_) => {
+                self.notice = if joined {
+                    format!("{name} 已加入广播")
+                } else {
+                    format!("{name} 已退出广播")
+                };
+            }
+            Err(e) => self.notice = format!("广播名单同步失败：{e}"),
+        }
+    }
+
+    /// 该会话是否参与广播（名单为空 = 全部参与）
+    fn in_broadcast(&self, sid: &str) -> bool {
+        self.broadcast_targets.is_empty() || self.broadcast_targets.contains(sid)
+    }
+
+    /// 当前参与广播的会话数，供状态栏显示
+    fn broadcast_count(&self) -> usize {
+        if self.broadcast_targets.is_empty() {
+            self.tabs.len()
+        } else {
+            self.broadcast_targets.len()
+        }
+    }
+
+    pub fn broadcast(&self) -> bool {
+        self.broadcast
     }
 
     /// 把选区内容送出：先写父终端剪贴板（OSC 52），失败则发回会话。
@@ -1889,7 +1990,13 @@ impl App {
         let mut spans: Vec<Span> = Vec::new();
         let mut used = 0usize;
         for (i, tab) in self.tabs.iter().enumerate() {
-            let label = format!(" {}{} ", state_dot(tab.state), tab.name);
+            // 广播开着时给参与的标签加个 *：一眼能看出命令会打到哪几台
+            let mark = if self.broadcast && self.in_broadcast(&tab.id) {
+                "*"
+            } else {
+                " "
+            };
+            let label = format!(" {}{}{} ", mark, state_dot(tab.state), tab.name);
             if used + label.chars().count() > area.width as usize {
                 spans.push(Span::raw(format!(" +{}", self.tabs.len() - i)));
                 break;
@@ -2042,6 +2149,15 @@ impl App {
                     Style::default().fg(self.theme.warn),
                 ));
             }
+        }
+        // 广播态：开着就常驻显示，避免"忘了自己开着广播"把命令打进所有机器
+        if self.broadcast {
+            spans.push(Span::styled(
+                format!(" 广播×{} ", self.broadcast_count()),
+                Style::default()
+                    .fg(self.theme.status_fg)
+                    .bg(self.theme.warn),
+            ));
         }
         if !self.notice.is_empty() {
             spans.push(Span::styled(

@@ -72,6 +72,11 @@ pub enum AiObject {
         #[command(subcommand)]
         cmd: InputCmd,
     },
+    /// 广播：把同一份输入同时发给多个会话（M3 / FR-5.1）
+    Broadcast {
+        #[command(subcommand)]
+        cmd: BroadcastCmd,
+    },
     /// 审计查询（FR-8.4）
     Log {
         #[command(subcommand)]
@@ -221,6 +226,42 @@ pub enum InputCmd {
         /// 末尾补一个换行（等价于敲回车，仅对 --text 有意义）
         #[arg(long)]
         enter: bool,
+    },
+}
+
+/// 广播（FR-5.1）：一份输入、多个会话。
+///
+/// 会话名单存在 daemon 里（`broadcast.set`），因此开一次广播后
+/// 后续 `send` 不用再带名单；`--session` 可重复传入做一次性指定。
+#[derive(Debug, Subcommand)]
+pub enum BroadcastCmd {
+    /// 打开广播；不给 --session 表示全部已打开会话
+    Enable {
+        /// 参与广播的会话 id，可重复传入
+        #[arg(long = "session")]
+        sessions: Vec<String>,
+    },
+    /// 关闭广播（名单保留，下次 enable 沿用）
+    Disable,
+    /// 查看当前广播态
+    Status,
+    /// 把同一份输入发给参与会话
+    Send {
+        /// 原始文本
+        #[arg(long)]
+        text: Option<String>,
+        /// 键名序列，支持 `<Enter>` `<Esc>` `<Tab>` `<BS>` `<Up>` `<C-c>` 等占位符
+        #[arg(long)]
+        keys: Option<String>,
+        /// 十六进制字节串
+        #[arg(long)]
+        hex: Option<String>,
+        /// 末尾补一个换行（等价于敲回车，仅对 --text 有意义）
+        #[arg(long)]
+        enter: bool,
+        /// 一次性指定目标会话；不给则按当前广播名单
+        #[arg(long = "session")]
+        sessions: Vec<String>,
     },
 }
 
@@ -800,6 +841,63 @@ async fn dispatch(
                 Ok((String::new(), out))
             }
         },
+        AiObject::Broadcast { cmd } => match cmd {
+            BroadcastCmd::Enable { sessions } => {
+                let c = require_client(client)?;
+                let mut params = json!({ "enabled": true });
+                if !sessions.is_empty() {
+                    params["sessions"] = json!(sessions);
+                }
+                ctx.trace(&mut params);
+                let data = c.call(methods::BROADCAST_SET, params).await?;
+                Ok((
+                    format!("广播已开启：{}\n", broadcast_status_text(&data)),
+                    data,
+                ))
+            }
+            BroadcastCmd::Disable => {
+                let c = require_client(client)?;
+                let mut params = json!({ "enabled": false });
+                ctx.trace(&mut params);
+                let data = c.call(methods::BROADCAST_SET, params).await?;
+                Ok(("广播已关闭\n".into(), data))
+            }
+            BroadcastCmd::Status => {
+                let c = require_client(client)?;
+                let data = c.call(methods::BROADCAST_STATUS, json!({})).await?;
+                Ok((format!("{}\n", broadcast_status_text(&data)), data))
+            }
+            BroadcastCmd::Send {
+                text,
+                keys,
+                hex,
+                enter,
+                sessions,
+            } => {
+                let payload =
+                    build_input_payload(text.as_deref(), keys.as_deref(), hex.as_deref(), *enter)?;
+                let c = require_client(client)?;
+                let mut params = json!({ "data": payload });
+                if !sessions.is_empty() {
+                    params["sessions"] = json!(sessions);
+                }
+                ctx.trace(&mut params);
+                let data = c.call(methods::BROADCAST_SEND, params).await?;
+                let n = data.get("sent").and_then(|v| v.as_u64()).unwrap_or(0);
+                let mut out = format!("已广播到 {n} 个会话\n");
+                if let Some(failed) = data.get("failed").and_then(|v| v.as_array())
+                    && !failed.is_empty()
+                {
+                    out.push_str(&format!("失败 {} 个：\n", failed.len()));
+                    for f in failed {
+                        let sid = f.get("session").and_then(|v| v.as_str()).unwrap_or("-");
+                        let err = f.get("error").and_then(|v| v.as_str()).unwrap_or("-");
+                        out.push_str(&format!("  {sid}: {err}\n"));
+                    }
+                }
+                Ok((out, data))
+            }
+        },
         AiObject::Screen { cmd } => match cmd {
             ScreenCmd::Read {
                 session,
@@ -1264,6 +1362,23 @@ fn exec_text(data: &Value, suffix: Option<&str>) -> String {
 }
 
 /// 把 --text / --keys / --hex 合成最终要发送的字节串
+/// 广播态的人读表述（开/关 + 目标范围）
+fn broadcast_status_text(data: &Value) -> String {
+    let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let all = data.get("all").and_then(|v| v.as_bool()).unwrap_or(true);
+    let n = data
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let state = if enabled { "开启" } else { "关闭" };
+    if all {
+        format!("{state}（目标：全部已打开会话）")
+    } else {
+        format!("{state}（目标：{n} 个指定会话）")
+    }
+}
+
 fn build_input_payload(
     text: Option<&str>,
     keys: Option<&str>,

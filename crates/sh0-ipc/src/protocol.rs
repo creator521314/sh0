@@ -150,6 +150,14 @@ pub mod methods {
     /// 分块读写：给传输队列的进度与断点续传用
     pub const FILE_READ_RANGE: &str = "file.read_range";
     pub const FILE_WRITE_AT: &str = "file.write_at";
+
+    // ---- M3 · 批量与广播（FR-5.x）----
+    /// 广播开关与参与会话的设定（FR-5.1）
+    pub const BROADCAST_SET: &str = "broadcast.set";
+    /// 广播态查询
+    pub const BROADCAST_STATUS: &str = "broadcast.status";
+    /// 向参与会话同时发送同一份输入（FR-5.1）
+    pub const BROADCAST_SEND: &str = "broadcast.send";
 }
 
 /// 事件名常量

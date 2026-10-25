@@ -72,6 +72,8 @@ fn shell_reply(payload: &str) -> Option<Vec<u8>> {
 struct EchoTransport {
     pending: VecDeque<TransportEvent>,
     fs: Option<MemFs>,
+    /// 记下收到的输入：广播/输入类断言靠它
+    sends: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -85,7 +87,9 @@ impl SessionTransport for EchoTransport {
     }
 
     async fn send(&mut self, data: &[u8]) -> TransportResult<()> {
-        if let Some(reply) = shell_reply(&String::from_utf8_lossy(data)) {
+        let text = String::from_utf8_lossy(data).to_string();
+        self.sends.lock().unwrap().push(text.clone());
+        if let Some(reply) = shell_reply(&text) {
             self.pending.push_back(TransportEvent::Data(reply));
         }
         Ok(())
@@ -116,6 +120,8 @@ struct EchoShellFactory {
     fs: Arc<std::sync::Mutex<Option<MemFs>>>,
     pub connect_calls: Arc<std::sync::Mutex<u32>>,
     pub sftp_calls: Arc<std::sync::Mutex<u32>>,
+    /// 每条 `send` 的内容（广播测试要断言"同一份输入到了几个会话"）
+    pub sends: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl EchoShellFactory {
@@ -125,6 +131,7 @@ impl EchoShellFactory {
             fs: Arc::new(std::sync::Mutex::new(None)),
             connect_calls: Arc::new(std::sync::Mutex::new(0)),
             sftp_calls: Arc::new(std::sync::Mutex::new(0)),
+            sends: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -148,6 +155,7 @@ impl TransportFactory for EchoShellFactory {
         Ok(Box::new(EchoTransport {
             pending: VecDeque::new(),
             fs: self.fs.lock().unwrap().clone(),
+            sends: self.sends.clone(),
         }))
     }
 
@@ -1309,4 +1317,116 @@ async fn ai_file_upload_download_roundtrip() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ---------------------------------------------------------------------------
+// M3 W3.1：广播（FR-5.1）
+// ---------------------------------------------------------------------------
+
+/// 广播把同一份输入投给所有参与会话；未开启时必须显式指定名单
+#[tokio::test]
+async fn broadcast_fans_out_to_all_sessions() {
+    let fx = fixture().await;
+
+    let a = fx
+        .call(methods::SESSION_OPEN, json!({ "host": "mockbox" }))
+        .await
+        .unwrap();
+    let b = fx
+        .call(methods::SESSION_OPEN, json!({ "host": "mockbox" }))
+        .await
+        .unwrap();
+    let sa = a["id"].as_str().unwrap().to_string();
+
+    // 广播没开、也没给名单：直接拒绝（免得一次误触打进所有机器）
+    let e = fx
+        .call_err(methods::BROADCAST_SEND, json!({ "data": "ls\n" }))
+        .await;
+    assert_eq!(err_code(&e), "invalid_args");
+
+    // 开启广播：不给名单 = 全部已打开会话
+    let st = fx
+        .call(methods::BROADCAST_SET, json!({ "enabled": true }))
+        .await
+        .unwrap();
+    assert!(st["enabled"].as_bool().unwrap());
+    assert!(st["all"].as_bool().unwrap(), "不给名单应等于全部会话");
+
+    let before = fx.factory.sends.lock().unwrap().len();
+    let r = fx
+        .call(methods::BROADCAST_SEND, json!({ "data": "ls -la\n" }))
+        .await
+        .unwrap();
+    assert_eq!(r["sent"].as_u64().unwrap(), 2, "两台都该收到: {r}");
+    let hits = fx.factory.sends.lock().unwrap()[before..]
+        .iter()
+        .filter(|s| *s == "ls -la\n")
+        .count();
+    assert_eq!(hits, 2, "同一份输入应各发一份: {hits}");
+
+    // 显式指定一台：只到那台
+    let before2 = fx.factory.sends.lock().unwrap().len();
+    let r2 = fx
+        .call(
+            methods::BROADCAST_SEND,
+            json!({ "data": "whoami\n", "sessions": [&sa] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2["sent"].as_u64().unwrap(), 1);
+    let hits2 = fx.factory.sends.lock().unwrap()[before2..]
+        .iter()
+        .filter(|s| *s == "whoami\n")
+        .count();
+    assert_eq!(hits2, 1, "指定名单时只发一份: {hits2}");
+
+    // 关掉后仍不指定 → 依旧拒绝
+    fx.call(methods::BROADCAST_SET, json!({ "enabled": false }))
+        .await
+        .unwrap();
+    let e2 = fx
+        .call_err(methods::BROADCAST_SEND, json!({ "data": "x" }))
+        .await;
+    assert_eq!(err_code(&e2), "invalid_args");
+
+    // 广播落审计（一条汇总，不是逐台）
+    let log = fx.call(methods::LOG_QUERY, json!({ "limit": 50 })).await.unwrap();
+    let rows = log["records"].as_array().unwrap();
+    let bc = rows.iter().find(|r| r["action"] == "broadcast.send");
+    assert!(bc.is_some(), "广播应落审计: {rows:?}");
+    assert_eq!(bc.unwrap()["decision"], "sent");
+}
+
+/// TUI 的广播开关与逐台勾选要落到 daemon（名单在 daemon 侧生效）
+#[tokio::test]
+async fn tui_broadcast_toggle_and_mark() {
+    let fx = fixture().await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+    app.open("mockbox").await.unwrap();
+    app.open("mockbox").await.unwrap();
+
+    assert!(!app.broadcast(), "默认不开广播");
+    app.toggle_broadcast().await;
+    assert!(app.broadcast());
+
+    let st = fx.call(methods::BROADCAST_STATUS, json!({})).await.unwrap();
+    assert!(st["enabled"].as_bool().unwrap(), "TUI 开关要同步到 daemon");
+    assert!(st["all"].as_bool().unwrap(), "默认目标为全部会话");
+
+    // 勾选当前会话 → 名单变成显式一份
+    app.mark_broadcast().await;
+    let st2 = fx.call(methods::BROADCAST_STATUS, json!({})).await.unwrap();
+    assert!(!st2["all"].as_bool().unwrap(), "勾选后目标应为指定名单");
+    assert_eq!(st2["sessions"].as_array().unwrap().len(), 1);
+
+    // 再点一次 = 取消勾选，回到"全部"
+    app.mark_broadcast().await;
+    let st3 = fx.call(methods::BROADCAST_STATUS, json!({})).await.unwrap();
+    assert!(st3["all"].as_bool().unwrap(), "取消勾选后应回到全部会话");
 }
