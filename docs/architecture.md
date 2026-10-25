@@ -443,11 +443,12 @@ pub enum Event {   // daemon → 前端的推送
 | `sh0 ai screen read --session <id> [--lines N] [--mode plain\|grid]` | 读取屏幕/滚动缓冲 | P0 |
 | `sh0 ai input send --session <id> (--text T \| --keys K \| --hex H)` | 注入按键 | P0 |
 | `sh0 ai log query [--host X] [--session S] [--since TS] [--actor ai] [--risk deny] [--limit N]` | 审计查询 | P0 |
-| `sh0 ai file list --session <id> --path P` | 列远程目录 | P1 |
-| `sh0 ai file upload --session <id> --local L --remote R` | 上传 | P1 |
-| `sh0 ai file download --session <id> --remote R --local L` | 下载 | P1 |
-| `sh0 ai file read --session <id> --path P [--max-bytes N]` | 读远程文件 | P1 |
-| `sh0 ai file write --session <id> --path P --content-stdin` | 写远程文件 | P1 |
+| `sh0 ai file list (--session <id> \| --host X) --path P` | 列远程目录 ✅ | P1 |
+| `sh0 ai file upload (--session <id> \| --host X) --local L --remote R` | 上传（分块，二进制安全） ✅ | P1 |
+| `sh0 ai file download (--session <id> \| --host X) --remote R --local L` | 下载（分块） ✅ | P1 |
+| `sh0 ai file read (--session <id> \| --host X) --path P [--max-bytes N]` | 读远程文件 ✅ | P1 |
+| `sh0 ai file write (--session <id> \| --host X) --path P [--data S]` | 写远程文件（支持 `--encoding base64`） ✅ | P1 |
+| `sh0 ai file stat / mkdir / rm / rename / chmod` | 其余文件操作 ✅ | P1 |
 | `sh0 ai batch exec --hosts a,b,c --cmd <cmd> [--concurrency N]` | 批量执行并汇总 | P1 |
 | `sh0 ai broadcast send --sessions a,b --text T` | 广播输入 | P1 |
 

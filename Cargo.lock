@@ -3244,6 +3244,7 @@ dependencies = [
 name = "sh0-ai"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "serde",
  "serde_json",

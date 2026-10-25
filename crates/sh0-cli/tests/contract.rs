@@ -1221,3 +1221,92 @@ async fn tui_transfer_queue_marks_chunks_and_retries() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// `ai file upload/download` 端到端（FR-6.6 / W4.5）：分块、二进制安全
+#[tokio::test]
+async fn ai_file_upload_download_roundtrip() {
+    let (fx, fs) = fixture_sftp().await;
+
+    let tmp = std::env::temp_dir().join(format!("sh0-w45-{}", sh0_core::new_session_id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // 400 KB 二进制：必然跨块，也必然走 base64
+    let bin: Vec<u8> = (0..=255u8).cycle().take(400 * 1024).collect();
+    let src = tmp.join("payload.bin");
+    std::fs::write(&src, &bin).unwrap();
+
+    let upload = sh0_ai::AiArgs {
+        object: sh0_ai::AiObject::File {
+            cmd: sh0_ai::FileCmd::Upload {
+                session: None,
+                host: Some("mockbox".into()),
+                local: src.to_string_lossy().to_string(),
+                remote: "/tmp/payload.bin".into(),
+            },
+        },
+        json: false,
+        quiet: true,
+        trace_id: Some("w45-upload".into()),
+        timeout: 30,
+        yes: false,
+        dry_run: false,
+    };
+    assert_eq!(sh0_ai::run(upload, Some(fx.client.clone())).await, 0, "upload 应成功");
+    assert_eq!(fs.read("/tmp/payload.bin").unwrap(), bin, "上传的字节必须逐字节一致");
+
+    // 下载回来
+    let dst = tmp.join("back.bin");
+    let download = sh0_ai::AiArgs {
+        object: sh0_ai::AiObject::File {
+            cmd: sh0_ai::FileCmd::Download {
+                session: None,
+                host: Some("mockbox".into()),
+                remote: "/tmp/payload.bin".into(),
+                local: dst.to_string_lossy().to_string(),
+            },
+        },
+        json: false,
+        quiet: true,
+        trace_id: None,
+        timeout: 30,
+        yes: false,
+        dry_run: false,
+    };
+    assert_eq!(sh0_ai::run(download, Some(fx.client.clone())).await, 0, "download 应成功");
+    assert_eq!(std::fs::read(&dst).unwrap(), bin, "下载回来也该逐字节一致");
+
+    // 本地文件不存在：应当是参数错误，而不是崩在 IPC 上
+    let bad = sh0_ai::AiArgs {
+        object: sh0_ai::AiObject::File {
+            cmd: sh0_ai::FileCmd::Upload {
+                session: None,
+                host: Some("mockbox".into()),
+                local: tmp.join("nope.bin").to_string_lossy().to_string(),
+                remote: "/tmp/nope.bin".into(),
+            },
+        },
+        json: false,
+        quiet: true,
+        trace_id: None,
+        timeout: 30,
+        yes: false,
+        dry_run: false,
+    };
+    assert_eq!(
+        sh0_ai::run(bad, Some(fx.client.clone())).await,
+        sh0_ai::exit_code::INVALID_ARGS,
+        "本地文件不存在应报参数错误"
+    );
+
+    // trace_id 落进了审计（FR-6.9）
+    let log = fx.call(methods::LOG_QUERY, json!({})).await.unwrap();
+    assert!(
+        log["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["trace_id"] == "w45-upload"),
+        "上传的 trace_id 应出现在审计里"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

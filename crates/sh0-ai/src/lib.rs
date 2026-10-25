@@ -323,6 +323,32 @@ pub enum FileCmd {
         #[arg(long)]
         to: String,
     },
+    /// 上传本地文件到远端（分块，二进制安全；FR-6.6）
+    Upload {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        /// 本地文件路径
+        #[arg(long)]
+        local: String,
+        /// 远端目标路径
+        #[arg(long)]
+        remote: String,
+    },
+    /// 下载远端文件到本地（分块；FR-6.6）
+    Download {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        /// 远端文件路径
+        #[arg(long)]
+        remote: String,
+        /// 本地目标路径
+        #[arg(long)]
+        local: String,
+    },
     /// 改权限（八进制，如 644）
     Chmod {
         #[arg(long)]
@@ -932,6 +958,100 @@ async fn dispatch(
                 };
                 Ok((text, data))
             }
+            FileCmd::Upload {
+                session,
+                host,
+                local,
+                remote,
+            } => {
+                let c = require_client(client)?;
+                // 分块而不是整体 write：AI 传个几百兆的日志也不该把内存吃干。
+                // 块大小与 TUI 队列一致（256 KB），两端行为对齐，排查时不用换算。
+                let mut file =
+                    std::fs::File::open(local).map_err(|e| AiError::Args(format!("打开 {local} 失败：{e}")))?;
+                let total = file
+                    .metadata()
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let mut offset = 0u64;
+                let mut sent = 0usize;
+                let mut chunks = 0u32;
+                loop {
+                    let mut buf = vec![0u8; AI_CHUNK];
+                    let n = read_at(&mut file, offset, &mut buf)
+                        .map_err(|e| AiError::Other(format!("读 {local} 失败：{e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                    buf.truncate(n);
+                    let (encoding, data) = match std::str::from_utf8(&buf) {
+                        Ok(s) => ("utf8", s.to_string()),
+                        Err(_) => ("base64", base64_encode(&buf)),
+                    };
+                    let mut p = json!({
+                        "session": session, "host": host,
+                        "path": remote, "offset": offset,
+                        "data": data, "encoding": encoding,
+                    });
+                    ctx.trace(&mut p);
+                    c.call(methods::FILE_WRITE_AT, p).await?;
+                    offset += n as u64;
+                    sent += n;
+                    chunks += 1;
+                }
+                let text = format!("已上传 {local} → {remote}（{sent} 字节 / {chunks} 块）\n");
+                Ok((text, json!({
+                    "local": local, "remote": remote,
+                    "bytes": sent, "chunks": chunks, "size": total,
+                })))
+            }
+            FileCmd::Download {
+                session,
+                host,
+                remote,
+                local,
+            } => {
+                let c = require_client(client)?;
+                let mut offset = 0u64;
+                let mut got = 0usize;
+                let mut chunks = 0u32;
+                let mut created = false;
+                loop {
+                    let mut p = json!({
+                        "session": session, "host": host,
+                        "path": remote, "offset": offset, "len": AI_CHUNK,
+                    });
+                    ctx.trace(&mut p);
+                    let data = c.call(methods::FILE_READ_RANGE, p).await?;
+                    let enc = data.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
+                    let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let bytes = if enc == "base64" {
+                        base64_decode(content)
+                            .ok_or_else(|| AiError::Other("下载内容无法解码".into()))?
+                    } else {
+                        content.as_bytes().to_vec()
+                    };
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    if !created {
+                        std::fs::write(local, &bytes)
+                            .map_err(|e| AiError::Args(format!("写 {local} 失败：{e}")))?;
+                        created = true;
+                    } else {
+                        append_to(local, &bytes)
+                            .map_err(|e| AiError::Args(format!("写 {local} 失败：{e}")))?;
+                    }
+                    offset += bytes.len() as u64;
+                    got += bytes.len();
+                    chunks += 1;
+                }
+                let text = format!("已下载 {remote} → {local}（{got} 字节 / {chunks} 块）\n");
+                Ok((text, json!({
+                    "remote": remote, "local": local,
+                    "bytes": got, "chunks": chunks,
+                })))
+            }
             FileCmd::Read {
                 session,
                 host,
@@ -1071,6 +1191,40 @@ fn fmt_ts(secs: i64) -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+/// 与 TUI 传输队列一致的块大小
+const AI_CHUNK: usize = 256 * 1024;
+
+/// 从文件的 `offset` 处读一块
+fn read_at(f: &mut std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::{Read, Seek};
+    f.seek(std::io::SeekFrom::Start(offset))?;
+    let mut read = 0usize;
+    while read < buf.len() {
+        let n = f.read(&mut buf[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    Ok(read)
+}
+
+fn append_to(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+    f.write_all(bytes)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
 /// exec 的人类可读输出：一行头部 + stdout + stderr

@@ -150,7 +150,8 @@
 **M4 进度**：FR-4.1（W4.1，SFTP 通道复用会话连接）、FR-4.2（W4.2，双栏 UI + 排序 + 路径跳转）、
 FR-4.3（W4.3，上传/下载/重命名/删除/建目录/改权限）、
 FR-4.4（W4.4，标记多选 + 传输队列的进度/速度/失败重试）已实现；
-`ai file list/read/write/mkdir/rm/rename/chmod` 已可用（W4.1 提前落地，W4.5 正式归位）。
+FR-6.6 的 `ai file list/stat/read/write/mkdir/rm/rename/chmod/upload/download` 全部可用
+（前八个 W4.1 提前落地，upload/download 在 W4.5 补齐）。
 
 ### FR-5 批量与多机操作
 
