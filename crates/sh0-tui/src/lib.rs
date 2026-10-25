@@ -5,10 +5,11 @@
 //! 渲染在自己进程里做，避免每帧跨进程传整个网格。
 
 pub mod app;
+pub mod files;
 pub mod hosts;
 pub mod render;
 pub mod theme;
 
-pub use app::{App, Focus, Tab, run};
+pub use app::{App, Focus, Tab, View, run};
 pub use hosts::{HostForm, HostTree};
 pub use theme::Theme;

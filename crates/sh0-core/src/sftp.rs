@@ -95,6 +95,59 @@ pub fn mode_string(is_dir: bool, mode: Option<u32>) -> String {
     s
 }
 
+/// 人类可读的体积：`1.5K`、`238M`。给 UI 与 AI 共用，避免两处各写一套。
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut n = bytes as f64;
+    let mut i = 0usize;
+    while n >= 1024.0 && i + 1 < UNITS.len() {
+        n /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes}B")
+    } else if n < 10.0 {
+        format!("{n:.1}{}", UNITS[i])
+    } else {
+        format!("{:.0}{}", n, UNITS[i])
+    }
+}
+
+/// mtime（unix 秒）→ `YYYY-MM-DD HH:MM:SS`；无值时给等宽占位，方便对齐。
+///
+/// 手写 civil_from_days 而不是引 chrono：整个项目只有这一处需要日历换算。
+pub fn format_mtime(secs: Option<i64>) -> String {
+    let Some(s) = secs.filter(|v| *v > 0) else {
+        return "-".to_string();
+    };
+    let days = s.div_euclid(86_400);
+    let rem = s.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Howard Hinnant 的 civil_from_days：从 1970 起算的天数 → (年, 月, 日)
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +174,24 @@ mod tests {
         assert_eq!(mode_string(false, Some(0o100644)), "-rw-r--r--");
         assert_eq!(mode_string(true, Some(0o40755)), "drwxr-xr-x");
         assert_eq!(mode_string(false, None), "----------");
+    }
+
+    #[test]
+    fn human_size_steps_units() {
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(999), "999B");
+        assert_eq!(human_size(1024), "1.0K");
+        assert_eq!(human_size(1536), "1.5K");
+        assert_eq!(human_size(15 * 1024), "15K");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0M");
+    }
+
+    #[test]
+    fn format_mtime_uses_calendar_days() {
+        // 2024-03-01 12:34:56 UTC
+        let secs = 1_709_296_496;
+        assert_eq!(format_mtime(Some(secs)), "2024-03-01 12:34:56");
+        assert_eq!(format_mtime(None), "-");
+        assert_eq!(format_mtime(Some(0)), "-");
     }
 }

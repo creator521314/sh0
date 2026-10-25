@@ -19,6 +19,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sh0::daemon;
+use sh0_core::mock::{MemFs, MockSftp};
+use sh0_core::sftp::SftpClient;
 use sh0_core::transport::{
     ExecOutput, SessionTransport, TransportError, TransportEvent, TransportFactory, TransportResult,
 };
@@ -49,7 +51,11 @@ fn shell_reply(payload: &str) -> Option<Vec<u8>> {
         .to_string();
     let cmd = lines[..echo_idx].join("\n");
     let cmd = cmd.trim();
-    let exit = if cmd.contains("false") || cmd.contains("exit 1") { 1 } else { 0 };
+    let exit = if cmd.contains("false") || cmd.contains("exit 1") {
+        1
+    } else {
+        0
+    };
     let out = if let Some(rest) = cmd.strip_prefix("echo ") {
         rest.to_string()
     } else if cmd.is_empty() {
@@ -57,14 +63,15 @@ fn shell_reply(payload: &str) -> Option<Vec<u8>> {
     } else {
         format!("[mock-output] {cmd}")
     };
-    Some(
-        format!("{cmd}\r\n{out}\r\necho {sentinel}:$?\r\n{sentinel}:{exit}\r\n").into_bytes(),
-    )
+    Some(format!("{cmd}\r\n{out}\r\necho {sentinel}:$?\r\n{sentinel}:{exit}\r\n").into_bytes())
 }
 
-/// 收到带哨兵的发送就回复；其余发送（纯输入）静默丢弃
+/// 收到带哨兵的发送就回复；其余发送（纯输入）静默丢弃。
+///
+/// 挂了 `fs` 就能在这条连接上开 SFTP——契约测试用它证明"会话内 SFTP 不新开 TCP"。
 struct EchoTransport {
     pending: VecDeque<TransportEvent>,
+    fs: Option<MemFs>,
 }
 
 #[async_trait]
@@ -91,6 +98,13 @@ impl SessionTransport for EchoTransport {
     async fn close(&mut self) -> TransportResult<()> {
         Ok(())
     }
+
+    async fn sftp(&mut self) -> TransportResult<Box<dyn SftpClient>> {
+        match &self.fs {
+            Some(fs) => Ok(Box::new(MockSftp::new(fs.clone()))),
+            None => Err(TransportError::NotImplemented("mock 未挂文件系统".into())),
+        }
+    }
 }
 
 /// 双模式假工厂：shell 走 EchoTransport，exec channel 走脚本化输出
@@ -98,13 +112,27 @@ impl SessionTransport for EchoTransport {
 #[derive(Clone, Default)]
 struct EchoShellFactory {
     exec_outputs: Arc<std::sync::Mutex<VecDeque<ExecOutput>>>,
+    /// 挂在连接上的内存文件系统；None 时 SFTP 不可用（模拟不支持的服务端）
+    fs: Arc<std::sync::Mutex<Option<MemFs>>>,
+    pub connect_calls: Arc<std::sync::Mutex<u32>>,
+    pub sftp_calls: Arc<std::sync::Mutex<u32>>,
 }
 
 impl EchoShellFactory {
     fn with_exec(outputs: Vec<ExecOutput>) -> Self {
         Self {
             exec_outputs: Arc::new(std::sync::Mutex::new(VecDeque::from(outputs))),
+            fs: Arc::new(std::sync::Mutex::new(None)),
+            connect_calls: Arc::new(std::sync::Mutex::new(0)),
+            sftp_calls: Arc::new(std::sync::Mutex::new(0)),
         }
+    }
+
+    /// 让这台"主机"支持 SFTP
+    fn with_sftp(fs: MemFs) -> Self {
+        let f = Self::default();
+        *f.fs.lock().unwrap() = Some(fs);
+        f
     }
 }
 
@@ -116,8 +144,10 @@ impl TransportFactory for EchoShellFactory {
         _cols: u16,
         _rows: u16,
     ) -> TransportResult<Box<dyn SessionTransport + Send>> {
+        *self.connect_calls.lock().unwrap() += 1;
         Ok(Box::new(EchoTransport {
             pending: VecDeque::new(),
+            fs: self.fs.lock().unwrap().clone(),
         }))
     }
 
@@ -134,6 +164,15 @@ impl TransportFactory for EchoShellFactory {
             q.front().cloned()
         };
         out.ok_or_else(|| TransportError::NotImplemented("exec 脚本为空".into()))
+    }
+
+    async fn open_sftp(&self, _host: &Host) -> TransportResult<Box<dyn SftpClient>> {
+        *self.sftp_calls.lock().unwrap() += 1;
+        match self.fs.lock().unwrap().clone() {
+            // 没挂 fs = 服务端没开 sftp subsystem：真机上这是常见配置
+            None => Err(TransportError::NotImplemented("SFTP 子系统不可用".into())),
+            Some(fs) => Ok(Box::new(MockSftp::new(fs))),
+        }
     }
 }
 
@@ -156,6 +195,10 @@ struct Fixture {
     dir: PathBuf,
     client: Arc<IpcClient>,
     stop: Option<oneshot::Sender<()>>,
+    /// 留一份工厂：SFTP 的复用断言要数 connect 次数
+    factory: EchoShellFactory,
+    /// TUI 侧集成测试要用同一份 Store
+    store: Arc<Store>,
 }
 
 impl Fixture {
@@ -229,7 +272,8 @@ async fn fixture_with(factory: EchoShellFactory) -> Fixture {
         })
         .expect("写入主机清单失败");
 
-    let (addr, token, stop) = daemon::run_for_test(store, cfg, Arc::new(factory))
+    // 留一份给测试断言（SFTP 复用要数 connect 次数），另一份交给 daemon
+    let (addr, token, stop) = daemon::run_for_test(store.clone(), cfg, Arc::new(factory.clone()))
         .await
         .expect("测试 daemon 启动失败");
     let conn = sh0_ipc::IpcClient::connect(&addr.to_string(), &token)
@@ -239,6 +283,8 @@ async fn fixture_with(factory: EchoShellFactory) -> Fixture {
         dir,
         client: conn.client,
         stop: Some(stop),
+        factory,
+        store,
     }
 }
 
@@ -351,23 +397,23 @@ async fn ac5_deny_is_absolute_even_with_yes() {
             )
             .await;
         assert_eq!(
-            err_code(&err), "risk_denied",
+            err_code(&err),
+            "risk_denied",
             "rm -rf / 必须一律 deny（yes={yes} 也不例外）"
         );
     }
 
     // 拦截动作本身要落审计（AC-8）
     let log = fx
-        .call(
-            methods::LOG_QUERY,
-            json!({ "actor": "ai", "risk": "deny" }),
-        )
+        .call(methods::LOG_QUERY, json!({ "actor": "ai", "risk": "deny" }))
         .await
         .expect("审计查询应当成功");
     let recs = log["records"].as_array().expect("records 必须是数组");
     assert!(
         recs.iter().any(|r| r["decision"] == "denied"
-            && r["command"].as_str().is_some_and(|c| c.contains("rm -rf /"))),
+            && r["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("rm -rf /"))),
         "deny 决策必须出现在审计里: {log}"
     );
 }
@@ -545,16 +591,8 @@ async fn ac7_no_plaintext_secrets_on_disk() {
                 }
                 let raw = std::fs::read(&path).unwrap_or_default();
                 let text = String::from_utf8_lossy(&raw);
-                assert!(
-                    !text.contains(secret),
-                    "{} 含有明文密码",
-                    path.display()
-                );
-                assert!(
-                    !text.contains(master),
-                    "{} 含有主密码",
-                    path.display()
-                );
+                assert!(!text.contains(secret), "{} 含有明文密码", path.display());
+                assert!(!text.contains(master), "{} 含有主密码", path.display());
                 checked += 1;
             }
         }
@@ -578,7 +616,10 @@ async fn p0_session_lifecycle_and_screen() {
         )
         .await
         .expect("打开会话应当成功");
-    let sid = opened["id"].as_str().expect("必须返回 session id").to_string();
+    let sid = opened["id"]
+        .as_str()
+        .expect("必须返回 session id")
+        .to_string();
 
     let list = fx.call(methods::SESSION_LIST, json!({})).await.unwrap();
     assert!(
@@ -604,7 +645,10 @@ async fn p0_session_lifecycle_and_screen() {
         )
         .await
         .unwrap();
-    assert!(plain["text"].is_string(), "plain 模式必须返回 text: {plain}");
+    assert!(
+        plain["text"].is_string(),
+        "plain 模式必须返回 text: {plain}"
+    );
 
     let grid = fx
         .call(
@@ -730,8 +774,14 @@ async fn ac8_ai_and_tui_actions_share_one_audit_log() {
     let recs = log["records"].as_array().unwrap();
     let actions: Vec<&str> = recs.iter().filter_map(|r| r["action"].as_str()).collect();
     assert!(actions.contains(&"exec.run"), "缺 exec.run: {actions:?}");
-    assert!(actions.contains(&"session.open"), "缺 session.open: {actions:?}");
-    assert!(actions.contains(&"input.send"), "缺 input.send: {actions:?}");
+    assert!(
+        actions.contains(&"session.open"),
+        "缺 session.open: {actions:?}"
+    );
+    assert!(
+        actions.contains(&"input.send"),
+        "缺 input.send: {actions:?}"
+    );
 
     // actor 区分得开（同一本账，不是两个库）
     assert!(recs.iter().any(|r| r["actor"] == "ai"));
@@ -749,4 +799,267 @@ async fn ac8_ai_and_tui_actions_share_one_audit_log() {
             .iter()
             .all(|r| r["actor"] == "ai")
     );
+}
+
+// ---------------------------------------------------------------------------
+// M4 · SFTP（FR-4.1 复用连接 / FR-4.2 UI 依赖的规范化路径 / FR-6.6）
+// ---------------------------------------------------------------------------
+
+async fn fixture_sftp() -> (Fixture, MemFs) {
+    let fs = MemFs::new();
+    let fx = fixture_with(EchoShellFactory::with_sftp(fs.clone())).await;
+    (fx, fs)
+}
+
+/// 会话内列目录：复用已建连接（FR-4.1），且返回规范化绝对路径（FR-4.2 的 UI 依赖）
+#[tokio::test]
+async fn sftp_list_reuses_session_and_returns_canonical_path() {
+    let (fx, _fs) = fixture_sftp().await;
+
+    let opened = fx
+        .call(
+            methods::SESSION_OPEN,
+            json!({ "host": "mockbox", "cols": 80, "rows": 24, "actor": "tui" }),
+        )
+        .await
+        .unwrap();
+    let sid = opened["id"].as_str().unwrap().to_string();
+    let connects_after_open = *fx.factory.connect_calls.lock().unwrap();
+
+    // UI 第一次列目录给的是 "."：服务端必须把它变成可信绝对路径，
+    // 否则 `./foo` 会一层层叠下去，审计里的路径也跟着糊掉
+    let data = fx
+        .call(
+            methods::FILE_LIST,
+            json!({ "session": sid, "path": ".", "actor": "tui" }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(data["path"], "/tmp", "应返回规范化后的绝对路径: {data}");
+    assert_eq!(data["host"], "mockbox");
+    let entries = data["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "预置 logs/ 与 hello.txt: {data}");
+    assert_eq!(entries[0]["name"], "logs", "目录排前面");
+    assert_eq!(entries[0]["is_dir"], true);
+    assert_eq!(entries[1]["name"], "hello.txt");
+
+    // 关键：没有为新开 SFTP 而新建 TCP 连接
+    assert_eq!(
+        *fx.factory.connect_calls.lock().unwrap(),
+        connects_after_open,
+        "SFTP 应当复用会话连接，不新开 TCP"
+    );
+}
+
+/// 读写往返 + 审计落账（FR-4.3 / FR-8.x）
+#[tokio::test]
+async fn sftp_write_read_roundtrip_and_audited() {
+    let (fx, fs) = fixture_sftp().await;
+
+    fx.call(
+        methods::FILE_WRITE,
+        json!({ "host": "mockbox", "path": "/tmp/ui.txt", "data": "双栏 UI", "actor": "ai" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs.read("/tmp/ui.txt").unwrap(), "双栏 UI".as_bytes());
+
+    let data = fx
+        .call(
+            methods::FILE_READ,
+            json!({ "host": "mockbox", "path": "/tmp/ui.txt", "actor": "ai" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(data["encoding"], "utf8");
+    assert_eq!(data["content"], "双栏 UI");
+
+    // 不存在的路径 → not_found（AI 靠这个码决定下一步，不能是笼统的 internal）
+    let err = fx
+        .call_err(
+            methods::FILE_READ,
+            json!({ "host": "mockbox", "path": "/tmp/nope.txt", "actor": "ai" }),
+        )
+        .await;
+    assert_eq!(err_code(&err), "not_found");
+
+    let log = fx.call(methods::LOG_QUERY, json!({})).await.unwrap();
+    let actions: Vec<&str> = log["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["action"].as_str())
+        .collect();
+    assert!(
+        actions.contains(&"file.write"),
+        "缺 file.write: {actions:?}"
+    );
+    assert!(actions.contains(&"file.read"), "缺 file.read: {actions:?}");
+}
+
+/// 目录/重命名/权限/删除：UI 的 `g` 跳转与后续操作都建立在这些之上
+#[tokio::test]
+async fn sftp_lifecycle_mkdir_rename_chmod_remove() {
+    let (fx, fs) = fixture_sftp().await;
+
+    fx.call(
+        methods::FILE_MKDIR,
+        json!({ "host": "mockbox", "path": "/tmp/sh0-ui", "actor": "ai" }),
+    )
+    .await
+    .unwrap();
+    assert!(fs.exists("/tmp/sh0-ui"));
+
+    fx.call(
+        methods::FILE_RENAME,
+        json!({ "host": "mockbox", "from": "/tmp/sh0-ui", "to": "/tmp/sh0-ui2", "actor": "ai" }),
+    )
+    .await
+    .unwrap();
+    assert!(!fs.exists("/tmp/sh0-ui"));
+    assert!(fs.exists("/tmp/sh0-ui2"));
+
+    fx.call(
+        methods::FILE_CHMOD,
+        json!({ "host": "mockbox", "path": "/tmp/hello.txt", "mode": 0o600, "actor": "ai" }),
+    )
+    .await
+    .unwrap();
+    let st = fx
+        .call(
+            methods::FILE_STAT,
+            json!({ "host": "mockbox", "path": "/tmp/hello.txt", "actor": "ai" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(st["entry"]["mode"], 0o600);
+
+    fx.call(
+        methods::FILE_REMOVE,
+        json!({ "host": "mockbox", "path": "/tmp/sh0-ui2", "dir": true, "actor": "ai" }),
+    )
+    .await
+    .unwrap();
+    assert!(!fs.exists("/tmp/sh0-ui2"));
+
+    // 删掉之后再列：空目录而不是报错
+    let listed = fx
+        .call(
+            methods::FILE_LIST,
+            json!({ "host": "mockbox", "path": "/tmp", "actor": "ai" }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "sh0-ui2")
+    );
+}
+
+/// 一键式（`--host`，没有会话）走工厂的 open_sftp，用完即关
+#[tokio::test]
+async fn sftp_one_shot_uses_host_selector() {
+    let (fx, _fs) = fixture_sftp().await;
+
+    let data = fx
+        .call(
+            methods::FILE_LIST,
+            json!({ "host": "mockbox", "path": "/tmp", "actor": "ai" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(data["path"], "/tmp");
+    assert_eq!(*fx.factory.sftp_calls.lock().unwrap(), 1);
+
+    // 既没 session 也没 host → invalid_args，而不是去猜
+    let err = fx
+        .call_err(methods::FILE_LIST, json!({ "path": "/tmp", "actor": "ai" }))
+        .await;
+    assert_eq!(err_code(&err), "invalid_args");
+}
+
+/// 服务端不支持 SFTP 时给出可读错误（真机上旧 sshd / 被禁 subsystem 会走到这）
+#[tokio::test]
+async fn sftp_unavailable_is_machine_readable() {
+    // 工厂默认不挂文件系统，等价于"服务端不支持 SFTP"
+    let fx = fixture().await;
+    let err = fx
+        .call_err(
+            methods::FILE_LIST,
+            json!({ "host": "mockbox", "path": "/tmp", "actor": "ai" }),
+        )
+        .await;
+    assert_eq!(
+        err_code(&err),
+        "not_implemented",
+        "能力缺失要能被 AI 识别成'重试无用'"
+    );
+}
+
+/// TUI 的双栏文件视图真的能经 IPC 列出远端目录（FR-4.2）
+///
+/// 不跑事件循环，只驱动 App 的行为方法——验证的是"F9 之后右栏有没有东西"，
+/// 渲染本身由 `files.rs` 的单测覆盖。这样不必真的开一个终端。
+#[tokio::test]
+async fn tui_file_view_lists_remote_over_ipc() {
+    let (fx, _fs) = fixture_sftp().await;
+
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+    app.open("mockbox").await.unwrap();
+
+    // 左栏开局就是本机目录，且排过序
+    assert!(!app.local_files().entries.is_empty(), "左栏应列出本机目录");
+
+    app.enter_files().await;
+    assert!(app.in_file_view());
+
+    // 右栏：daemon 把 "." 规范化成了绝对路径
+    assert_eq!(app.remote_files().cwd, "/tmp");
+    let names: Vec<&str> = app
+        .remote_files()
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["logs", "hello.txt"],
+        "目录在前、文件在后: {names:?}"
+    );
+
+    // 焦点默认在左栏（要往外传文件）：先 Tab 到右栏
+    app.toggle_file_pane();
+    // 进入子目录：选中的第一行是 logs
+    app.file_enter().await;
+    assert_eq!(app.remote_files().cwd, "/tmp/logs");
+    let inner: Vec<&str> = app
+        .remote_files()
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(inner, vec!["app.log"]);
+
+    // 上级目录
+    app.file_up().await;
+    assert_eq!(app.remote_files().cwd, "/tmp");
+
+    // 路径跳转
+    app.file_goto("/tmp/logs").await;
+    assert_eq!(app.remote_files().cwd, "/tmp/logs");
+
+    // 排序切换不影响条目数
+    let before = app.remote_files().entries.len();
+    app.file_sort();
+    assert_eq!(app.remote_files().entries.len(), before);
 }

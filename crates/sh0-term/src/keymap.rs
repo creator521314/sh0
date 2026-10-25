@@ -35,6 +35,10 @@ pub enum Action {
     SelectMode,
     /// 复制当前选区
     Copy,
+    /// 终端视图与双栏文件视图之间切换（FR-4.2）
+    ToggleFiles,
+    /// 刷新当前文件面板
+    FileRefresh,
 }
 
 impl Action {
@@ -59,6 +63,8 @@ impl Action {
             Action::ClearScreen => "screen.clear",
             Action::SelectMode => "screen.select",
             Action::Copy => "screen.copy",
+            Action::ToggleFiles => "file.toggle",
+            Action::FileRefresh => "file.refresh",
         }
     }
 
@@ -83,6 +89,8 @@ impl Action {
             Action::ClearScreen,
             Action::SelectMode,
             Action::Copy,
+            Action::ToggleFiles,
+            Action::FileRefresh,
         ]
         .into_iter()
         .find(|a| a.as_str() == s)
@@ -109,6 +117,8 @@ impl Action {
             Action::ClearScreen => "清屏",
             Action::SelectMode => "选择文本",
             Action::Copy => "复制选区",
+            Action::ToggleFiles => "文件管理",
+            Action::FileRefresh => "刷新文件列表",
         }
     }
 }
@@ -148,6 +158,8 @@ impl Keymap {
             ("ctrl+l", Action::ClearScreen),
             ("alt+v", Action::SelectMode),
             ("alt+c", Action::Copy),
+            ("f9", Action::ToggleFiles),
+            ("f5", Action::FileRefresh),
         ])
     }
 
@@ -169,6 +181,8 @@ impl Keymap {
             ("ctrl+l", Action::ClearScreen),
             ("alt+v", Action::SelectMode),
             ("alt+c", Action::Copy),
+            ("f9", Action::ToggleFiles),
+            ("f5", Action::FileRefresh),
         ])
     }
 
@@ -190,6 +204,8 @@ impl Keymap {
             ("ctrl+l", Action::ClearScreen),
             ("alt+v", Action::SelectMode),
             ("alt+c", Action::Copy),
+            ("f9", Action::ToggleFiles),
+            ("f5", Action::FileRefresh),
         ])
     }
 
@@ -205,7 +221,10 @@ impl Keymap {
     }
 
     pub fn get(&self, key: KeyEvent) -> Option<Action> {
-        self.bindings.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
+        self.bindings
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, a)| *a)
     }
 
     pub fn bind(&mut self, key: KeyEvent, action: Action) {

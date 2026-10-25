@@ -24,10 +24,12 @@ use sh0_core::SessionState;
 use sh0_store::Store;
 use sh0_term::{Keymap, Screen, ScreenOptions};
 
+use crate::files::{FilePane, entry_line};
 use crate::hosts::{HostForm, HostTree, Row};
-use sh0_term::keymap::Action;
 use crate::render::{render_line, render_line_with_cursor};
 use crate::theme::Theme;
+use sh0_core::sftp::FileEntry;
+use sh0_term::keymap::Action;
 
 const TREE_WIDTH: u16 = 28;
 const FRAME_MS: u64 = 16;
@@ -46,6 +48,15 @@ pub struct Tab {
 pub enum Focus {
     Tree,
     Terminal,
+    /// 双栏文件面板（FR-4.2）。具体是哪一栏看 [`App::file_focus_left`]
+    Files,
+}
+
+/// 主区渲染什么：终端 或 双栏文件管理
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Terminal,
+    Files,
 }
 
 /// 文本选区，坐标是**视图坐标**（随滚动一起移动）
@@ -122,6 +133,18 @@ pub struct App {
     last_copy: String,
     /// 待确认的 exec 弹窗（confirm.requested）；Some 时拦截全部按键
     confirm: Option<PendingConfirm>,
+    /// 主区视图：终端还是文件管理
+    view: View,
+    /// 左侧：本机目录
+    files_left: FilePane,
+    /// 右侧：远端目录（走当前会话的 SFTP 通道）
+    files_right: FilePane,
+    /// 文件视图里焦点在哪一栏
+    file_focus_left: bool,
+    /// 路径跳转输入缓冲；Some 表示正在输入
+    file_jump: Option<String>,
+    /// 右栏当前绑定到的会话（换标签页要重新列目录）
+    file_sid: Option<String>,
 }
 
 impl App {
@@ -137,7 +160,9 @@ impl App {
         let budget = if cfg.memory_budget_mb == 0 {
             None
         } else {
-            Some(sh0_term::MemoryBudget::new(cfg.memory_budget_mb * 1024 * 1024))
+            Some(sh0_term::MemoryBudget::new(
+                cfg.memory_budget_mb * 1024 * 1024,
+            ))
         };
         let _ = budget; // TUI 侧每个标签各自持有 Screen，预算在 daemon 侧统一约束
 
@@ -161,6 +186,12 @@ impl App {
             selection: None,
             last_copy: String::new(),
             confirm: None,
+            view: View::Terminal,
+            files_left: FilePane::local(),
+            files_right: FilePane::remote(),
+            file_focus_left: true,
+            file_jump: None,
+            file_sid: None,
         }
     }
 
@@ -168,17 +199,26 @@ impl App {
     pub async fn attach_existing(&mut self) -> anyhow::Result<()> {
         let res = self.client.call(methods::SESSION_LIST, json!({})).await?;
         let empty = vec![];
-        let list = res.get("sessions").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let list = res
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty);
         for s in list {
             let id = s.get("id").and_then(|v| v.as_str()).unwrap_or_default();
             if id.is_empty() || self.tabs.iter().any(|t| t.id == id) {
                 continue;
             }
-            let name = s.get("host_name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let name = s
+                .get("host_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
             let state = s.get("state").and_then(|v| v.as_str()).unwrap_or("closed");
             let mut tab = self.new_tab(id.to_string(), name.clone(), name.clone());
             tab.state = parse_state(state);
-            tab.screen.push_notice("已接入 daemon 中的既有会话（历史输出请用 `sh0 ai screen read` 查看）");
+            tab.screen.push_notice(
+                "已接入 daemon 中的既有会话（历史输出请用 `sh0 ai screen read` 查看）",
+            );
             self.tabs.push(tab);
         }
         Ok(())
@@ -203,7 +243,10 @@ impl App {
         let (cols, rows) = self.term_size;
         let res = self
             .client
-            .call(methods::SESSION_OPEN, json!({ "host": host, "cols": cols, "rows": rows }))
+            .call(
+                methods::SESSION_OPEN,
+                json!({ "host": host, "cols": cols, "rows": rows }),
+            )
             .await?;
         let id = res
             .get("id")
@@ -215,10 +258,15 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or(host)
             .to_string();
-        self.tabs.push(self.new_tab(id, name.clone(), host.to_string()));
+        self.tabs
+            .push(self.new_tab(id, name.clone(), host.to_string()));
         self.active = self.tabs.len() - 1;
-        self.focus = Focus::Terminal;
+        if self.view != View::Files {
+            self.focus = Focus::Terminal;
+        }
         self.notice = format!("已连接 {name}");
+        // 文件视图下右栏要切到这台主机
+        self.tab_changed().await;
         Ok(())
     }
 
@@ -386,12 +434,11 @@ impl App {
                 KeyCode::Char('d') => self.pending_delete = self.tree.current_host(),
                 _ => {}
             },
+            Focus::Files => return self.on_file_key(key).await,
             Focus::Terminal => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let app_keys = tab.screen.grid.app_cursor_keys;
-                    if let Some(bytes) =
-                        sh0_term::encode_key(key, app_keys)
-                    {
+                    if let Some(bytes) = sh0_term::encode_key(key, app_keys) {
                         let text = String::from_utf8_lossy(&bytes).to_string();
                         let _ = self
                             .client
@@ -409,7 +456,74 @@ impl App {
         Ok(())
     }
 
+    /// 文件视图的按键：先喂路径跳转输入框，再走导航
+    async fn on_file_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        if let Some(j) = self.file_jump.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.file_jump = None;
+                    self.notice.clear();
+                }
+                KeyCode::Enter => {
+                    let target = j.trim().to_string();
+                    self.file_jump = None;
+                    self.file_goto(&target).await;
+                }
+                KeyCode::Backspace => {
+                    j.pop();
+                }
+                KeyCode::Char(c) => j.push(c),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.file_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.file_move(1),
+            KeyCode::Enter | KeyCode::Right => self.file_enter().await,
+            KeyCode::Backspace | KeyCode::Left => self.file_up().await,
+            KeyCode::Tab => {
+                self.toggle_file_pane();
+                // 切到右栏时若还没列过目录，顺手列一次
+                if !self.file_focus_left && self.file_sid.is_none() {
+                    self.reload_remote().await;
+                }
+            }
+            KeyCode::Char('g') => {
+                self.file_jump = Some(String::new());
+                self.notice = "跳转：输入路径后回车（Esc 取消）".into();
+            }
+            KeyCode::Char('s') => self.file_sort(),
+            KeyCode::Char('r') => {
+                if self.file_focus_left {
+                    self.files_left.reload_local();
+                    self.notice = "本地已刷新".into();
+                } else {
+                    self.reload_remote().await;
+                    self.notice = "远程已刷新".into();
+                }
+            }
+            KeyCode::Esc => self.leave_files(),
+            _ => {}
+        }
+        Ok(())
+    }
+
     async fn on_action(&mut self, action: Action) -> anyhow::Result<()> {
+        // 翻页/清屏这些是终端动作：文件视图下先退回去，别打在看不见的地方
+        if self.view == View::Files
+            && matches!(
+                action,
+                Action::ScrollUp
+                    | Action::ScrollDown
+                    | Action::ScrollTop
+                    | Action::ScrollBottom
+                    | Action::ClearScreen
+            )
+        {
+            self.leave_files();
+        }
         match action {
             Action::Quit => self.should_quit = true,
             Action::NewTab => {
@@ -417,13 +531,38 @@ impl App {
                 self.query = Some(String::new());
             }
             Action::CloseTab => self.close_active().await?,
-            Action::NextTab => self.cycle_tab(1),
-            Action::PrevTab => self.cycle_tab(-1),
+            Action::NextTab => {
+                self.cycle_tab(1);
+                self.tab_changed().await;
+            }
+            Action::PrevTab => {
+                self.cycle_tab(-1);
+                self.tab_changed().await;
+            }
             Action::ToggleFocus => {
-                self.focus = match self.focus {
-                    Focus::Tree => Focus::Terminal,
-                    Focus::Terminal => Focus::Tree,
+                let main = if self.view == View::Files {
+                    Focus::Files
+                } else {
+                    Focus::Terminal
                 };
+                self.focus = match self.focus {
+                    Focus::Tree => main,
+                    _ => Focus::Tree,
+                };
+            }
+            Action::ToggleFiles => {
+                if self.view == View::Files {
+                    self.leave_files();
+                } else {
+                    self.enter_files().await;
+                }
+            }
+            Action::FileRefresh => {
+                if self.file_focus_left {
+                    self.files_left.reload_local();
+                } else {
+                    self.reload_remote().await;
+                }
             }
             Action::HostSearch => self.query = Some(String::new()),
             Action::HostNew => self.form = Some(HostForm::new(None)),
@@ -459,7 +598,11 @@ impl App {
                     self.selection = None;
                     self.notice = "已退出选择模式".into();
                 } else {
+                    // 选择的是终端里的文字：文件视图下先退回去，否则选了个寂寞
                     let head = tab.screen.view_cursor().unwrap_or((0, 0));
+                    if self.view == View::Files {
+                        self.leave_files();
+                    }
                     self.selection = Some(Selection { anchor: head, head });
                     self.focus = Focus::Terminal;
                     self.notice = "选择模式：方向键移动，Enter/y 复制，Esc 取消".into();
@@ -518,7 +661,10 @@ impl App {
         let data = self.last_copy.clone();
         let _ = self
             .client
-            .call(methods::INPUT_SEND, json!({ "session": tab.id, "data": data }))
+            .call(
+                methods::INPUT_SEND,
+                json!({ "session": tab.id, "data": data }),
+            )
             .await;
         Ok(())
     }
@@ -533,6 +679,13 @@ impl App {
         let r = (sel.head.0 as isize + dr).clamp(0, max_r as isize) as usize;
         let c = (sel.head.1 as isize + dc).clamp(0, max_c as isize) as usize;
         sel.head = (r, c);
+    }
+
+    /// 当前标签页变了：文件视图的右栏要跟着换会话重新列目录
+    async fn tab_changed(&mut self) {
+        if self.view == View::Files {
+            self.reload_remote().await;
+        }
     }
 
     fn cycle_tab(&mut self, delta: isize) {
@@ -562,6 +715,8 @@ impl App {
             .call(methods::SESSION_CLOSE, json!({ "session": tab.id }))
             .await;
         self.notice = format!("已关闭 {}", tab.name);
+        // 文件视图的右栏可能正指着这个会话
+        self.tab_changed().await;
         Ok(())
     }
 
@@ -582,7 +737,13 @@ impl App {
     }
 
     fn on_ipc(&mut self, msg: ServerMsg) {
-        let ServerMsg::Event { event, session, data, .. } = msg else {
+        let ServerMsg::Event {
+            event,
+            session,
+            data,
+            ..
+        } = msg
+        else {
             return;
         };
 
@@ -624,7 +785,11 @@ impl App {
                 }
                 self.notice = format!(
                     "{}：{summary}",
-                    if approved { "已批准执行" } else { "已拒绝" }
+                    if approved {
+                        "已批准执行"
+                    } else {
+                        "已拒绝"
+                    }
                 );
                 return;
             }
@@ -657,11 +822,164 @@ impl App {
             }
             "closed" => {
                 tab.state = SessionState::Closed;
-                let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("已结束");
+                let reason = data
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("已结束");
                 tab.screen.push_notice(&format!("会话结束：{reason}"));
             }
             _ => {}
         }
+    }
+
+    // ---- 文件视图（FR-4.2）----
+
+    /// 左栏（本地）状态。测试与调试用
+    pub fn local_files(&self) -> &FilePane {
+        &self.files_left
+    }
+
+    /// 右栏（远程）状态。测试与调试用
+    pub fn remote_files(&self) -> &FilePane {
+        &self.files_right
+    }
+
+    /// 是否正处于双栏文件视图
+    pub fn in_file_view(&self) -> bool {
+        self.view == View::Files
+    }
+
+    /// 文件视图里把焦点切到另一栏（Tab 键走的就是它）
+    pub fn toggle_file_pane(&mut self) {
+        self.file_focus_left = !self.file_focus_left;
+    }
+
+    fn pane(&self) -> &FilePane {
+        if self.file_focus_left {
+            &self.files_left
+        } else {
+            &self.files_right
+        }
+    }
+
+    fn pane_mut(&mut self) -> &mut FilePane {
+        if self.file_focus_left {
+            &mut self.files_left
+        } else {
+            &mut self.files_right
+        }
+    }
+
+    pub async fn enter_files(&mut self) {
+        self.view = View::Files;
+        self.focus = Focus::Files;
+        self.notice =
+            "文件管理：Tab 切栏 · ↑↓ 选择 · Enter 进入 · Backspace 上级 · g 跳转 · s 排序".into();
+        self.reload_remote().await;
+    }
+
+    pub fn leave_files(&mut self) {
+        self.view = View::Terminal;
+        self.focus = Focus::Terminal;
+        self.notice.clear();
+    }
+
+    /// 右栏列目录：走 `file.list`，复用当前会话已建立的 SSH 连接
+    pub async fn reload_remote(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.files_right
+                .set_error("没有活动会话：先在左侧连一台主机");
+            return;
+        };
+        let sid = tab.id.clone();
+        let host = tab.name.clone();
+        // 换会话了：远端侧回到该会话的起始目录，别把上一台的 cwd 带过去
+        if self.file_sid.as_deref() != Some(sid.as_str()) {
+            self.files_right.goto(".");
+            self.file_sid = Some(sid.clone());
+        }
+        self.files_right.loading = true;
+        let path = self.files_right.cwd.clone();
+        match self
+            .client
+            .call(methods::FILE_LIST, json!({ "session": sid, "path": path }))
+            .await
+        {
+            Ok(v) => {
+                let entries: Vec<FileEntry> = v
+                    .get("entries")
+                    .cloned()
+                    .and_then(|x| serde_json::from_value(x).ok())
+                    .unwrap_or_default();
+                let resolved = v.get("path").and_then(|x| x.as_str()).map(str::to_string);
+                self.files_right.set_entries(entries, resolved);
+            }
+            Err(e) => self
+                .files_right
+                .set_error(format!("{host} 列目录失败：{e}")),
+        }
+    }
+
+    /// 文件视图下的路径跳转：本地按相对 cwd 解析，远程按 SFTP 语义交给服务端
+    pub async fn file_goto(&mut self, target: &str) {
+        if target.trim().is_empty() {
+            return;
+        }
+        if self.file_focus_left {
+            let joined = std::path::Path::new(&self.files_left.cwd).join(target);
+            self.files_left.goto(joined.to_string_lossy().to_string());
+            self.files_left.reload_local();
+            self.notice = format!("本地 → {}", self.files_left.cwd);
+        } else {
+            self.files_right.goto(target);
+            self.reload_remote().await;
+            self.notice = format!("远程 → {}", self.files_right.cwd);
+        }
+    }
+
+    /// 进入光标下的目录；不是目录就给个提示（打开与传输在 W4.3）
+    pub async fn file_enter(&mut self) {
+        let Some(cur) = self.pane().current().cloned() else {
+            return;
+        };
+        if !cur.is_dir {
+            self.notice = format!("{} 不是目录（文件操作在 W4.3）", cur.name);
+            return;
+        }
+        if self.file_focus_left {
+            self.files_left.goto(cur.path);
+            self.files_left.reload_local();
+        } else {
+            self.files_right.goto(cur.path);
+            self.reload_remote().await;
+        }
+    }
+
+    pub async fn file_up(&mut self) {
+        if self.file_focus_left {
+            if self.files_left.up() {
+                self.files_left.reload_local();
+            } else {
+                self.notice = "本地已在根目录".into();
+            }
+        } else if self.files_right.up() {
+            self.reload_remote().await;
+        } else {
+            self.notice = "远程已在根目录".into();
+        }
+    }
+
+    pub fn file_move(&mut self, delta: isize) {
+        let rows = self.term_size.1.saturating_sub(2) as usize;
+        let p = self.pane_mut();
+        p.move_sel(delta);
+        p.ensure_visible(rows.max(5));
+    }
+
+    pub fn file_sort(&mut self) {
+        let p = self.pane_mut();
+        p.cycle_sort();
+        self.notice = format!("排序：{}", p.sort.label());
     }
 
     // ---- 渲染 ----
@@ -678,7 +996,11 @@ impl App {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .split(f.area());
 
         self.draw_tabs(f, chunks[0]);
@@ -694,7 +1016,11 @@ impl App {
             chunks[1]
         };
 
-        self.draw_terminal(f, body);
+        if self.view == View::Files {
+            self.draw_files(f, body);
+        } else {
+            self.draw_terminal(f, body);
+        }
         self.draw_status(f, chunks[2]);
 
         // 搜索框浮在底部状态栏之上
@@ -724,7 +1050,9 @@ impl App {
                 Line::from("按 y 确认，其它键取消"),
             ];
             f.render_widget(
-                Paragraph::new(text).block(block).alignment(Alignment::Center),
+                Paragraph::new(text)
+                    .block(block)
+                    .alignment(Alignment::Center),
                 area,
             );
         }
@@ -779,6 +1107,115 @@ impl App {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
+    /// 双栏文件视图：左本地、右远程（FR-4.2）
+    fn draw_files(&self, f: &mut ratatui::Frame, area: Rect) {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        let host = self.tabs.get(self.active).map(|t| t.name.as_str());
+        self.draw_pane(f, cols[0], &self.files_left, self.file_focus_left, None);
+        self.draw_pane(f, cols[1], &self.files_right, !self.file_focus_left, host);
+
+        // 路径跳转输入框：浮在底部状态栏之上，样式与主机搜索一致
+        if let Some(j) = &self.file_jump {
+            let r = Rect {
+                x: area.x,
+                y: area.bottom().saturating_sub(1),
+                width: area.width,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(format!("跳转到: {j}")).style(
+                    Style::default()
+                        .fg(self.theme.status_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                r,
+            );
+        }
+    }
+
+    fn draw_pane(
+        &self,
+        f: &mut ratatui::Frame,
+        area: Rect,
+        pane: &FilePane,
+        focused: bool,
+        host: Option<&str>,
+    ) {
+        let border = if focused {
+            self.theme.accent
+        } else {
+            self.theme.border_dim
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(pane.title(host));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let width = inner.width as usize;
+        // 底部留一行给状态（条目数/排序/错误），条目区矮一行
+        let rows = inner.height.saturating_sub(1) as usize;
+        let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+
+        if pane.loading {
+            lines.push(Line::from(Span::styled(
+                "列目录…",
+                Style::default().fg(self.theme.warn),
+            )));
+        } else if pane.entries.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（空目录）",
+                Style::default().fg(self.theme.border),
+            )));
+        } else {
+            for (i, e) in pane.entries.iter().skip(pane.scroll).take(rows).enumerate() {
+                let idx = pane.scroll + i;
+                let text = entry_line(e, width);
+                let style = match (idx == pane.selected, focused) {
+                    (true, true) => Style::default()
+                        .fg(self.theme.status_fg)
+                        .bg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                    (true, false) => Style::default()
+                        .fg(self.theme.fg)
+                        .bg(self.theme.border_dim)
+                        .add_modifier(Modifier::BOLD),
+                    (false, _) => {
+                        if e.is_dir {
+                            Style::default().fg(self.theme.accent)
+                        } else if e.is_symlink {
+                            Style::default().fg(self.theme.ok)
+                        } else {
+                            Style::default().fg(self.theme.fg)
+                        }
+                    }
+                };
+                lines.push(Line::from(Span::styled(format!("{text:<width$}"), style)));
+            }
+        }
+        while lines.len() < rows {
+            lines.push(Line::raw(""));
+        }
+
+        // 底部状态：错误优先，否则给条目数与排序键
+        let tail = match &pane.status {
+            Some(s) => Span::styled(
+                crate::files::truncate_chars(s, width),
+                Style::default().fg(self.theme.err),
+            ),
+            None => Span::styled(
+                format!("{} 项 · 排序 {}", pane.entries.len(), pane.sort.label()),
+                Style::default().fg(self.theme.border),
+            ),
+        };
+        lines.push(Line::from(tail));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_tabs(&self, f: &mut ratatui::Frame, area: Rect) {
         let mut spans: Vec<Span> = Vec::new();
         let mut used = 0usize;
@@ -790,7 +1227,9 @@ impl App {
             }
             used += label.chars().count();
             let style = if i == self.active {
-                Style::default().fg(self.theme.status_fg).bg(self.theme.status_bg)
+                Style::default()
+                    .fg(self.theme.status_fg)
+                    .bg(self.theme.status_bg)
             } else {
                 Style::default().fg(self.theme.fg)
             };
@@ -799,7 +1238,9 @@ impl App {
         if self.tabs.is_empty() {
             spans.push(Span::styled(
                 " 无会话：在左侧选择主机回车连接，Ctrl+T 新建 ",
-                Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(self.theme.border)
+                    .add_modifier(Modifier::DIM),
             ));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -807,7 +1248,11 @@ impl App {
 
     fn draw_tree(&self, f: &mut ratatui::Frame, area: Rect) {
         let focused = self.focus == Focus::Tree;
-        let border = if focused { self.theme.accent } else { self.theme.border_dim };
+        let border = if focused {
+            self.theme.accent
+        } else {
+            self.theme.border_dim
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border))
@@ -820,7 +1265,11 @@ impl App {
         for (i, row) in rows.iter().enumerate().take(inner.height as usize) {
             let selected = i == self.tree.selected;
             let text = match row {
-                Row::Group { path, count, expanded } => {
+                Row::Group {
+                    path,
+                    count,
+                    expanded,
+                } => {
                     format!("{} {path} ({count})", if *expanded { "▾" } else { "▸" })
                 }
                 Row::Host(h) => {
@@ -842,7 +1291,10 @@ impl App {
             } else {
                 Style::default().fg(self.theme.fg)
             };
-            lines.push(Line::from(Span::styled(truncate(&text, inner.width as usize), style)));
+            lines.push(Line::from(Span::styled(
+                truncate(&text, inner.width as usize),
+                style,
+            )));
         }
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -858,7 +1310,9 @@ impl App {
             let hint = "左侧选择主机后回车连接 · Ctrl+T 新建 · Ctrl+B 切换焦点 · Ctrl+Q 退出";
             f.render_widget(
                 Paragraph::new(hint).style(
-                    Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
+                    Style::default()
+                        .fg(self.theme.border)
+                        .add_modifier(Modifier::DIM),
                 ),
                 area,
             );
@@ -886,13 +1340,13 @@ impl App {
         if let (Some((cy, cx)), true) = (
             tab.screen.view_cursor(),
             tab.state == SessionState::Ready && self.focus == Focus::Terminal,
-        )
-            && cy < rows {
-                let src = lines.get(cy).copied();
-                if let Some(line) = src {
-                    out[cy] = render_line_with_cursor(line, cols, cx, &self.theme);
-                }
+        ) && cy < rows
+        {
+            let src = lines.get(cy).copied();
+            if let Some(line) = src {
+                out[cy] = render_line_with_cursor(line, cols, cx, &self.theme);
             }
+        }
         f.render_widget(Paragraph::new(out), area);
     }
 
@@ -911,7 +1365,11 @@ impl App {
             }
             if tab.screen.is_scrolled() {
                 spans.push(Span::styled(
-                    format!(" 回看 {}/{} ", tab.screen.scroll_offset(), tab.screen.scrollback_len()),
+                    format!(
+                        " 回看 {}/{} ",
+                        tab.screen.scroll_offset(),
+                        tab.screen.scrollback_len()
+                    ),
                     Style::default().fg(self.theme.warn),
                 ));
             }
@@ -922,23 +1380,33 @@ impl App {
                 Style::default().fg(self.theme.warn),
             ));
         }
-        let right = "Ctrl+Q 退出 · Ctrl+T 新建 · Ctrl+W 关闭 · Ctrl+B 焦点";
+        let right = if self.view == View::Files {
+            "Tab 切栏 · ↑↓ 选择 · Enter 进入 · Backspace 上级 · g 跳转 · s 排序 · F5 刷新 · F9 回终端"
+        } else {
+            "Ctrl+Q 退出 · Ctrl+T 新建 · Ctrl+W 关闭 · Ctrl+B 焦点"
+        };
         let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let pad = area.width as usize - left_len - right.chars().count();
+        let pad = (area.width as usize).saturating_sub(left_len + right.chars().count());
         let mut all = spans;
         if pad > 1 {
             all.push(Span::raw(" ".repeat(pad)));
         }
         all.push(Span::styled(
             right,
-            Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(self.theme.border)
+                .add_modifier(Modifier::DIM),
         ));
         f.render_widget(Paragraph::new(Line::from(all)), area);
     }
 
     fn draw_form(&self, f: &mut ratatui::Frame, form: &HostForm) {
         let area = centered_rect(60, form.fields.len() as u16 + 5, f.area());
-        let title = if form.editing.is_some() { " 编辑主机 " } else { " 新建主机 " };
+        let title = if form.editing.is_some() {
+            " 编辑主机 "
+        } else {
+            " 新建主机 "
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(self.theme.accent))
@@ -951,7 +1419,9 @@ impl App {
             let focused = i == form.focus;
             let marker = if focused { "▸" } else { " " };
             let style = if focused {
-                Style::default().fg(self.theme.status_fg).bg(self.theme.accent)
+                Style::default()
+                    .fg(self.theme.status_fg)
+                    .bg(self.theme.accent)
             } else {
                 Style::default().fg(self.theme.fg)
             };

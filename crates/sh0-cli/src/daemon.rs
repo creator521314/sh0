@@ -20,7 +20,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use sh0_core::session::{SessionConfig, SessionEvent, SessionHandle, spawn_session};
 use sh0_core::sftp::{SftpClient, SftpError, SftpResult};
-use sh0_core::{RiskEngine, RiskLevel, SessionSnapshot, SessionState, TransportFactory, new_session_id};
+use sh0_core::{
+    RiskEngine, RiskLevel, SessionSnapshot, SessionState, TransportFactory, new_session_id,
+};
 use sh0_ipc::protocol::{DaemonInfo, ErrorBody, events, methods};
 use sh0_ipc::{EventHub, Handler, ServerMsg, serve};
 use sh0_ssh::session::RusshFactory;
@@ -117,10 +119,11 @@ impl DaemonState {
         cols: u16,
         rows: u16,
     ) -> std::result::Result<SessionHandle, ErrorBody> {
-        let host = self
-            .store
-            .find_host(selector)
-            .map_err(|e| ErrorBody { code: "host_not_found".into(), message: e.to_string(), data: None })?;
+        let host = self.store.find_host(selector).map_err(|e| ErrorBody {
+            code: "host_not_found".into(),
+            message: e.to_string(),
+            data: None,
+        })?;
 
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
         let cfg = self.session_config(cols, rows);
@@ -153,7 +156,10 @@ impl DaemonState {
             }
         });
 
-        self.sessions.lock().await.insert(id.clone(), handle.clone());
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), handle.clone());
         Ok(handle)
     }
 
@@ -272,6 +278,8 @@ impl DaemonState {
                         data: None,
                     })?
                 };
+                // 会话侧的错误只有"会话没了"与"能力不支持"两种，都归到
+                // 会话不可用：对调用方来说两条路一样——换条路或先连上。
                 let c = h.sftp().await.map_err(|e| ErrorBody {
                     code: "session_unavailable".into(),
                     message: e.to_string(),
@@ -286,7 +294,7 @@ impl DaemonState {
                     data: None,
                 })?;
                 let c = self.factory.open_sftp(&h).await.map_err(|e| ErrorBody {
-                    code: "session_unavailable".into(),
+                    code: sftp_transport_code(&e).into(),
                     message: e.to_string(),
                     data: None,
                 })?;
@@ -351,7 +359,14 @@ impl DaemonState {
             // 路径记在 command 列：审计只有一个"目标"列，单开一列反而难检索
             command: Some(detail.to_string()),
             risk: None,
-            decision: Some(if error.is_some() { "failed" } else { "executed" }.into()),
+            decision: Some(
+                if error.is_some() {
+                    "failed"
+                } else {
+                    "executed"
+                }
+                .into(),
+            ),
             exit_code: None,
             duration_ms: None,
             truncated: false,
@@ -440,11 +455,11 @@ impl DaemonState {
     ///
     /// 注意 `timeout` 走 Ok(data) 返回——AI 需要看到部分输出，
     /// 退出码由 `sh0-ai` 依据 data 内容映射（架构文档 §6.3）。
-    async fn exec_run(
-        &self,
-        params: &Value,
-    ) -> std::result::Result<ExecData, ErrorBody> {
-        let dry_run = params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    async fn exec_run(&self, params: &Value) -> std::result::Result<ExecData, ErrorBody> {
+        let dry_run = params
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let yes = params.get("yes").and_then(|v| v.as_bool()).unwrap_or(false);
         let token = params
             .get("confirm_token")
@@ -541,7 +556,8 @@ impl DaemonState {
                         }),
                     }
                 } else if yes {
-                    self.exec_after_risk(&req, &host.name, assessment.level, true).await
+                    self.exec_after_risk(&req, &host.name, assessment.level, true)
+                        .await
                 } else {
                     // 无人值守：签发令牌并广播给可能在场的 TUI（FR-7.4）
                     let t = format!("cf_{}", new_session_id());
@@ -916,7 +932,10 @@ impl DaemonState {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let approve = params.get("approve").and_then(|v| v.as_bool()).unwrap_or(true);
+        let approve = params
+            .get("approve")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let Some(pending) = self.confirms.take(&token) else {
             return Err(ErrorBody {
@@ -1004,16 +1023,36 @@ impl DaemonState {
             });
         };
         let filter = AuditFilter {
-            host: params.get("host").and_then(|v| v.as_str()).map(str::to_string),
-            session: params.get("session").and_then(|v| v.as_str()).map(str::to_string),
-            actor: params.get("actor").and_then(|v| v.as_str()).map(str::to_string),
-            risk: params.get("risk").and_then(|v| v.as_str()).map(str::to_string),
-            since: params.get("since").and_then(|v| v.as_str()).map(str::to_string),
-            limit: params.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize),
+            host: params
+                .get("host")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            session: params
+                .get("session")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            actor: params
+                .get("actor")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            risk: params
+                .get("risk")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            since: params
+                .get("since")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            limit: params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
         };
-        let records = db
-            .query(&filter)
-            .map_err(|e| ErrorBody { code: "internal".into(), message: e.to_string(), data: None })?;
+        let records = db.query(&filter).map_err(|e| ErrorBody {
+            code: "internal".into(),
+            message: e.to_string(),
+            data: None,
+        })?;
         Ok(json!({ "records": records, "count": records.len() }))
     }
 }
@@ -1075,7 +1114,8 @@ fn sftp_err(e: SftpError) -> ErrorBody {
         SftpError::PermissionDenied(_) => "permission_denied",
         SftpError::TooLarge(_) => "too_large",
         SftpError::Disconnected(_) => "session_unavailable",
-        SftpError::NotImplemented(_) => "invalid_args",
+        // "能力缺失"不是调用方用错参数：让 AI 知道重试也没用
+        SftpError::NotImplemented(_) => "not_implemented",
         _ => "internal",
     };
     ErrorBody {
@@ -1117,11 +1157,15 @@ impl Handler for DaemonState {
             }
 
             methods::SESSION_OPEN => {
-                let host = params.get("host").and_then(|v| v.as_str()).ok_or_else(|| ErrorBody {
-                    code: "invalid_args".into(),
-                    message: "缺少 host 参数".into(),
-                    data: None,
-                })?;
+                let host =
+                    params
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ErrorBody {
+                            code: "invalid_args".into(),
+                            message: "缺少 host 参数".into(),
+                            data: None,
+                        })?;
                 let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(120) as u16;
                 let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(32) as u16;
                 let handle = self.open(host, cols, rows).await?;
@@ -1132,7 +1176,10 @@ impl Handler for DaemonState {
                     .to_string();
                 self.audit(AuditRecord {
                     ts: now_rfc3339(),
-                    trace_id: params.get("trace_id").and_then(|v| v.as_str()).map(str::to_string),
+                    trace_id: params
+                        .get("trace_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     session_id: Some(handle.id.clone()),
                     host_name: Some(handle.host.name.clone()),
                     actor,
@@ -1147,15 +1194,20 @@ impl Handler for DaemonState {
                     stdout: None,
                     stderr: None,
                 });
-                Ok(json!({ "id": handle.id, "state": SessionState::Connecting.as_str(), "host": handle.host.name }))
+                Ok(
+                    json!({ "id": handle.id, "state": SessionState::Connecting.as_str(), "host": handle.host.name }),
+                )
             }
 
             methods::SESSION_CLOSE => {
-                let sid = params.get("session").and_then(|v| v.as_str()).ok_or_else(|| ErrorBody {
-                    code: "invalid_args".into(),
-                    message: "缺少 session 参数".into(),
-                    data: None,
-                })?;
+                let sid = params
+                    .get("session")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ErrorBody {
+                        code: "invalid_args".into(),
+                        message: "缺少 session 参数".into(),
+                        data: None,
+                    })?;
                 let data = self.close(sid).await?;
                 let actor = params
                     .get("actor")
@@ -1164,7 +1216,10 @@ impl Handler for DaemonState {
                     .to_string();
                 self.audit(AuditRecord {
                     ts: now_rfc3339(),
-                    trace_id: params.get("trace_id").and_then(|v| v.as_str()).map(str::to_string),
+                    trace_id: params
+                        .get("trace_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     session_id: Some(sid.to_string()),
                     host_name: None,
                     actor,
@@ -1208,9 +1263,11 @@ impl Handler for DaemonState {
                     message: format!("会话 {sid} 不存在"),
                     data: None,
                 })?;
-                h.reconnect()
-                    .await
-                    .map_err(|e| ErrorBody { code: "internal".into(), message: e.to_string(), data: None })?;
+                h.reconnect().await.map_err(|e| ErrorBody {
+                    code: "internal".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
                 Ok(json!({ "reconnecting": true }))
             }
 
@@ -1222,18 +1279,28 @@ impl Handler for DaemonState {
                     message: format!("会话 {sid} 不存在"),
                     data: None,
                 })?;
-                h.clear()
-                    .await
-                    .map_err(|e| ErrorBody { code: "internal".into(), message: e.to_string(), data: None })?;
+                h.clear().await.map_err(|e| ErrorBody {
+                    code: "internal".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
                 Ok(json!({ "cleared": true }))
             }
 
             methods::SCREEN_READ => {
                 let sid = params.get("session").and_then(|v| v.as_str()).unwrap_or("");
-                let with_scrollback =
-                    params.get("scrollback").and_then(|v| v.as_bool()).unwrap_or(true);
-                let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("plain");
-                let lines_limit = params.get("lines").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let with_scrollback = params
+                    .get("scrollback")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let mode = params
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("plain");
+                let lines_limit = params
+                    .get("lines")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
 
                 let sessions = self.sessions.lock().await;
                 let h = sessions.get(sid).ok_or_else(|| ErrorBody {
@@ -1281,9 +1348,11 @@ impl Handler for DaemonState {
                     })?;
                     (h.clone(), h.host.name.clone())
                 };
-                h.send(data.as_bytes())
-                    .await
-                    .map_err(|e| ErrorBody { code: "internal".into(), message: e.to_string(), data: None })?;
+                h.send(data.as_bytes()).await.map_err(|e| ErrorBody {
+                    code: "internal".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
                 let actor = params
                     .get("actor")
                     .and_then(|v| v.as_str())
@@ -1291,7 +1360,10 @@ impl Handler for DaemonState {
                     .to_string();
                 self.audit(AuditRecord {
                     ts: now_rfc3339(),
-                    trace_id: params.get("trace_id").and_then(|v| v.as_str()).map(str::to_string),
+                    trace_id: params
+                        .get("trace_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     session_id: Some(sid.to_string()),
                     host_name: Some(host_name),
                     actor,
@@ -1319,9 +1391,11 @@ impl Handler for DaemonState {
                     message: format!("会话 {sid} 不存在"),
                     data: None,
                 })?;
-                h.resize(cols, rows)
-                    .await
-                    .map_err(|e| ErrorBody { code: "internal".into(), message: e.to_string(), data: None })?;
+                h.resize(cols, rows).await.map_err(|e| ErrorBody {
+                    code: "internal".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
                 Ok(json!({ "cols": cols, "rows": rows }))
             }
 
@@ -1335,17 +1409,24 @@ impl Handler for DaemonState {
             methods::FILE_LIST => {
                 let path = file_path(&params)?;
                 let (sftp, host_name, sid) = self.sftp_for(&params).await?;
-                let r = sftp.list(&path).await;
+                // 先规范化：让返回的路径（以及条目里的 path）是绝对路径。
+                // 否则 UI 用 `.` 起步会得到 `./foo/./bar`，审计里也跟着糊掉。
+                // 规范化失败不该挡下列目录（比如权限不足），退回原路径。
+                let resolved = sftp
+                    .canonicalize(&path)
+                    .await
+                    .unwrap_or_else(|_| path.clone());
+                let r = sftp.list(&resolved).await;
                 let _ = sftp.close().await;
                 let entries = self.file_done(
                     &params,
                     "file.list",
-                    &path,
+                    &resolved,
                     &host_name,
                     sid.as_deref(),
                     r,
                 )?;
-                Ok(json!({ "path": path, "host": host_name, "entries": entries }))
+                Ok(json!({ "path": resolved, "host": host_name, "entries": entries }))
             }
 
             methods::FILE_STAT => {
@@ -1455,11 +1536,14 @@ impl Handler for DaemonState {
 
             methods::FILE_CHMOD => {
                 let path = file_path(&params)?;
-                let mode = params.get("mode").and_then(|v| v.as_u64()).ok_or_else(|| ErrorBody {
-                    code: "invalid_args".into(),
-                    message: "缺少 mode 参数".into(),
-                    data: None,
-                })? as u32;
+                let mode = params
+                    .get("mode")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| ErrorBody {
+                        code: "invalid_args".into(),
+                        message: "缺少 mode 参数".into(),
+                        data: None,
+                    })? as u32;
                 let (sftp, host_name, sid) = self.sftp_for(&params).await?;
                 let r = sftp.chmod(&path, mode).await;
                 let _ = sftp.close().await;
@@ -1483,6 +1567,17 @@ impl Handler for DaemonState {
                 data: None,
             }),
         }
+    }
+}
+
+/// 传输层错误 → IPC 错误码。
+///
+/// "服务端不支持 SFTP"与"连接断了"对 AI 的下一步完全不同：
+/// 前者重试一万次也没用，后者值得重连一次。
+fn sftp_transport_code(e: &sh0_core::transport::TransportError) -> &'static str {
+    match e {
+        sh0_core::transport::TransportError::NotImplemented(_) => "not_implemented",
+        _ => "session_unavailable",
     }
 }
 
@@ -1514,10 +1609,12 @@ pub fn seed_example_host(store: &Store) -> anyhow::Result<()> {
 /// M2 组件装配：风险引擎 + 审计库。run_foreground 与契约测试共用，
 /// 保证测试验的就是生产装配（而不是另起一套宽松配置）。
 fn assemble_m2(store: &Store, cfg: &AppConfig) -> (Arc<RiskEngine>, Option<Arc<AuditDb>>) {
-    let user_rules = store.load_risk_rules(&cfg.risk.rules_file).unwrap_or_else(|e| {
-        tracing::warn!("风险规则文件解析失败（{e}），本次使用内置规则");
-        Vec::new()
-    });
+    let user_rules = store
+        .load_risk_rules(&cfg.risk.rules_file)
+        .unwrap_or_else(|e| {
+            tracing::warn!("风险规则文件解析失败（{e}），本次使用内置规则");
+            Vec::new()
+        });
     let mut engine = RiskEngine::builtin().with_user_rules(&user_rules);
     engine.default_level = cfg.risk.unmatched;
     let audit = if cfg.audit.enabled {
@@ -1529,7 +1626,10 @@ fn assemble_m2(store: &Store, cfg: &AppConfig) -> (Arc<RiskEngine>, Option<Arc<A
         ) {
             Ok(db) => Some(Arc::new(db)),
             Err(e) => {
-                tracing::warn!("审计库打开失败（{}），AI 动作将不落库: {e}", store.paths().audit_db().display());
+                tracing::warn!(
+                    "审计库打开失败（{}），AI 动作将不落库: {e}",
+                    store.paths().audit_db().display()
+                );
                 None
             }
         }
@@ -1587,8 +1687,7 @@ pub async fn run_foreground(
     // 2) 风险引擎 + 3) 审计库
     let (engine, audit) = assemble_m2(&store, &cfg);
 
-    let (state, shutdown_rx) =
-        DaemonState::new(store, cfg, hub.clone(), factory, engine, audit);
+    let (state, shutdown_rx) = DaemonState::new(store, cfg, hub.clone(), factory, engine, audit);
 
     // 后台模式下进程没有控制台，注册 ctrl_c 会立即就绪、导致 daemon 启动即退出。
     // 因此只在手动前台运行时才监听 Ctrl+C；后台一律通过 shutdown 方法优雅停止。
