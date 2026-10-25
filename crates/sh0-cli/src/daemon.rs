@@ -2368,6 +2368,8 @@ pub fn seed_example_host(store: &Store) -> anyhow::Result<()> {
         tags: vec![],
         note: Some("示例条目：编辑 ~/.config/sh0/hosts.toml 改成你自己的主机".into()),
         risk_cap: None,
+        proxy_jump: None,
+        jump: None,
     });
     store.save_hosts(&hosts)?;
     tracing::info!("已生成示例主机条目 example");

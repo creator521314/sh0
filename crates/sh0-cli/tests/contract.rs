@@ -264,6 +264,8 @@ fn test_host() -> Host {
         tags: vec![],
         note: None,
         risk_cap: None,
+        proxy_jump: None,
+        jump: None,
     }
 }
 
@@ -307,6 +309,8 @@ fn host_named(name: &str, group: &[&str], tags: &[&str]) -> Host {
         tags: tags.iter().map(|s| s.to_string()).collect(),
         note: None,
         risk_cap: None,
+        proxy_jump: None,
+        jump: None,
     }
 }
 
@@ -1638,8 +1642,10 @@ async fn tui_mouse_shift_hands_back_to_terminal() {
     }
 
     // 配置关掉鼠标时，一切鼠标事件都不处理
-    let mut cfg = AppConfig::default();
-    cfg.mouse = false;
+    let cfg = AppConfig {
+        mouse: false,
+        ..AppConfig::default()
+    };
     let events2 = tokio::sync::mpsc::unbounded_channel().1;
     let mut off = sh0_tui::App::new(fx.client.clone(), events2, fx.store.clone(), cfg);
     off.set_tree_area(ratatui::layout::Rect::new(1, 2, 26, 8));
@@ -2058,8 +2064,10 @@ async fn tui_command_palette_filters_and_connects() {
 async fn tui_command_palette_switches_theme_and_persists() {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    let mut cfg = AppConfig::default();
-    cfg.theme = "dark".to_string();
+    let cfg = AppConfig {
+        theme: "dark".to_string(),
+        ..AppConfig::default()
+    };
     let fx = fixture_with_hosts_cfg(EchoShellFactory::default(), cfg, vec![]).await;
     let events = tokio::sync::mpsc::unbounded_channel().1;
     let mut app = sh0_tui::App::new(
@@ -2213,4 +2221,85 @@ async fn config_reload_notes_restart_only_keys() {
     let note = r["note"].as_str().unwrap();
     assert!(note.contains("keepalive_secs"), "提示应点名 keepalive_secs: {note}");
     assert!(note.contains("重启"), "提示应说明要重启: {note}");
+}
+
+// ---------------------------------------------------------------------------
+// M5 W5.6：ProxyJump 跳板机（FR-1.9）
+// ---------------------------------------------------------------------------
+
+/// 跳板可以是 hosts.toml 里的另一台主机，也可以内联 `user@host:port`
+#[tokio::test]
+async fn proxy_jump_resolves_from_hosts_and_inline() {
+    let mut target = host_named("target", &["prod"], &[]);
+    target.proxy_jump = Some("jump1".to_string());
+    let mut inline = host_named("inline", &["prod"], &[]);
+    inline.proxy_jump = Some("me@10.0.0.9:2222".to_string());
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("jump1", &["net"], &[]), target, inline],
+    )
+    .await;
+
+    // 1) 引用另一台主机
+    let h = fx.store.find_host("target").unwrap();
+    let jump = h.jump.as_ref().expect("应展开出跳板");
+    assert_eq!(jump.name, "jump1");
+    assert!(jump.jump.is_none(), "jump1 自己没有跳板");
+
+    // 2) 内联写法
+    let h2 = fx.store.find_host("inline").unwrap();
+    let j2 = h2.jump.as_ref().expect("内联跳板应能解析");
+    assert_eq!(j2.addr, "10.0.0.9");
+    assert_eq!(j2.port, 2222);
+    assert_eq!(j2.user, "me");
+
+    // 3) 没配跳板的主机不该凭空多出 jump
+    let plain = fx.store.find_host("jump1").unwrap();
+    assert!(plain.jump.is_none());
+
+    // 4) 跳板信息不落盘：hosts.toml 里只留 proxy_jump 这个名字
+    let raw = std::fs::read_to_string(fx.store.paths().hosts_file()).unwrap();
+    assert!(raw.contains("proxy_jump"), "配置里应保留 proxy_jump");
+    assert!(!raw.contains("jump:"), "解析出的跳板不该写回文件");
+}
+
+/// 链式跳板（A → B → C）要逐级展开
+#[tokio::test]
+async fn proxy_jump_chain_expands_recursively() {
+    let mut a = host_named("a", &[], &[]);
+    a.proxy_jump = Some("b".to_string());
+    let mut b = host_named("b", &[], &[]);
+    b.proxy_jump = Some("c".to_string());
+
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![a, b, host_named("c", &[], &[])]).await;
+
+    let ha = fx.store.find_host("a").unwrap();
+    let jb = ha.jump.as_ref().expect("a → b");
+    assert_eq!(jb.name, "b");
+    let jc = jb.jump.as_ref().expect("b → c");
+    assert_eq!(jc.name, "c");
+    assert!(jc.jump.is_none(), "c 是链尾");
+}
+
+/// 配置成环（A → B → A）不能把进程栈打爆
+#[tokio::test]
+async fn proxy_jump_cycle_does_not_recurse_forever() {
+    let mut a = host_named("a", &[], &[]);
+    a.proxy_jump = Some("b".to_string());
+    let mut b = host_named("b", &[], &[]);
+    b.proxy_jump = Some("a".to_string());
+
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![a, b]).await;
+
+    let ha = fx.store.find_host("a").unwrap();
+    // 展开到上限就停：不 panic、不死循环即可
+    let mut depth = 0;
+    let mut cur = ha.jump.as_deref();
+    while let Some(j) = cur {
+        depth += 1;
+        cur = j.jump.as_deref();
+        assert!(depth <= 8, "跳板链不该无限展开");
+    }
+    assert!(depth >= 1, "至少要展开出第一层");
 }

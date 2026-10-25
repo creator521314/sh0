@@ -206,6 +206,12 @@ impl HostForm {
                 FormField { label: "用户", value: host.map(|h| h.user.clone()).unwrap_or_default() },
                 FormField { label: "认证(agent/key/password/none)", value: auth.into() },
                 FormField { label: "私钥路径(key 时填)", value: key_path },
+                FormField {
+                    label: "跳板机(可空)",
+                    value: host
+                        .and_then(|h| h.proxy_jump.clone())
+                        .unwrap_or_default(),
+                },
             ],
             focus: 0,
         }
@@ -274,7 +280,13 @@ impl HostForm {
             auth,
             tags: vec![],
             note: None,
-        risk_cap: None,
+            risk_cap: None,
+            // 填了就当主机名或 user@host:port，留给连接前解析
+            proxy_jump: {
+                let j = self.fields[7].value.trim();
+                if j.is_empty() { None } else { Some(j.to_string()) }
+            },
+            jump: None,
         })
     }
 }

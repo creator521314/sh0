@@ -391,8 +391,16 @@ impl Store {
         Ok(())
     }
 
-    /// 按名称或 ID 精确匹配一台主机；返回 CoreError 便于上层复用语义
+    /// 按名称或 ID 精确匹配一台主机；返回 CoreError 便于上层复用语义。
+    /// 返回的主机**已展开跳板链**（`Host::jump`）。
     pub fn find_host(&self, selector: &str) -> std::result::Result<sh0_core::Host, sh0_core::CoreError> {
+        self.lookup_host(selector)
+            .map(|h| self.with_jump_chain(&h, 0))
+    }
+
+    /// 只查清单、不展开跳板。展开过程内部用它，否则 `find_host → with_jump_chain
+    /// → find_host` 会把 depth 每次归零，配置成环时直接爆栈。
+    fn lookup_host(&self, selector: &str) -> std::result::Result<sh0_core::Host, sh0_core::CoreError> {
         let hosts = self.load_hosts().map_err(|e| {
             sh0_core::CoreError::Credential(format!("failed to read hosts.toml: {e}"))
         })?;
@@ -411,6 +419,50 @@ impl Store {
             },
             None => Err(sh0_core::CoreError::HostNotFound(selector.to_string())),
         }
+    }
+
+    /// 把 `host.proxy_jump` 展开成完整的跳板 `Host` 挂在 `host.jump` 上。
+    ///
+    /// 跳板值有两种写法：hosts.toml 里另一台主机的名字，或内联的
+    /// `user@host:port`（user / port 可省）。跳板自己也可以有跳板，
+    /// 递归展开即可串成链；`depth` 用来兜住写错造成的循环引用。
+    pub fn with_jump_chain(&self, host: &sh0_core::Host, depth: usize) -> sh0_core::Host {
+        let Some(spec) = host.proxy_jump.as_deref() else {
+            let mut out = host.clone();
+            out.jump = None;
+            return out;
+        };
+        if depth >= MAX_JUMP_DEPTH {
+            tracing::warn!(
+                "{} 的跳板链超过 {} 层（可能配置成了环），就此打住",
+                host.name,
+                MAX_JUMP_DEPTH
+            );
+            let mut out = host.clone();
+            out.jump = None;
+            return out;
+        }
+        let mut out = host.clone();
+        match self.lookup_host(spec) {
+            Ok(jump) => {
+                // 跳板自己再展开一层
+                let jump = self.with_jump_chain(&jump, depth + 1);
+                out.jump = Some(Box::new(jump));
+            }
+            Err(_) => match parse_jump_spec(spec) {
+                Some(jump) => {
+                    let jump = self.with_jump_chain(&jump, depth + 1);
+                    out.jump = Some(Box::new(jump));
+                }
+                None => {
+                    // 既不是已知主机、也不是 user@host:port —— 交给连接层直连失败报错，
+                    // 这里不擅自改用户意图，只记一条警告
+                    tracing::warn!("{} 的跳板 `{spec}` 无法解析，本次直连", host.name);
+                    out.jump = None;
+                }
+            },
+        }
+        out
     }
 
     /// 批量选择主机（FR-5.2）：显式列表 / 分组前缀 / 标签，取并集去重。
@@ -469,7 +521,11 @@ impl Store {
                 sel
             )));
         }
-        Ok(out)
+        // 批量同样要展开跳板：每台机器都有自己的 proxy_jump
+        Ok(out
+            .into_iter()
+            .map(|h| self.with_jump_chain(&h, 0))
+            .collect())
     }
 
     /// 用户风险规则文件路径（FR-7.5）。`rules_file` 来自 `cfg.risk.rules_file`
@@ -518,4 +574,54 @@ fn parse_scalar(value: &str) -> serde_json::Value {
 
 fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// 跳板链最大层数：兜住 A→B→A 这种配置错误
+pub const MAX_JUMP_DEPTH: usize = 5;
+
+/// 解析内联跳板写法 `user@host:port`，user 与 port 可省。
+///
+/// 跳板一般走 agent / 默认私钥，所以这里固定 `CredentialRef::Agent`——
+/// 需要指定私钥时请把它写成 hosts.toml 里的一台正式主机。
+fn parse_jump_spec(spec: &str) -> Option<sh0_core::Host> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let (user, rest) = match spec.rsplit_once('@') {
+        Some((u, r)) if !u.is_empty() && !r.is_empty() => (u.to_string(), r.to_string()),
+        _ => (
+            std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "root".to_string()),
+            spec.to_string(),
+        ),
+    };
+    // 端口只在最后一段是数字时才切，避免把 IPv6 地址的冒号切坏
+    let (addr, port) = match rest.rsplit_once(':') {
+        Some((a, p)) if !a.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            match p.parse::<u16>() {
+                Ok(port) => (a.to_string(), port),
+                Err(_) => return None,
+            }
+        }
+        _ => (rest, 22),
+    };
+    if addr.is_empty() {
+        return None;
+    }
+    Some(sh0_core::Host {
+        id: sh0_core::new_host_id(),
+        name: format!("jump:{addr}"),
+        group: vec![],
+        addr,
+        port,
+        user,
+        auth: sh0_core::CredentialRef::Agent,
+        tags: vec![],
+        note: Some("由 proxy_jump 内联生成的跳板".to_string()),
+        risk_cap: None,
+        proxy_jump: None,
+        jump: None,
+    })
 }

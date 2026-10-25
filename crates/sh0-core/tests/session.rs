@@ -24,6 +24,8 @@ fn host() -> Host {
         tags: vec![],
         note: None,
         risk_cap: None,
+        proxy_jump: None,
+        jump: None,
     }
 }
 

@@ -80,6 +80,19 @@ pub struct Host {
     /// 危险命令会被压到 confirm 档——引擎仍可能给出更高档，由 daemon 取较小值。
     #[serde(default)]
     pub risk_cap: Option<RiskLevel>,
+    /// 跳板机（ProxyJump，需求 FR-1.9）。
+    ///
+    /// 值可以是 hosts.toml 里的另一台主机名，也可以内联 `user@host:port`
+    /// （user 与 port 可省）。跳板自己也可以有跳板，从而串成链。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
+    /// 已解析好的跳板机（运行时用，不落盘）。
+    ///
+    /// `proxy_jump` 只是用户写的一个名字；真正建连前要把它换成完整的
+    /// 主机信息（地址、端口、用户、凭据），逐级展开后放在这里。
+    /// `skip` 是必须的——否则跳板信息会被重复写进 hosts.toml。
+    #[serde(skip)]
+    pub jump: Option<Box<Host>>,
 }
 
 fn default_port() -> u16 {

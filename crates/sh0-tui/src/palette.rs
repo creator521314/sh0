@@ -131,7 +131,7 @@ pub fn filter<'a>(all: &'a [PaletteItem], query: &str) -> Vec<&'a PaletteItem> {
             scored.push((s, it));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
     scored.into_iter().map(|(_, it)| it).collect()
 }
 

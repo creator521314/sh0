@@ -5,6 +5,7 @@
 //! mock（NFR-9 / NFR-10）。
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,12 +111,14 @@ impl SshConnection {
         });
 
         let handler = ClientHandler {
-            known_hosts: opts.known_hosts,
+            known_hosts: opts.known_hosts.clone(),
             host: host.addr.clone(),
             port: host.port,
         };
 
-        let mut handle = client::connect(config, (host.addr.as_str(), host.port), handler)
+        // 先取流再挪走 opts：known_hosts 要交给 handler
+        let stream = open_stream(host, &opts).await?;
+        let mut handle = client::connect_stream(config, stream, handler)
             .await
             .map_err(SshError::Connect)?;
 
@@ -271,6 +274,83 @@ impl ShellHandle {
     pub async fn eof(&self) -> Result<()> {
         self.channel.eof().await.map_err(SshError::Connect)
     }
+}
+
+/// 到目标的字节流：直连 TCP，或走跳板机上的 direct-tcpip 通道（FR-1.9）
+enum ConnStream {
+    Tcp(tokio::net::TcpStream),
+    /// 盒装 + 钉住：russh 的 ChannelStream 不保证 Unpin，而 connect_stream 要求
+    Jump(Pin<Box<russh::ChannelStream<russh::client::Msg>>>),
+}
+
+impl tokio::io::AsyncRead for ConnStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(t) => Pin::new(t).poll_read(cx, buf),
+            Self::Jump(c) => Pin::new(c).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ConnStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(t) => Pin::new(t).poll_write(cx, buf),
+            Self::Jump(c) => Pin::new(c).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(t) => Pin::new(t).poll_flush(cx),
+            Self::Jump(c) => Pin::new(c).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(t) => Pin::new(t).poll_shutdown(cx),
+            Self::Jump(c) => Pin::new(c).poll_shutdown(cx),
+        }
+    }
+}
+
+/// 打通到目标的字节流：直连 TCP，或经跳板机的 direct-tcpip 通道（FR-1.9）。
+///
+/// 跳板本身也是一台 `Host`，它可能还有自己的跳板——所以这里递归，
+/// 多级跳板自然串成链。跳板信息由 daemon 在会话创建前解析好（见 `Host::jump`）。
+async fn open_stream(host: &Host, opts: &ConnectOptions) -> Result<ConnStream> {
+    let Some(jump) = host.jump.as_deref() else {
+        let tcp = tokio::net::TcpStream::connect((host.addr.as_str(), host.port)).await?;
+        return Ok(ConnStream::Tcp(tcp));
+    };
+
+    tracing::info!(
+        "经跳板 {} 连接 {}（ProxyJump）",
+        jump.endpoint(),
+        host.endpoint()
+    );
+    let jump_conn = Box::pin(SshConnection::connect(jump, opts.clone())).await?;
+    let channel = jump_conn
+        .handle
+        .channel_open_direct_tcpip(host.addr.clone(), host.port as u32, "127.0.0.1", 0)
+        .await
+        .map_err(SshError::Connect)?;
+    Ok(ConnStream::Jump(Box::pin(channel.into_stream())))
 }
 
 async fn authenticate(
