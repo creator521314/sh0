@@ -1504,6 +1504,75 @@ impl Handler for DaemonState {
                 Ok(json!({ "path": path, "host": host_name, "bytes": n, "encoding": encoding }))
             }
 
+            // 分块读：传输队列按块拉，UI 才有字节级进度可显示。
+            // 审计只在第一块落一条——每块都记会把审计表刷爆，
+            // 而"谁读了哪个文件"这件事第一块就已经说清楚了。
+            methods::FILE_READ_RANGE => {
+                let path = file_path(&params)?;
+                let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                let len = params.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let r = sftp.read_range(&path, offset, len).await;
+                let _ = sftp.close().await;
+                let bytes = if offset == 0 {
+                    self.file_done(&params, "file.read", &path, &host_name, sid.as_deref(), r)?
+                } else {
+                    r.map_err(sftp_err)?
+                };
+                let size = bytes.len();
+                // 与 file.read 一致：文本给内容，二进制给 base64
+                Ok(match String::from_utf8(bytes) {
+                    Ok(s) => json!({
+                        "path": path, "host": host_name, "size": size,
+                        "encoding": "utf8", "content": s,
+                    }),
+                    Err(e) => json!({
+                        "path": path, "host": host_name, "size": size,
+                        "encoding": "base64",
+                        "content": base64_encode(&e.into_bytes()),
+                    }),
+                })
+            }
+
+            methods::FILE_WRITE_AT => {
+                let path = file_path(&params)?;
+                let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                let encoding = params
+                    .get("encoding")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("utf8");
+                let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let bytes = match encoding {
+                    "utf8" => data.as_bytes().to_vec(),
+                    "base64" => base64_decode(data).map_err(|e| ErrorBody {
+                        code: "invalid_args".into(),
+                        message: format!("data 不是合法 base64：{e}"),
+                        data: None,
+                    })?,
+                    other => {
+                        return Err(ErrorBody {
+                            code: "invalid_args".into(),
+                            message: format!("未知 encoding `{other}`，可选 utf8 / base64"),
+                            data: None,
+                        })
+                    }
+                };
+                let (sftp, host_name, sid) = self.sftp_for(&params).await?;
+                let n = bytes.len();
+                let r = sftp.write_at(&path, offset, &bytes).await;
+                let _ = sftp.close().await;
+                if offset == 0 {
+                    // 首块：记"要写这个文件"；后续块不再重复记
+                    self.file_done(&params, "file.write", &path, &host_name, sid.as_deref(), r)?;
+                } else {
+                    r.map_err(sftp_err)?;
+                }
+                Ok(json!({
+                    "path": path, "host": host_name, "bytes": n,
+                    "offset": offset, "encoding": encoding,
+                }))
+            }
+
             methods::FILE_MKDIR => {
                 let path = file_path(&params)?;
                 let (sftp, host_name, sid) = self.sftp_for(&params).await?;

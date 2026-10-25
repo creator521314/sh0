@@ -147,6 +147,9 @@ pub mod methods {
     pub const FILE_REMOVE: &str = "file.remove";
     pub const FILE_RENAME: &str = "file.rename";
     pub const FILE_CHMOD: &str = "file.chmod";
+    /// 分块读写：给传输队列的进度与断点续传用
+    pub const FILE_READ_RANGE: &str = "file.read_range";
+    pub const FILE_WRITE_AT: &str = "file.write_at";
 }
 
 /// 事件名常量

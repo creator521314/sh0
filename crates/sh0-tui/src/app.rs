@@ -33,8 +33,10 @@ use sh0_term::keymap::Action;
 
 const TREE_WIDTH: u16 = 28;
 const FRAME_MS: u64 = 16;
-/// 单次传输的字节上限（8 MB）：UI 同步等 IPC，再大就该走 W4.4 的传输队列
-const TRANSFER_LIMIT: usize = 8 * 1024 * 1024;
+/// 传输分块大小：每帧一块，256 KB 在"进度够细"和"往返次数"之间取平衡
+const CHUNK_SIZE: usize = 256 * 1024;
+/// 单块失败后的最大重试次数（FR-4.4）
+const MAX_RETRIES: u32 = 3;
 
 /// 一个标签页 = 一个远端会话 + 本地一份 Screen
 pub struct Tab {
@@ -72,6 +74,52 @@ pub enum FilePrompt {
     Rename(String),
     /// 改权限，携带目标完整路径
     Chmod(String),
+}
+
+/// 一个传输任务的状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferState {
+    /// 排队中
+    Pending,
+    /// 正在传
+    Active,
+    Done,
+    /// 重试次数用尽
+    Failed,
+}
+
+/// 传输队列里的一项（FR-4.4）
+#[derive(Debug, Clone)]
+pub struct Transfer {
+    pub name: String,
+    /// 源路径
+    pub src: String,
+    /// 目标路径
+    pub dst: String,
+    /// true = 上传（本地 → 远端）
+    pub upload: bool,
+    pub size: u64,
+    pub done: u64,
+    pub state: TransferState,
+    pub retries: u32,
+    /// 平均速度（字节/秒）
+    pub speed: u64,
+    pub error: Option<String>,
+    started: Option<std::time::Instant>,
+}
+
+impl Transfer {
+    /// 进度 0.0~1.0；未知大小（0）时按未完成处理
+    pub fn progress(&self) -> f64 {
+        if self.size == 0 {
+            return if self.state == TransferState::Done { 1.0 } else { 0.0 };
+        }
+        (self.done as f64 / self.size as f64).clamp(0.0, 1.0)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self.state, TransferState::Done | TransferState::Failed)
+    }
 }
 
 impl FilePrompt {
@@ -174,6 +222,12 @@ pub struct App {
     file_delete: Option<(bool, String, bool)>,
     /// 右栏当前绑定到的会话（换标签页要重新列目录）
     file_sid: Option<String>,
+    /// 左栏被标记的文件路径
+    marks_left: std::collections::HashSet<String>,
+    /// 右栏被标记的文件路径
+    marks_right: std::collections::HashSet<String>,
+    /// 传输队列（FR-4.4）
+    transfers: Vec<Transfer>,
 }
 
 impl App {
@@ -222,6 +276,9 @@ impl App {
             file_prompt: None,
             file_delete: None,
             file_sid: None,
+            marks_left: std::collections::HashSet::new(),
+            marks_right: std::collections::HashSet::new(),
+            transfers: Vec::new(),
         }
     }
 
@@ -554,6 +611,9 @@ impl App {
             }
             KeyCode::Char('s') => self.file_sort(),
             KeyCode::Char('r') => self.file_refresh().await,
+            KeyCode::Char(' ') => self.toggle_mark(),
+            KeyCode::Char('R') => self.retry_failed(),
+            KeyCode::Char('c') => self.clear_finished(),
             KeyCode::Char('p') => {
                 match self.pane().current_path() {
                     Some(p) => {
@@ -1236,97 +1296,272 @@ impl App {
         }
     }
 
-    /// 把焦点栏的选中文件传到对面栏的当前目录。
+    /// 把焦点栏的**选中项或全部标记项**排进传输队列。
     ///
-    /// 单次传输上限 [`TRANSFER_LIMIT`]：这里同步等 IPC 返回，几十兆的文件会把
-    /// 界面卡死——那种量级该交给 W4.4 的传输队列（带进度、失败重试与续传）。
+    /// 真正的数据搬运在 [`App::tick_transfers`] 里按块推进：UI 每帧只做一块，
+    /// 于是不管多大的文件，界面都不会卡住，进度条也真的会动。
     pub async fn file_transfer(&mut self) {
         if self.view != View::Files {
             return;
         }
-        let Some(cur) = self.pane().current().cloned() else {
-            self.notice = "没有选中项".into();
-            return;
-        };
-        if cur.is_dir {
-            self.notice = "目录要递归传，留到 W4.4 的传输队列".into();
-            return;
-        }
-        let name = cur.name.clone();
-        let Some(sid) = self.active_session() else {
+        let upload = self.file_focus_left;
+        let sid = self.active_session().unwrap_or_default();
+        if sid.is_empty() {
             self.notice = "没有活动会话".into();
             return;
-        };
-        if self.file_focus_left {
-            // 上传：本地读 → 远端写
-            let Ok(bytes) = std::fs::read(&cur.path) else {
-                self.notice = format!("读本地文件失败：{}", cur.path);
-                return;
-            };
-            if bytes.len() > TRANSFER_LIMIT {
-                self.notice = format!(
-                    "{} 有 {} 字节，超过单次上限 {TRANSFER_LIMIT}（大文件等 W4.4 的队列）",
-                    name,
-                    bytes.len()
-                );
-                return;
-            }
-            let target = join_posix(&self.files_right.cwd, &name);
-            // 文本直接传，二进制走 base64：JSON 里塞不下裸字节
-            let (encoding, data) = match std::str::from_utf8(&bytes) {
-                Ok(s) => ("utf8", s.to_string()),
-                Err(_) => ("base64", base64_encode(&bytes)),
-            };
-            match self
-                .client
-                .call(
-                    methods::FILE_WRITE,
-                    json!({ "session": sid, "path": target, "data": data, "encoding": encoding }),
-                )
-                .await
-            {
-                Ok(_) => {
-                    self.notice = format!("已上传 {name}（{} 字节）", bytes.len());
-                    self.reload_remote().await;
-                }
-                Err(e) => self.notice = format!("上传失败：{e}"),
-            }
+        }
+        let dst_dir = if upload {
+            self.files_right.cwd.clone()
         } else {
-            // 下载：远端读 → 本地写
-            match self
-                .client
-                .call(
-                    methods::FILE_READ,
-                    json!({ "session": sid, "path": cur.path, "max_bytes": TRANSFER_LIMIT }),
-                )
-                .await
-            {
-                Ok(v) => {
-                    let enc = v.get("encoding").and_then(|x| x.as_str()).unwrap_or("utf8");
-                    let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
-                    let bytes = if enc == "base64" {
-                        match base64_decode(content) {
-                            Some(b) => b,
-                            None => {
-                                self.notice = "下载的内容无法解码".into();
-                                return;
-                            }
-                        }
+            self.files_left.cwd.clone()
+        };
+        let marks = if upload { &self.marks_left } else { &self.marks_right };
+        let picked: Vec<FileEntry> = if marks.is_empty() {
+            self.pane().current().cloned().into_iter().collect()
+        } else {
+            self.pane()
+                .entries
+                .iter()
+                .filter(|e| marks.contains(&e.path))
+                .cloned()
+                .collect()
+        };
+        if picked.is_empty() {
+            self.notice = "没有选中项".into();
+            return;
+        }
+        let mut queued = 0usize;
+        let mut skipped_dirs = 0usize;
+        for e in picked {
+            if e.is_dir {
+                skipped_dirs += 1;
+                continue;
+            }
+            let dst = if upload {
+                join_posix(&dst_dir, &e.name)
+            } else {
+                std::path::Path::new(&dst_dir)
+                    .join(&e.name)
+                    .to_string_lossy()
+                    .to_string()
+            };
+            self.transfers.push(Transfer {
+                name: e.name.clone(),
+                src: e.path.clone(),
+                dst,
+                upload,
+                size: e.size,
+                done: 0,
+                state: TransferState::Pending,
+                retries: 0,
+                speed: 0,
+                error: None,
+                started: None,
+            });
+            queued += 1;
+        }
+        // 传完就清空标记：不然下次 F5 会把这批再传一遍
+        if upload {
+            self.marks_left.clear();
+        } else {
+            self.marks_right.clear();
+        }
+        self.notice = match (queued, skipped_dirs) {
+            (0, _) => "没有可传的文件".into(),
+            (n, 0) => format!("已排队 {n} 个文件"),
+            (n, d) => format!("已排队 {n} 个文件（跳过 {d} 个目录，递归传输待 W4.5）"),
+        };
+    }
+
+    /// 队列里还有活儿吗（测试驱动用）
+    pub fn has_pending_transfer(&self) -> bool {
+        self.transfers
+            .iter()
+            .any(|t| matches!(t.state, TransferState::Pending | TransferState::Active))
+    }
+
+    /// 推进传输队列**一块**。事件循环每帧调一次：
+    /// 每帧只做 [`CHUNK_SIZE`] 字节，UI 因此始终有响应。
+    pub async fn tick_transfers(&mut self) {
+        // 串行执行：同一时刻只推一个任务，避免并发刷爆连接与审计
+        let Some(idx) = self
+            .transfers
+            .iter()
+            .position(|t| matches!(t.state, TransferState::Active | TransferState::Pending))
+        else {
+            return;
+        };
+        let t = &mut self.transfers[idx];
+        if t.state == TransferState::Pending {
+            t.state = TransferState::Active;
+            t.started = Some(std::time::Instant::now());
+        }
+        let offset = t.done;
+        let (name, src, dst, upload) = (t.name.clone(), t.src.clone(), t.dst.clone(), t.upload);
+
+        let result = if upload {
+            self.upload_chunk(&src, &dst, offset).await
+        } else {
+            self.download_chunk(&src, &dst, offset).await
+        };
+
+        let t = &mut self.transfers[idx];
+        match result {
+            Ok(n) => {
+                t.done += n as u64;
+                if let Some(started) = t.started {
+                    let secs = started.elapsed().as_secs_f64().max(0.001);
+                    t.speed = (t.done as f64 / secs) as u64;
+                }
+                if n < CHUNK_SIZE || (t.size > 0 && t.done >= t.size) {
+                    t.state = TransferState::Done;
+                    t.error = None;
+                    // 目标栏要看到新文件
+                    if upload {
+                        self.reload_remote().await;
                     } else {
-                        content.as_bytes().to_vec()
-                    };
-                    let target = std::path::Path::new(&self.files_left.cwd).join(&name);
-                    match std::fs::write(&target, &bytes) {
-                        Ok(_) => {
-                            self.notice = format!("已下载 {name}（{} 字节）", bytes.len());
-                            self.files_left.reload_local();
-                        }
-                        Err(e) => self.notice = format!("写本地文件失败：{e}"),
+                        self.files_left.reload_local();
                     }
                 }
-                Err(e) => self.notice = format!("下载失败：{e}"),
+            }
+            Err(e) => {
+                t.retries += 1;
+                t.error = Some(e);
+                if t.retries >= MAX_RETRIES {
+                    t.state = TransferState::Failed;
+                } else {
+                    // 留在队列里，下一帧（或下一次 tick）重试
+                    t.state = TransferState::Pending;
+                    t.done = offset; // 从当前偏移继续，不回退
+                }
             }
         }
+        let _ = name;
+    }
+
+    /// 上传一块：本地读 → `file.write_at`
+    async fn upload_chunk(
+        &self,
+        src: &str,
+        dst: &str,
+        offset: u64,
+    ) -> std::result::Result<usize, String> {
+        use std::io::{Read, Seek};
+        let mut f = std::fs::File::open(src).map_err(|e| format!("打开本地文件失败：{e}"))?;
+        f.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|e| format!("定位失败：{e}"))?;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let n = f.read(&mut buf).map_err(|e| format!("读本地文件失败：{e}"))?;
+        if n == 0 {
+            return Ok(0);
+        }
+        buf.truncate(n);
+        let sid = self.active_session().unwrap_or_default();
+        let (encoding, data) = match std::str::from_utf8(&buf) {
+            Ok(s) => ("utf8", s.to_string()),
+            Err(_) => ("base64", base64_encode(&buf)),
+        };
+        self.client
+            .call(
+                methods::FILE_WRITE_AT,
+                json!({
+                    "session": sid, "path": dst, "offset": offset,
+                    "data": data, "encoding": encoding,
+                }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
+    /// 下载一块：`file.read_range` → 本地追加写
+    async fn download_chunk(
+        &self,
+        src: &str,
+        dst: &str,
+        offset: u64,
+    ) -> std::result::Result<usize, String> {
+        let sid = self.active_session().unwrap_or_default();
+        let v = self
+            .client
+            .call(
+                methods::FILE_READ_RANGE,
+                json!({ "session": sid, "path": src, "offset": offset, "len": CHUNK_SIZE }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let enc = v.get("encoding").and_then(|x| x.as_str()).unwrap_or("utf8");
+        let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+        let bytes = if enc == "base64" {
+            base64_decode(content).ok_or_else(|| "下载的内容无法解码".to_string())?
+        } else {
+            content.as_bytes().to_vec()
+        };
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        // 首块覆盖写，之后追加
+        if offset == 0 {
+            std::fs::write(dst, &bytes).map_err(|e| format!("写本地文件失败：{e}"))?;
+        } else {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dst)
+                .map_err(|e| format!("打开本地文件失败：{e}"))?;
+            f.write_all(&bytes).map_err(|e| format!("写本地文件失败：{e}"))?;
+        }
+        Ok(bytes.len())
+    }
+
+    /// 把失败的项重新排队（键 `R`）
+    pub fn retry_failed(&mut self) {
+        let mut n = 0;
+        for t in &mut self.transfers {
+            if t.state == TransferState::Failed {
+                t.state = TransferState::Pending;
+                t.retries = 0;
+                t.error = None;
+                n += 1;
+            }
+        }
+        self.notice = if n == 0 { "没有失败的传输".into() } else { format!("已重新排队 {n} 项") };
+    }
+
+    /// 清掉已完成的项（键 `c`）
+    pub fn clear_finished(&mut self) {
+        let before = self.transfers.len();
+        self.transfers.retain(|t| !t.is_finished());
+        self.notice = format!("已清理 {} 项", before - self.transfers.len());
+    }
+
+    /// 标记/取消标记当前项（键 `Space`）
+    pub fn toggle_mark(&mut self) {
+        let Some(e) = self.pane().current().cloned() else {
+            return;
+        };
+        let marks = if self.file_focus_left {
+            &mut self.marks_left
+        } else {
+            &mut self.marks_right
+        };
+        if !marks.insert(e.path.clone()) {
+            marks.remove(&e.path);
+        }
+        let n = marks.len();
+        self.notice = format!("已标记 {n} 项（F5 传走）");
+    }
+
+    pub fn marks(&self, left: bool) -> &std::collections::HashSet<String> {
+        if left {
+            &self.marks_left
+        } else {
+            &self.marks_right
+        }
+    }
+
+    pub fn transfers(&self) -> &[Transfer] {
+        &self.transfers
     }
 
     fn active_session(&self) -> Option<String> {
@@ -1458,15 +1693,35 @@ impl App {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    /// 双栏文件视图：左本地、右远程（FR-4.2）
+    /// 双栏文件视图：左本地、右远程（FR-4.2）+ 底部传输队列（FR-4.4）
     fn draw_files(&self, f: &mut ratatui::Frame, area: Rect) {
+        // 队列有任务时才占地方，最多 5 行；平时把空间全留给文件列表
+        let queue_rows = if self.transfers.is_empty() {
+            0
+        } else {
+            (self.transfers.len() as u16 + 1).min(6)
+        };
+        let (files_area, queue_area) = if queue_rows == 0 {
+            (area, None)
+        } else {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(queue_rows)])
+                .split(area);
+            (rows[0], Some(rows[1]))
+        };
+
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
+            .split(files_area);
         let host = self.tabs.get(self.active).map(|t| t.name.as_str());
         self.draw_pane(f, cols[0], &self.files_left, self.file_focus_left, None);
         self.draw_pane(f, cols[1], &self.files_right, !self.file_focus_left, host);
+
+        if let Some(qa) = queue_area {
+            self.draw_queue(f, qa);
+        }
 
         // 路径跳转输入框：浮在底部状态栏之上，样式与主机搜索一致
         if let Some((kind, j)) = &self.file_prompt {
@@ -1525,7 +1780,14 @@ impl App {
         } else {
             for (i, e) in pane.entries.iter().skip(pane.scroll).take(rows).enumerate() {
                 let idx = pane.scroll + i;
-                let text = entry_line(e, width);
+                let marked = self
+                    .marks(self.file_focus_left == (pane.side == crate::files::Side::Local))
+                    .contains(&e.path);
+                let text = if marked {
+                    format!("*{}", entry_line(e, width.saturating_sub(1)))
+                } else {
+                    entry_line(e, width)
+                };
                 let style = match (idx == pane.selected, focused) {
                     (true, true) => Style::default()
                         .fg(self.theme.status_fg)
@@ -1564,6 +1826,62 @@ impl App {
             ),
         };
         lines.push(Line::from(tail));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// 传输队列面板（FR-4.4）：进度条 + 速度 + 失败原因
+    fn draw_queue(&self, f: &mut ratatui::Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.border))
+            .title(format!(" 传输队列 {} ", self.transfers.len()));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let width = inner.width as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        for t in self.transfers.iter().take(inner.height as usize) {
+            let (mark, color) = match t.state {
+                TransferState::Pending => ("…", self.theme.border),
+                TransferState::Active => ("↑", self.theme.accent),
+                TransferState::Done => ("✓", self.theme.ok),
+                TransferState::Failed => ("✗", self.theme.err),
+            };
+            let arrow = if t.upload { "→" } else { "←" };
+            let pct = (t.progress() * 100.0) as u32;
+            let bar = progress_bar(t.progress(), 12);
+            let size = sh0_core::sftp::human_size(t.size);
+            let speed = if t.state == TransferState::Active || t.state == TransferState::Done {
+                format!("{}/s", sh0_core::sftp::human_size(t.speed))
+            } else {
+                String::new()
+            };
+            let mut spans = vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::styled(
+                    crate::files::truncate_chars(&t.name, 20),
+                    Style::default().fg(self.theme.fg),
+                ),
+                Span::raw(format!(" {arrow} {bar} {pct:3}% {size} {speed}")),
+            ];
+            if let Some(e) = &t.error {
+                spans.push(Span::styled(
+                    format!("  {}", crate::files::truncate_chars(e, 24)),
+                    Style::default().fg(self.theme.err),
+                ));
+            }
+            if t.retries > 0 && t.state != TransferState::Failed {
+                spans.push(Span::styled(
+                    format!(" (重试 {})", t.retries),
+                    Style::default().fg(self.theme.warn),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        while lines.len() < inner.height as usize {
+            lines.push(Line::raw(""));
+        }
+        let _ = width;
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1732,7 +2050,7 @@ impl App {
             ));
         }
         let right = if self.view == View::Files {
-            "Tab 切栏 · ↑↓ 选择 · Enter 进入 · g 跳转 · F5 传文件 · F6 改名 · F7 建目录 · F8 删除 · p 权限 · F9 回终端"
+            "Tab 切栏 · ↑↓ 选择 · Space 标记 · F5 传走 · F6 改名 · F7 建目录 · F8 删除 · p 权限 · F9 回终端"
         } else {
             "Ctrl+Q 退出 · Ctrl+T 新建 · Ctrl+W 关闭 · Ctrl+B 焦点"
         };
@@ -1912,7 +2230,10 @@ async fn loop_inner(
             app.on_ipc(msg);
         }
 
-        // 3) 渲染
+        // 3) 推进传输队列（每帧一块，界面不卡）
+        app.tick_transfers().await;
+
+        // 4) 渲染
         terminal.draw(|f| app.draw(f))?;
 
         tokio::time::sleep(Duration::from_millis(FRAME_MS)).await;
@@ -1925,6 +2246,12 @@ pub fn is_hard_quit(key: KeyEvent) -> bool {
         (key.code, key.modifiers),
         (KeyCode::Char('q'), KeyModifiers::CONTROL) | (KeyCode::Char('c'), KeyModifiers::CONTROL)
     )
+}
+
+/// 文本进度条：`████░░░░░░`
+fn progress_bar(p: f64, width: usize) -> String {
+    let filled = ((p.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 /// POSIX 风格拼接（远端路径一律用 `/`）

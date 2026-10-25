@@ -4,10 +4,12 @@
 //! 以及把它的错误码翻译成 core 的 [`SftpError`]（错误码要能被 AI 语义化消费，
 //! "路径不存在"和"权限不足"对 AI 的下一步决策完全不同）。
 
+use std::io::SeekFrom;
+
 use async_trait::async_trait;
 use russh_sftp::client::SftpSession;
-use tokio::io::AsyncWriteExt;
-use russh_sftp::protocol::{FileAttributes, FileType, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use sh0_core::sftp::{FileEntry, SftpClient, SftpError, SftpResult};
 
 use crate::client::SshConnection;
@@ -75,6 +77,38 @@ impl SftpClient for RusshSftp {
         file.write_all(data).await.map_err(io_err)?;
         file.close().await.map_err(io_err)?;
         Ok(())
+    }
+
+    async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> SftpResult<()> {
+        // CREATE|WRITE 不带 TRUNCATE：续传时前面的块还在，不能覆盖掉
+        let mut file = self
+            .session
+            .open_with_flags(path, OpenFlags::CREATE | OpenFlags::WRITE)
+            .await
+            .map_err(map_err)?;
+        file.seek(SeekFrom::Start(offset)).await.map_err(io_err)?;
+        file.write_all(data).await.map_err(io_err)?;
+        file.flush().await.map_err(io_err)?;
+        file.close().await.map_err(io_err)?;
+        Ok(())
+    }
+
+    async fn read_range(&self, path: &str, offset: u64, len: usize) -> SftpResult<Vec<u8>> {
+        let mut file = self.session.open(path).await.map_err(map_err)?;
+        file.seek(SeekFrom::Start(offset)).await.map_err(io_err)?;
+        let mut buf = vec![0u8; len];
+        let mut read = 0usize;
+        // read_exact 到文件尾会报 UnexpectedEof，这里自己读满为止
+        while read < len {
+            let n = file.read(&mut buf[read..]).await.map_err(io_err)?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        buf.truncate(read);
+        file.close().await.map_err(io_err)?;
+        Ok(buf)
     }
 
     async fn mkdir(&self, path: &str) -> SftpResult<()> {

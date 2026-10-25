@@ -811,6 +811,17 @@ async fn fixture_sftp() -> (Fixture, MemFs) {
     (fx, fs)
 }
 
+/// 把传输队列跑到空：UI 里由事件循环每帧调一次 `tick_transfers`
+async fn drain_transfers(app: &mut sh0_tui::App) {
+    for _ in 0..500 {
+        if !app.has_pending_transfer() {
+            break;
+        }
+        app.tick_transfers().await;
+    }
+    assert!(!app.has_pending_transfer(), "传输队列没跑完");
+}
+
 /// 会话内列目录：复用已建连接（FR-4.1），且返回规范化绝对路径（FR-4.2 的 UI 依赖）
 #[tokio::test]
 async fn sftp_list_reuses_session_and_returns_canonical_path() {
@@ -1088,12 +1099,14 @@ async fn tui_file_ops_transfer_and_edit() {
     let i = app.local_files().entries.iter().position(|e| e.name == "up.txt").unwrap();
     app.local_files_mut().selected = i;
     app.file_transfer().await;
+    drain_transfers(&mut app).await;
     assert_eq!(fs.read("/tmp/up.txt").unwrap(), b"hello-sh0", "文本上传应原样到达");
 
     // 上传 bin.dat：非 UTF-8，必须走 base64 才能不失真
     let i = app.local_files().entries.iter().position(|e| e.name == "bin.dat").unwrap();
     app.local_files_mut().selected = i;
     app.file_transfer().await;
+    drain_transfers(&mut app).await;
     assert_eq!(fs.read("/tmp/bin.dat").unwrap(), bin, "二进制上传必须逐字节一致");
 
     // 下载 hello.txt 到本地目录
@@ -1101,6 +1114,7 @@ async fn tui_file_ops_transfer_and_edit() {
     let i = app.remote_files().entries.iter().position(|e| e.name == "hello.txt").unwrap();
     app.remote_files_mut().selected = i;
     app.file_transfer().await;
+    drain_transfers(&mut app).await;
     assert_eq!(std::fs::read(tmp.join("hello.txt")).unwrap(), b"hello");
 
     // 远端建目录 → 改名 → 删目录
@@ -1130,6 +1144,80 @@ async fn tui_file_ops_transfer_and_edit() {
     // 删文件（非目录）
     app.file_delete(false, "/tmp/up.txt", false).await;
     assert!(!fs.exists("/tmp/up.txt"));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// 标记多选 + 传输队列：多块传输、进度、失败重试（FR-4.4）
+#[tokio::test]
+async fn tui_transfer_queue_marks_chunks_and_retries() {
+    let (fx, fs) = fixture_sftp().await;
+
+    let tmp = std::env::temp_dir().join(format!("sh0-w44-{}", sh0_core::new_session_id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("a.txt"), "aaa").unwrap();
+    std::fs::write(tmp.join("b.txt"), "bbb").unwrap();
+    // 600 KB：超过 256 KB 的块大小，必须分多块才能传完
+    let big = vec![7u8; 600 * 1024];
+    std::fs::write(tmp.join("big.dat"), &big).unwrap();
+
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app =
+        sh0_tui::App::new(fx.client.clone(), events, fx.store.clone(), AppConfig::default());
+    app.open("mockbox").await.unwrap();
+    app.enter_files().await;
+    app.local_files_mut().goto(tmp.to_string_lossy().to_string());
+    app.local_files_mut().reload_local();
+
+    // Space 标记两个文件 → F5 应该把两个都排进队列
+    for name in ["a.txt", "b.txt"] {
+        let i = app.local_files().entries.iter().position(|e| e.name == name).unwrap();
+        app.local_files_mut().selected = i;
+        app.toggle_mark();
+    }
+    assert_eq!(app.marks(true).len(), 2, "标记应落在左栏");
+
+    app.file_transfer().await;
+    assert_eq!(app.transfers().len(), 2, "两个标记项都应入队");
+    assert_eq!(app.marks(true).len(), 0, "传完该清空标记，避免重复传");
+    drain_transfers(&mut app).await;
+
+    assert_eq!(fs.read("/tmp/a.txt").unwrap(), b"aaa");
+    assert_eq!(fs.read("/tmp/b.txt").unwrap(), b"bbb");
+    assert!(
+        app.transfers()
+            .iter()
+            .all(|t| t.state == sh0_tui::app::TransferState::Done),
+        "全部应完成：{:?}",
+        app.transfers().iter().map(|t| t.state).collect::<Vec<_>>()
+    );
+
+    // 大文件分块：字节数必须严丝合缝，多一块少一块都会体现在长度上
+    let i = app.local_files().entries.iter().position(|e| e.name == "big.dat").unwrap();
+    app.local_files_mut().selected = i;
+    app.file_transfer().await;
+    drain_transfers(&mut app).await;
+    assert_eq!(fs.read("/tmp/big.dat").unwrap().len(), big.len(), "分块传输不能丢字节");
+    let last = app.transfers().last().unwrap();
+    assert_eq!(last.done, big.len() as u64, "进度应累计到完整大小");
+    assert!(last.speed > 0, "完成时应有速度统计");
+
+    // 传到不存在的目录：重试到上限后失败，而不是把队列卡死
+    app.remote_files_mut().goto("/nope");
+    let i = app.local_files().entries.iter().position(|e| e.name == "a.txt").unwrap();
+    app.local_files_mut().selected = i;
+    app.file_transfer().await;
+    drain_transfers(&mut app).await;
+    let failed = app.transfers().last().unwrap();
+    assert_eq!(failed.state, sh0_tui::app::TransferState::Failed);
+    assert_eq!(failed.retries, 3, "应重试到上限再放弃");
+    assert!(failed.error.is_some());
+
+    // R 重新排队、c 清理已完成项
+    app.retry_failed();
+    assert!(app.has_pending_transfer(), "R 应把失败项重新排队");
+    app.clear_finished();
+    assert!(app.transfers().iter().all(|t| !t.is_finished()));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

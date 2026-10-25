@@ -442,6 +442,41 @@ impl SftpClient for MockSftp {
         Ok(())
     }
 
+    async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> SftpResult<()> {
+        let p = self.fs.norm(path);
+        // 与整体 write 一致：父目录不存在就该报错，不能默默造出来
+        if let Some(parent) = parent_of(&p)
+            && !self.fs.exists(&parent)
+        {
+            return Err(SftpError::NotFound(parent));
+        }
+        let mut nodes = self.fs.nodes.lock().unwrap();
+        let node = nodes.entry(p.clone()).or_insert(MemNode {
+            is_dir: false,
+            data: Vec::new(),
+            mtime: 1_700_000_000,
+            mode: 0o100_644,
+        });
+        let at = offset as usize;
+        if node.data.len() < at {
+            // 中间空档补 0：真文件系统也是这个语义
+            node.data.resize(at, 0);
+        }
+        if node.data.len() < at + data.len() {
+            node.data.resize(at + data.len(), 0);
+        }
+        node.data[at..at + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    async fn read_range(&self, path: &str, offset: u64, len: usize) -> SftpResult<Vec<u8>> {
+        let p = self.fs.norm(path);
+        let n = self.fs.get(&p).ok_or_else(|| SftpError::NotFound(p.clone()))?;
+        let at = (offset as usize).min(n.data.len());
+        let end = (at + len).min(n.data.len());
+        Ok(n.data[at..end].to_vec())
+    }
+
     async fn mkdir(&self, path: &str) -> SftpResult<()> {
         let p = self.fs.norm(path);
         if self.fs.exists(&p) {

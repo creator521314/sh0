@@ -69,6 +69,13 @@ pub trait SftpClient: Send + Sync {
     /// 读文件；超过 `max_bytes` 报 [`SftpError::TooLarge`]（不让 AI 一口气拉爆内存）
     async fn read(&self, path: &str, max_bytes: usize) -> SftpResult<Vec<u8>>;
     async fn write(&self, path: &str, data: &[u8]) -> SftpResult<()>;
+    /// 分块写：从 `offset` 处写入（不截断已有内容）。
+    ///
+    /// 为带进度的传输与断点续传服务——整体 `write` 一次发完的话，UI 只能
+    /// 在"传完"和"没传"之间跳，队列面板就没有意义了。
+    async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> SftpResult<()>;
+    /// 分块读：从 `offset` 处读最多 `len` 字节（到文件尾则少给一些）
+    async fn read_range(&self, path: &str, offset: u64, len: usize) -> SftpResult<Vec<u8>>;
     async fn mkdir(&self, path: &str) -> SftpResult<()>;
     async fn remove_file(&self, path: &str) -> SftpResult<()>;
     async fn remove_dir(&self, path: &str) -> SftpResult<()>;
