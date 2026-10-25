@@ -39,6 +39,8 @@ pub enum Action {
     ToggleFiles,
     /// 刷新当前文件面板
     FileRefresh,
+    /// 把焦点栏的选中项传到对面栏（上传/下载，FR-4.3）
+    FileCopy,
 }
 
 impl Action {
@@ -65,6 +67,7 @@ impl Action {
             Action::Copy => "screen.copy",
             Action::ToggleFiles => "file.toggle",
             Action::FileRefresh => "file.refresh",
+            Action::FileCopy => "file.copy",
         }
     }
 
@@ -91,6 +94,7 @@ impl Action {
             Action::Copy,
             Action::ToggleFiles,
             Action::FileRefresh,
+            Action::FileCopy,
         ]
         .into_iter()
         .find(|a| a.as_str() == s)
@@ -119,6 +123,7 @@ impl Action {
             Action::Copy => "复制选区",
             Action::ToggleFiles => "文件管理",
             Action::FileRefresh => "刷新文件列表",
+            Action::FileCopy => "传文件到对面",
         }
     }
 }
@@ -159,7 +164,7 @@ impl Keymap {
             ("alt+v", Action::SelectMode),
             ("alt+c", Action::Copy),
             ("f9", Action::ToggleFiles),
-            ("f5", Action::FileRefresh),
+            ("f5", Action::FileCopy),
         ])
     }
 
@@ -182,7 +187,7 @@ impl Keymap {
             ("alt+v", Action::SelectMode),
             ("alt+c", Action::Copy),
             ("f9", Action::ToggleFiles),
-            ("f5", Action::FileRefresh),
+            ("f5", Action::FileCopy),
         ])
     }
 
@@ -205,7 +210,7 @@ impl Keymap {
             ("alt+v", Action::SelectMode),
             ("alt+c", Action::Copy),
             ("f9", Action::ToggleFiles),
-            ("f5", Action::FileRefresh),
+            ("f5", Action::FileCopy),
         ])
     }
 

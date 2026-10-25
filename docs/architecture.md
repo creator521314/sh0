@@ -338,7 +338,22 @@ pub trait Screen: Send {
 - `file.list` 在 daemon 侧先 `canonicalize` 再列：UI 第一次给的 `.` 会被换成可信绝对路径，
   否则 `./foo` 会一层层叠下去，审计里的路径也跟着糊掉。
 - 键位（焦点在文件面板时）：`↑↓`/`jk` 选择，`Enter`/`→` 进入，`Backspace`/`←` 上级，
-  `Tab` 切栏，`g` 路径跳转，`s` 切排序，`r`/`F5` 刷新，`Esc` 回终端视图。
+  `Tab` 切栏，`g` 路径跳转，`s` 切排序，`r` 刷新，`Esc` 回终端视图。
+
+#### 5.3.2 文件操作（M4 / FR-4.3）
+
+| 键 | 动作 | 走的路径 |
+| --- | --- | --- |
+| `F5` | 把选中文件传到对面栏（上传/下载） | 上传：`std::fs::read` → `file.write`；下载：`file.read` → `std::fs::write` |
+| `F6` | 重命名 | 本地 `std::fs::rename` / 远端 `file.rename` |
+| `F7` | 新建目录 | 本地 `create_dir` / 远端 `file.mkdir` |
+| `F8` / `Delete` | 删除（先确认） | 本地 `remove_file`/`remove_dir` / 远端 `file.remove` |
+| `p` | 改权限（输入八进制） | 本地 `set_permissions` / 远端 `file.chmod` |
+
+- 传输是**整体读写**，单次上限 8 MB：UI 同步等 IPC 返回，更大的文件要等 W4.4 的传输队列
+  （带进度、失败重试）。目录传输同样留给 W4.4——它必须递归，而递归就该有进度。
+- 二进制走 `file.write` 的 `encoding=base64`：JSON 里塞不下裸字节，文本则原样传，省一层编解码。
+- 删除一律先弹确认；远端删目录要求目录为空（非空递归删除也在 W4.4）。
 
 ### 5.4 `sh0-ai`（CLI 契约层）
 

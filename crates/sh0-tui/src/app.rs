@@ -33,6 +33,8 @@ use sh0_term::keymap::Action;
 
 const TREE_WIDTH: u16 = 28;
 const FRAME_MS: u64 = 16;
+/// 单次传输的字节上限（8 MB）：UI 同步等 IPC，再大就该走 W4.4 的传输队列
+const TRANSFER_LIMIT: usize = 8 * 1024 * 1024;
 
 /// 一个标签页 = 一个远端会话 + 本地一份 Screen
 pub struct Tab {
@@ -57,6 +59,31 @@ pub enum Focus {
 pub enum View {
     Terminal,
     Files,
+}
+
+/// 文件视图里等待输入的动作（统一走一个输入框，省得每种操作各写一套状态机）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePrompt {
+    /// 跳到某个路径
+    Goto,
+    /// 在当前目录下新建子目录
+    Mkdir,
+    /// 重命名，携带被改的**完整路径**
+    Rename(String),
+    /// 改权限，携带目标完整路径
+    Chmod(String),
+}
+
+impl FilePrompt {
+    /// 输入框前缀（提示用户现在在填什么）
+    pub fn label(&self) -> &'static str {
+        match self {
+            FilePrompt::Goto => "跳转路径",
+            FilePrompt::Mkdir => "新建目录名",
+            FilePrompt::Rename(_) => "重命名为",
+            FilePrompt::Chmod(_) => "权限(八进制)",
+        }
+    }
 }
 
 /// 文本选区，坐标是**视图坐标**（随滚动一起移动）
@@ -141,8 +168,10 @@ pub struct App {
     files_right: FilePane,
     /// 文件视图里焦点在哪一栏
     file_focus_left: bool,
-    /// 路径跳转输入缓冲；Some 表示正在输入
-    file_jump: Option<String>,
+    /// 输入提示：`(要做什么, 已输入内容)`
+    file_prompt: Option<(FilePrompt, String)>,
+    /// 待确认的删除：`(是否左栏, 路径, 是否目录)`
+    file_delete: Option<(bool, String, bool)>,
     /// 右栏当前绑定到的会话（换标签页要重新列目录）
     file_sid: Option<String>,
 }
@@ -190,7 +219,8 @@ impl App {
             files_left: FilePane::local(),
             files_right: FilePane::remote(),
             file_focus_left: true,
-            file_jump: None,
+            file_prompt: None,
+            file_delete: None,
             file_sid: None,
         }
     }
@@ -456,28 +486,56 @@ impl App {
         Ok(())
     }
 
-    /// 文件视图的按键：先喂路径跳转输入框，再走导航
+    /// 文件视图的按键：删除确认 → 输入提示 → 导航/操作
     async fn on_file_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        if let Some(j) = self.file_jump.as_mut() {
+        // 0) 删除确认：删文件是不可逆的，一律先问一句
+        if let Some((is_left, path, is_dir)) = self.file_delete.take() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.file_delete(is_left, &path, is_dir).await
+                }
+                _ => self.notice = "已取消删除".into(),
+            }
+            return Ok(());
+        }
+
+        // 1) 输入提示（跳转 / 新建目录 / 重命名 / 改权限）
+        if self.file_prompt.is_some() {
             match key.code {
                 KeyCode::Esc => {
-                    self.file_jump = None;
+                    self.file_prompt = None;
                     self.notice.clear();
                 }
                 KeyCode::Enter => {
-                    let target = j.trim().to_string();
-                    self.file_jump = None;
-                    self.file_goto(&target).await;
+                    let (kind, raw) = self.file_prompt.take().unwrap_or((FilePrompt::Goto, String::new()));
+                    let text = raw.trim().to_string();
+                    if !text.is_empty() {
+                        match kind {
+                            FilePrompt::Goto => self.file_goto(&text).await,
+                            FilePrompt::Mkdir => self.file_mkdir(&text).await,
+                            FilePrompt::Rename(p) => self.file_rename(&p, &text).await,
+                            FilePrompt::Chmod(p) => self.file_chmod(&p, &text).await,
+                        }
+                    } else {
+                        self.notice = "已取消".into();
+                    }
                 }
                 KeyCode::Backspace => {
-                    j.pop();
+                    if let Some((_, b)) = self.file_prompt.as_mut() {
+                        b.pop();
+                    }
                 }
-                KeyCode::Char(c) => j.push(c),
+                KeyCode::Char(c) => {
+                    if let Some((_, b)) = self.file_prompt.as_mut() {
+                        b.push(c);
+                    }
+                }
                 _ => {}
             }
             return Ok(());
         }
 
+        // 2) 导航与操作
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.file_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.file_move(1),
@@ -491,17 +549,44 @@ impl App {
                 }
             }
             KeyCode::Char('g') => {
-                self.file_jump = Some(String::new());
+                self.file_prompt = Some((FilePrompt::Goto, String::new()));
                 self.notice = "跳转：输入路径后回车（Esc 取消）".into();
             }
             KeyCode::Char('s') => self.file_sort(),
-            KeyCode::Char('r') => {
-                if self.file_focus_left {
-                    self.files_left.reload_local();
-                    self.notice = "本地已刷新".into();
-                } else {
-                    self.reload_remote().await;
-                    self.notice = "远程已刷新".into();
+            KeyCode::Char('r') => self.file_refresh().await,
+            KeyCode::Char('p') => {
+                match self.pane().current_path() {
+                    Some(p) => {
+                        self.file_prompt = Some((FilePrompt::Chmod(p), String::new()));
+                        self.notice = "权限：输入八进制，如 644（Esc 取消）".into();
+                    }
+                    None => self.notice = "没有选中项".into(),
+                }
+            }
+            KeyCode::F(6) => {
+                match self.pane().current().cloned() {
+                    Some(e) => {
+                        let cur = e.name.clone();
+                        let path = e.path.clone();
+                        self.file_prompt = Some((FilePrompt::Rename(path), cur));
+                        self.notice = "重命名：改成新名字后回车（Esc 取消）".into();
+                    }
+                    None => self.notice = "没有选中项".into(),
+                }
+            }
+            KeyCode::F(7) => {
+                self.file_prompt = Some((FilePrompt::Mkdir, String::new()));
+                self.notice = "新建目录：输入名字后回车（Esc 取消）".into();
+            }
+            KeyCode::F(8) | KeyCode::Delete => {
+                match self.pane().current().cloned() {
+                    Some(e) => {
+                        let path = e.path.clone();
+                        let name = e.name.clone();
+                        self.file_delete = Some((self.file_focus_left, path, e.is_dir));
+                        self.notice = format!("删除 `{name}`？按 y 确认，其它键取消");
+                    }
+                    None => self.notice = "没有选中项".into(),
                 }
             }
             KeyCode::Esc => self.leave_files(),
@@ -557,13 +642,8 @@ impl App {
                     self.enter_files().await;
                 }
             }
-            Action::FileRefresh => {
-                if self.file_focus_left {
-                    self.files_left.reload_local();
-                } else {
-                    self.reload_remote().await;
-                }
-            }
+            Action::FileRefresh => self.file_refresh().await,
+            Action::FileCopy => self.file_transfer().await,
             Action::HostSearch => self.query = Some(String::new()),
             Action::HostNew => self.form = Some(HostForm::new(None)),
             Action::HostEdit => {
@@ -844,9 +924,24 @@ impl App {
         &self.files_right
     }
 
+    /// 左栏可写句柄（测试与调试用）
+    pub fn local_files_mut(&mut self) -> &mut FilePane {
+        &mut self.files_left
+    }
+
+    /// 右栏可写句柄（测试与调试用）
+    pub fn remote_files_mut(&mut self) -> &mut FilePane {
+        &mut self.files_right
+    }
+
     /// 是否正处于双栏文件视图
     pub fn in_file_view(&self) -> bool {
         self.view == View::Files
+    }
+
+    /// 最近一条提示/错误（测试与调试用）
+    pub fn notice(&self) -> &str {
+        &self.notice
     }
 
     /// 文件视图里把焦点切到另一栏（Tab 键走的就是它）
@@ -980,6 +1075,262 @@ impl App {
         let p = self.pane_mut();
         p.cycle_sort();
         self.notice = format!("排序：{}", p.sort.label());
+    }
+
+    /// 刷新当前栏
+    pub async fn file_refresh(&mut self) {
+        if self.file_focus_left {
+            self.files_left.reload_local();
+            self.notice = "本地已刷新".into();
+        } else {
+            self.reload_remote().await;
+            self.notice = "远程已刷新".into();
+        }
+    }
+
+    /// 在当前栏的 cwd 下建子目录
+    pub async fn file_mkdir(&mut self, name: &str) {
+        if self.file_focus_left {
+            let path = std::path::Path::new(&self.files_left.cwd).join(name);
+            match std::fs::create_dir(&path) {
+                Ok(_) => {
+                    self.notice = format!("已建目录 {}", path.display());
+                    self.files_left.reload_local();
+                }
+                Err(e) => self.notice = format!("新建目录失败：{e}"),
+            }
+            return;
+        }
+        let path = join_posix(&self.files_right.cwd, name);
+        let Some(sid) = self.active_session() else {
+            self.notice = "没有活动会话".into();
+            return;
+        };
+        match self
+            .client
+            .call(methods::FILE_MKDIR, json!({ "session": sid, "path": path }))
+            .await
+        {
+            Ok(_) => {
+                self.notice = format!("已建目录 {path}");
+                self.reload_remote().await;
+            }
+            Err(e) => self.notice = format!("新建目录失败：{e}"),
+        }
+    }
+
+    /// 重命名：只改名字，目录位置不变
+    pub async fn file_rename(&mut self, from: &str, new_name: &str) {
+        let to = if self.file_focus_left {
+            match std::path::Path::new(from).parent() {
+                Some(p) => p.join(new_name).to_string_lossy().to_string(),
+                None => new_name.to_string(),
+            }
+        } else {
+            match from.rfind('/') {
+                Some(i) => format!("{}/{new_name}", &from[..i]),
+                None => new_name.to_string(),
+            }
+        };
+        if self.file_focus_left {
+            match std::fs::rename(from, &to) {
+                Ok(_) => {
+                    self.notice = format!("已重命名为 {new_name}");
+                    self.files_left.reload_local();
+                }
+                Err(e) => self.notice = format!("重命名失败：{e}"),
+            }
+            return;
+        }
+        let Some(sid) = self.active_session() else {
+            self.notice = "没有活动会话".into();
+            return;
+        };
+        match self
+            .client
+            .call(
+                methods::FILE_RENAME,
+                json!({ "session": sid, "from": from, "to": to }),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.notice = format!("已重命名为 {new_name}");
+                self.reload_remote().await;
+            }
+            Err(e) => self.notice = format!("重命名失败：{e}"),
+        }
+    }
+
+    /// 改权限：输入的是八进制（`644` / `0755`）
+    pub async fn file_chmod(&mut self, path: &str, mode: &str) {
+        let Some(m) = parse_octal(mode) else {
+            self.notice = format!("`{mode}` 不是八进制权限（例如 644）");
+            return;
+        };
+        if self.file_focus_left {
+            let msg = match chmod_local(path, m) {
+                Ok(_) => {
+                    self.files_left.reload_local();
+                    format!("权限已改为 {mode}")
+                }
+                Err(e) => e,
+            };
+            self.notice = msg;
+            return;
+        }
+        let Some(sid) = self.active_session() else {
+            self.notice = "没有活动会话".into();
+            return;
+        };
+        match self
+            .client
+            .call(
+                methods::FILE_CHMOD,
+                json!({ "session": sid, "path": path, "mode": m }),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.notice = format!("权限已改为 {mode}");
+                self.reload_remote().await;
+            }
+            Err(e) => self.notice = format!("改权限失败：{e}"),
+        }
+    }
+
+    /// 删除（已确认过）：目录要求是空的，非空目录递归删除留到 W4.4
+    pub async fn file_delete(&mut self, is_left: bool, path: &str, is_dir: bool) {
+        if is_left {
+            let r = if is_dir {
+                std::fs::remove_dir(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            match r {
+                Ok(_) => {
+                    self.notice = "已删除".into();
+                    self.files_left.reload_local();
+                }
+                Err(e) => self.notice = format!("删除失败：{e}"),
+            }
+            return;
+        }
+        let Some(sid) = self.active_session() else {
+            self.notice = "没有活动会话".into();
+            return;
+        };
+        match self
+            .client
+            .call(
+                methods::FILE_REMOVE,
+                json!({ "session": sid, "path": path, "dir": is_dir }),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.notice = "已删除".into();
+                self.reload_remote().await;
+            }
+            Err(e) => self.notice = format!("删除失败：{e}"),
+        }
+    }
+
+    /// 把焦点栏的选中文件传到对面栏的当前目录。
+    ///
+    /// 单次传输上限 [`TRANSFER_LIMIT`]：这里同步等 IPC 返回，几十兆的文件会把
+    /// 界面卡死——那种量级该交给 W4.4 的传输队列（带进度、失败重试与续传）。
+    pub async fn file_transfer(&mut self) {
+        if self.view != View::Files {
+            return;
+        }
+        let Some(cur) = self.pane().current().cloned() else {
+            self.notice = "没有选中项".into();
+            return;
+        };
+        if cur.is_dir {
+            self.notice = "目录要递归传，留到 W4.4 的传输队列".into();
+            return;
+        }
+        let name = cur.name.clone();
+        let Some(sid) = self.active_session() else {
+            self.notice = "没有活动会话".into();
+            return;
+        };
+        if self.file_focus_left {
+            // 上传：本地读 → 远端写
+            let Ok(bytes) = std::fs::read(&cur.path) else {
+                self.notice = format!("读本地文件失败：{}", cur.path);
+                return;
+            };
+            if bytes.len() > TRANSFER_LIMIT {
+                self.notice = format!(
+                    "{} 有 {} 字节，超过单次上限 {TRANSFER_LIMIT}（大文件等 W4.4 的队列）",
+                    name,
+                    bytes.len()
+                );
+                return;
+            }
+            let target = join_posix(&self.files_right.cwd, &name);
+            // 文本直接传，二进制走 base64：JSON 里塞不下裸字节
+            let (encoding, data) = match std::str::from_utf8(&bytes) {
+                Ok(s) => ("utf8", s.to_string()),
+                Err(_) => ("base64", base64_encode(&bytes)),
+            };
+            match self
+                .client
+                .call(
+                    methods::FILE_WRITE,
+                    json!({ "session": sid, "path": target, "data": data, "encoding": encoding }),
+                )
+                .await
+            {
+                Ok(_) => {
+                    self.notice = format!("已上传 {name}（{} 字节）", bytes.len());
+                    self.reload_remote().await;
+                }
+                Err(e) => self.notice = format!("上传失败：{e}"),
+            }
+        } else {
+            // 下载：远端读 → 本地写
+            match self
+                .client
+                .call(
+                    methods::FILE_READ,
+                    json!({ "session": sid, "path": cur.path, "max_bytes": TRANSFER_LIMIT }),
+                )
+                .await
+            {
+                Ok(v) => {
+                    let enc = v.get("encoding").and_then(|x| x.as_str()).unwrap_or("utf8");
+                    let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+                    let bytes = if enc == "base64" {
+                        match base64_decode(content) {
+                            Some(b) => b,
+                            None => {
+                                self.notice = "下载的内容无法解码".into();
+                                return;
+                            }
+                        }
+                    } else {
+                        content.as_bytes().to_vec()
+                    };
+                    let target = std::path::Path::new(&self.files_left.cwd).join(&name);
+                    match std::fs::write(&target, &bytes) {
+                        Ok(_) => {
+                            self.notice = format!("已下载 {name}（{} 字节）", bytes.len());
+                            self.files_left.reload_local();
+                        }
+                        Err(e) => self.notice = format!("写本地文件失败：{e}"),
+                    }
+                }
+                Err(e) => self.notice = format!("下载失败：{e}"),
+            }
+        }
+    }
+
+    fn active_session(&self) -> Option<String> {
+        self.tabs.get(self.active).map(|t| t.id.clone())
     }
 
     // ---- 渲染 ----
@@ -1118,7 +1469,7 @@ impl App {
         self.draw_pane(f, cols[1], &self.files_right, !self.file_focus_left, host);
 
         // 路径跳转输入框：浮在底部状态栏之上，样式与主机搜索一致
-        if let Some(j) = &self.file_jump {
+        if let Some((kind, j)) = &self.file_prompt {
             let r = Rect {
                 x: area.x,
                 y: area.bottom().saturating_sub(1),
@@ -1126,7 +1477,7 @@ impl App {
                 height: 1,
             };
             f.render_widget(
-                Paragraph::new(format!("跳转到: {j}")).style(
+                Paragraph::new(format!("{}: {j}", kind.label())).style(
                     Style::default()
                         .fg(self.theme.status_bg)
                         .add_modifier(Modifier::BOLD),
@@ -1381,7 +1732,7 @@ impl App {
             ));
         }
         let right = if self.view == View::Files {
-            "Tab 切栏 · ↑↓ 选择 · Enter 进入 · Backspace 上级 · g 跳转 · s 排序 · F5 刷新 · F9 回终端"
+            "Tab 切栏 · ↑↓ 选择 · Enter 进入 · g 跳转 · F5 传文件 · F6 改名 · F7 建目录 · F8 删除 · p 权限 · F9 回终端"
         } else {
             "Ctrl+Q 退出 · Ctrl+T 新建 · Ctrl+W 关闭 · Ctrl+B 焦点"
         };
@@ -1574,6 +1925,48 @@ pub fn is_hard_quit(key: KeyEvent) -> bool {
         (key.code, key.modifiers),
         (KeyCode::Char('q'), KeyModifiers::CONTROL) | (KeyCode::Char('c'), KeyModifiers::CONTROL)
     )
+}
+
+/// POSIX 风格拼接（远端路径一律用 `/`）
+fn join_posix(dir: &str, name: &str) -> String {
+    if dir.is_empty() || dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", dir.trim_end_matches('/'))
+    }
+}
+
+/// 权限输入解析：只认八进制，且不超过 7777
+fn parse_octal(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() || !s.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return None;
+    }
+    u32::from_str_radix(s, 8).ok().filter(|m| *m <= 0o7777)
+}
+
+/// 本地改权限：Unix 用 mode 的低 9 位；Windows 只认"只读"这一位
+#[cfg(unix)]
+fn chmod_local(path: &str, mode: u32) -> std::result::Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = std::fs::metadata(path).map_err(|e| format!("读取失败：{e}"))?;
+    let mut perm = md.permissions();
+    perm.set_mode(mode & 0o777);
+    std::fs::set_permissions(path, perm).map_err(|e| format!("改权限失败：{e}"))
+}
+
+#[cfg(not(unix))]
+fn chmod_local(path: &str, mode: u32) -> std::result::Result<(), String> {
+    let md = std::fs::metadata(path).map_err(|e| format!("读取失败：{e}"))?;
+    let mut perm = md.permissions();
+    perm.set_readonly(mode & 0o222 == 0);
+    std::fs::set_permissions(path, perm).map_err(|e| format!("改权限失败：{e}"))
+}
+
+/// base64 解码（下载二进制文件时用）
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
 /// 极简 base64 编码：只为 OSC 52 服务，不值得为它引入一个依赖

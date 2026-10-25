@@ -1063,3 +1063,73 @@ async fn tui_file_view_lists_remote_over_ipc() {
     app.file_sort();
     assert_eq!(app.remote_files().entries.len(), before);
 }
+
+/// 文件视图的基本操作：上传/下载（含二进制）、建目录、改名、改权限、删除（FR-4.3）
+#[tokio::test]
+async fn tui_file_ops_transfer_and_edit() {
+    let (fx, fs) = fixture_sftp().await;
+
+    // 本地临时目录：一个文本文件 + 一个二进制文件（后者逼着走 base64）
+    let tmp = std::env::temp_dir().join(format!("sh0-w43-{}", sh0_core::new_session_id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("up.txt"), "hello-sh0").unwrap();
+    let bin: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+    std::fs::write(tmp.join("bin.dat"), &bin).unwrap();
+
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app =
+        sh0_tui::App::new(fx.client.clone(), events, fx.store.clone(), AppConfig::default());
+    app.open("mockbox").await.unwrap();
+    app.enter_files().await;
+    app.local_files_mut().goto(tmp.to_string_lossy().to_string());
+    app.local_files_mut().reload_local();
+
+    // 上传 up.txt（焦点默认在左栏）
+    let i = app.local_files().entries.iter().position(|e| e.name == "up.txt").unwrap();
+    app.local_files_mut().selected = i;
+    app.file_transfer().await;
+    assert_eq!(fs.read("/tmp/up.txt").unwrap(), b"hello-sh0", "文本上传应原样到达");
+
+    // 上传 bin.dat：非 UTF-8，必须走 base64 才能不失真
+    let i = app.local_files().entries.iter().position(|e| e.name == "bin.dat").unwrap();
+    app.local_files_mut().selected = i;
+    app.file_transfer().await;
+    assert_eq!(fs.read("/tmp/bin.dat").unwrap(), bin, "二进制上传必须逐字节一致");
+
+    // 下载 hello.txt 到本地目录
+    app.toggle_file_pane();
+    let i = app.remote_files().entries.iter().position(|e| e.name == "hello.txt").unwrap();
+    app.remote_files_mut().selected = i;
+    app.file_transfer().await;
+    assert_eq!(std::fs::read(tmp.join("hello.txt")).unwrap(), b"hello");
+
+    // 远端建目录 → 改名 → 删目录
+    app.file_mkdir("w43").await;
+    assert!(fs.exists("/tmp/w43"));
+    app.file_rename("/tmp/w43", "w43b").await;
+    assert!(fs.exists("/tmp/w43b"));
+    assert!(!fs.exists("/tmp/w43"));
+    app.file_delete(false, "/tmp/w43b", true).await;
+    assert!(!fs.exists("/tmp/w43b"));
+
+    // 改权限（八进制字符串）
+    app.file_chmod("/tmp/hello.txt", "600").await;
+    let st = fx
+        .call(
+            methods::FILE_STAT,
+            json!({ "host": "mockbox", "path": "/tmp/hello.txt", "actor": "ai" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(st["entry"]["mode"], 0o600);
+
+    // 非法权限输入不该落到 IPC 上
+    app.file_chmod("/tmp/hello.txt", "abc").await;
+    assert!(app.notice().contains("不是八进制"));
+
+    // 删文件（非目录）
+    app.file_delete(false, "/tmp/up.txt", false).await;
+    assert!(!fs.exists("/tmp/up.txt"));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

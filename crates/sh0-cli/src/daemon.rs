@@ -1130,6 +1130,14 @@ fn base64_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// `file.write` 的反向路径：把 base64 还原成字节（二进制上传用）
+fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())
+}
+
 /// 把 `GridView` 序列化成 JSON 值（`screen read --mode grid`）
 fn grid_view_json(v: &GridView) -> Value {
     json!({
@@ -1467,13 +1475,33 @@ impl Handler for DaemonState {
 
             methods::FILE_WRITE => {
                 let path = file_path(&params)?;
-                let body = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                // 文本可以直接给；二进制走 base64，否则 JSON 里塞不下也没法校验
+                let encoding = params
+                    .get("encoding")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("utf8");
+                let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let bytes = match encoding {
+                    "utf8" => data.as_bytes().to_vec(),
+                    "base64" => base64_decode(data).map_err(|e| ErrorBody {
+                        code: "invalid_args".into(),
+                        message: format!("data 不是合法 base64：{e}"),
+                        data: None,
+                    })?,
+                    other => {
+                        return Err(ErrorBody {
+                            code: "invalid_args".into(),
+                            message: format!("未知 encoding `{other}`，可选 utf8 / base64"),
+                            data: None,
+                        })
+                    }
+                };
                 let (sftp, host_name, sid) = self.sftp_for(&params).await?;
-                let n = body.len();
-                let r = sftp.write(&path, body.as_bytes()).await;
+                let n = bytes.len();
+                let r = sftp.write(&path, &bytes).await;
                 let _ = sftp.close().await;
                 self.file_done(&params, "file.write", &path, &host_name, sid.as_deref(), r)?;
-                Ok(json!({ "path": path, "host": host_name, "bytes": n }))
+                Ok(json!({ "path": path, "host": host_name, "bytes": n, "encoding": encoding }))
             }
 
             methods::FILE_MKDIR => {
