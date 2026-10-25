@@ -7,6 +7,7 @@ pub mod config;
 pub mod creds;
 pub mod db;
 pub mod error;
+pub mod import;
 pub mod log;
 pub mod paths;
 
@@ -17,5 +18,8 @@ pub use db::{
     BatchRunSummary, redact,
 };
 pub use error::{Result, StoreError};
+pub use import::{
+    ImportReport, ImportSource, ImportedHost, import_xsh_dir, merge_into, parse_ssh_config, parse_xsh,
+};
 pub use log::{LogConfig, RotatingFileWriter, prune_old_logs, rotate_file};
 pub use paths::{Paths, APP_NAME};

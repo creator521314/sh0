@@ -112,6 +112,18 @@ pub enum HostCmd {
         /// 主机名或主机 ID
         selector: String,
     },
+    /// 导入既有配置：`--from ssh|xsh`（FR-1.10，只读源文件）
+    Import {
+        /// 来源：ssh 或 xsh
+        #[arg(long, value_name = "ssh|xsh")]
+        from: String,
+        /// 源文件路径；ssh 缺省用 ~/.ssh/config
+        #[arg(long)]
+        path: Option<String>,
+        /// 只报告将要导入什么，不写入 hosts.toml
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -687,6 +699,54 @@ async fn dispatch(
                 }
 
                 Ok((text, json!({ "hosts": hosts })))
+            }
+            HostCmd::Import {
+                from,
+                path,
+                dry_run,
+            } => {
+                let store = sh0_store::Store::new()
+                    .map_err(|e| AiError::Other(format!("无法读取配置: {e}")))?;
+                let source = sh0_store::ImportSource::parse(&from, path.as_deref())
+                    .map_err(|e| AiError::Other(format!("导入来源无效: {e}")))?;
+                let report = source
+                    .collect()
+                    .map_err(|e| AiError::Other(format!("读取源文件失败: {e}")))?;
+                let merged = store
+                    .import_hosts(report, *dry_run)
+                    .map_err(|e| AiError::Other(format!("写入主机清单失败: {e}")))?;
+
+                let mut text = String::new();
+                text.push_str(&format!(
+                    "{} {} 台\n",
+                    if *dry_run { "将要导入" } else { "已导入" },
+                    merged.imported.len()
+                ));
+                for h in &merged.imported {
+                    text.push_str(&format!("  {}  {}\n", h.name, h.endpoint()));
+                }
+                if !merged.duplicated.is_empty() {
+                    text.push_str(&format!(
+                        "  重名保留现有: {}\n",
+                        merged.duplicated.join(", ")
+                    ));
+                }
+                for (name, why) in &merged.skipped {
+                    text.push_str(&format!("  跳过 {name}: {why}\n"));
+                }
+                Ok((
+                    text,
+                    json!({
+                        "dry_run": *dry_run,
+                        "imported": merged.imported.iter().map(|h| json!({
+                            "name": h.name,
+                            "endpoint": h.endpoint(),
+                            "group": h.group_path(),
+                        })).collect::<Vec<_>>(),
+                        "duplicated": merged.duplicated,
+                        "skipped": merged.skipped,
+                    }),
+                ))
             }
             HostCmd::Show { selector } => {
                 let store = sh0_store::Store::new()

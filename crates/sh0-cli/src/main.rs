@@ -113,6 +113,49 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            HostCmd::Import {
+                from,
+                path,
+                dry_run,
+                json,
+            } => {
+                let source = sh0_store::ImportSource::parse(&from, path.as_deref())?;
+                let report = source.collect()?;
+                let merged = store.import_hosts(report, dry_run)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "dry_run": dry_run,
+                            "imported": merged.imported.iter().map(|h| serde_json::json!({
+                                "name": h.name, "endpoint": h.endpoint(), "group": h.group_path(),
+                            })).collect::<Vec<_>>(),
+                            "duplicated": merged.duplicated,
+                            "skipped": merged.skipped,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "{} {} 台，跳过 {} 条，重名未覆盖 {} 台",
+                        if dry_run { "将要导入" } else { "已导入" },
+                        merged.imported.len(),
+                        merged.skipped.len(),
+                        merged.duplicated.len()
+                    );
+                    for h in &merged.imported {
+                        println!("  + {:<20} {}", h.name, h.endpoint());
+                    }
+                    for (name, why) in &merged.skipped {
+                        println!("  - {name}: {why}");
+                    }
+                    for name in &merged.duplicated {
+                        println!("  = {name}: 已存在，保留现有配置");
+                    }
+                    if dry_run && !merged.imported.is_empty() {
+                        println!("（--dry-run：未写入；去掉该参数才落盘）");
+                    }
+                }
+            }
         },
 
         Cmd::Config { cmd } => match cmd {

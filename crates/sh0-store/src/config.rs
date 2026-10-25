@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use sh0_core::{Host, HostSelector, RiskLevel};
+use crate::import::ImportReport;
 use crate::log::LogConfig;
 
 use crate::error::{Result, StoreError};
@@ -361,6 +362,19 @@ impl Store {
 
         cfg = serde_json::from_value(v)?;
         self.save_config(&cfg)
+    }
+
+    /// 把导入结果并入 hosts.toml（FR-1.10）。
+    ///
+    /// `dry_run` 为真时只算不写——导入会动用户的主机清单，先看一眼再落盘
+    /// 是应该的。重名条目一律保留现有配置，绝不覆盖用户手工改过的东西。
+    pub fn import_hosts(&self, report: ImportReport, dry_run: bool) -> Result<ImportReport> {
+        let mut file = self.load_hosts()?;
+        let merged = crate::import::merge_into(&mut file.hosts, report);
+        if !dry_run && !merged.imported.is_empty() {
+            self.save_hosts(&file)?;
+        }
+        Ok(merged)
     }
 
     /// 配置文件与主机清单的修改时间，热重载据此判断要不要重新读

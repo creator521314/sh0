@@ -105,6 +105,21 @@ pub enum HostCmd {
         #[arg(long)]
         json: bool,
     },
+    /// 导入既有配置（只读源文件，FR-1.10）
+    Import {
+        /// 来源：ssh（~/.ssh/config）或 xsh（Xshell 会话文件/目录）
+        #[arg(long, value_name = "ssh|xsh")]
+        from: String,
+        /// 源文件路径；ssh 缺省用 ~/.ssh/config
+        #[arg(long)]
+        path: Option<String>,
+        /// 只打印将要导入什么，不写入 hosts.toml
+        #[arg(long)]
+        dry_run: bool,
+        /// 输出结构化 JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

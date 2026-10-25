@@ -2303,3 +2303,88 @@ async fn proxy_jump_cycle_does_not_recurse_forever() {
     }
     assert!(depth >= 1, "至少要展开出第一层");
 }
+
+// ---------------------------------------------------------------------------
+// M5 W5.3：配置导入（FR-1.10）
+// ---------------------------------------------------------------------------
+
+/// 导入 ssh config：dry-run 不落盘，正式导入才写 hosts.toml
+#[tokio::test]
+async fn host_import_from_ssh_config() {
+    let fx = fixture().await;
+
+    let dir = std::env::temp_dir().join(format!("sh0-import-{}", sh0_core::new_host_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg_path = dir.join("ssh_config");
+    std::fs::write(
+        &cfg_path,
+        "Host *\n    ServerAliveInterval 30\n\n\
+         Host web-01\n    HostName 10.0.0.1\n    User root\n    Port 2222\n\n\
+         Host db-01\n    HostName db.internal\n    User admin\n",
+    )
+    .unwrap();
+
+    // dry-run：报出来但不写（fixture 自带一台 mockbox，故比较导入前后的数量）
+    let before = fx.store.load_hosts().unwrap().hosts.len();
+    let src = sh0_store::ImportSource::parse("ssh", Some(cfg_path.to_str().unwrap())).unwrap();
+    let dry = fx.store.import_hosts(src.collect().unwrap(), true).unwrap();
+    assert_eq!(dry.imported.len(), 2, "应识别出两台: {dry:?}");
+    assert_eq!(
+        fx.store.load_hosts().unwrap().hosts.len(),
+        before,
+        "dry-run 不该落盘"
+    );
+
+    // 正式导入
+    let real = fx.store.import_hosts(src.collect().unwrap(), false).unwrap();
+    assert_eq!(real.imported.len(), 2);
+    let hosts = fx.store.load_hosts().unwrap().hosts;
+    assert_eq!(hosts.len(), before + 2);
+    let web = hosts.iter().find(|h| h.name == "web-01").unwrap();
+    assert_eq!(web.addr, "10.0.0.1");
+    assert_eq!(web.port, 2222);
+    assert_eq!(web.group_path(), "imported");
+
+    // 再导一次：重名不覆盖
+    let again = fx.store.import_hosts(src.collect().unwrap(), false).unwrap();
+    assert_eq!(again.imported.len(), 0);
+    assert_eq!(again.duplicated.len(), 2, "重名应全部列为已存在");
+    assert_eq!(
+        fx.store.load_hosts().unwrap().hosts.len(),
+        before + 2,
+        "不该重复写入"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Xshell 会话文件（含非 SSH 协议的要跳过）
+#[tokio::test]
+async fn host_import_from_xsh() {
+    let fx = fixture().await;
+    let dir = std::env::temp_dir().join(format!("sh0-xsh-{}", sh0_core::new_host_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("prod-web.xsh"),
+        "[CONNECTION]\nPROTOCOL=SSH\nHOSTNAME=192.168.1.50\nPORT=2201\nUSERNAME=deploy\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("old-switch.xsh"),
+        "[CONNECTION]\nPROTOCOL=TELNET\nHOSTNAME=10.9.9.9\n",
+    )
+    .unwrap();
+
+    let src = sh0_store::ImportSource::parse("xsh", Some(dir.to_str().unwrap())).unwrap();
+    let merged = fx.store.import_hosts(src.collect().unwrap(), false).unwrap();
+
+    assert_eq!(merged.imported.len(), 1, "只有 SSH 会话该导入: {merged:?}");
+    let h = &merged.imported[0];
+    assert_eq!(h.name, "prod-web");
+    assert_eq!(h.addr, "192.168.1.50");
+    assert_eq!(h.port, 2201);
+    assert_eq!(h.user, "deploy");
+    assert!(merged.skipped.iter().any(|(n, _)| n == "old-switch"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -234,10 +234,32 @@ sh0 secret rm  sh0 web-01                               # 删
 | Alt+B | 广播开关 |
 | Alt+M | 勾选/取消当前会话参与广播 |
 | F9 | 终端视图 / 双栏文件视图切换 |
+| **Ctrl+Shift+P** | **命令面板**（模糊搜索：内置动作 / 连接主机 / 切换主题） |
 
 另两套预设：`keymap = "vim"`（hjkl / `/` 搜索，`Alt+G` 到顶、`Shift+G` 到底）、
 `keymap = "xshell"`（Alt 组合为主，`Shift+PageUp` 回看）。任意单键可在 `config.toml` 的
-`[keys]` 里覆盖，例如 `quit = "ctrl+x"`。写错的键名只会在日志里告警，不会让程序起不来。
+`[keys]` 里覆盖，例如 `quit = "ctrl+x"`、`command.palette = "alt+p"`。写错的键名只会在日志里
+告警，不会让程序起不来。
+
+带 Shift 的字母键按**小写**匹配：终端上报的是 `Shift+G` 对应的大写 `G`，配置里写 `shift+g`
+即可，两边都会归一成小写再比。
+
+### 5.2.1 命令面板（Ctrl+Shift+P）
+
+面板里能搜到三类东西：
+
+- **动作**：全部内置命令（搜索主机、新建会话、广播开关、清屏……）。动作名也能搜，
+  输 `reconnect` 能命中"重新连接"。
+- **主机**：`连接 web-01` 这类条目，回车直连，右侧显示 `user@addr:port`。
+- **主题**：`主题：dark / light / high-contrast`，回车切换并**写回 config.toml**。
+
+`↑↓` 选择、`Enter` 执行、`Esc` 取消、直接打字过滤（模糊子序列匹配，不用连着打）。
+执行完面板关闭，焦点回到原来的地方。
+
+### 5.2.2 主题
+
+`config.toml` 里 `theme = "dark" | "light" | "high-contrast"`（默认 `dark`），
+或在命令面板里随时切换。`high-contrast` 是纯黑白 + 高饱和语义色，给强光/弱视环境用。
 
 ### 5.3 鼠标操作（主机树）
 
@@ -310,7 +332,9 @@ kitty / Alacritty 均支持）；不支持时内容仍留在 sh0 内部，可用
 ```bash
 sh0 tui [主机名或ID]     # 启动 TUI；省略时若只有一台主机则自动使用
 sh0 host list [--json]   # 列出主机
-sh0 config path          # 打印配置/数据/运行时目录
+sh0 host import --from ssh [--path ~/.ssh/config] [--dry-run] [--json]
+sh0 host import --from xsh --path <会话文件或目录> [--dry-run]
+sh0 config path|show|get|set|reload|check   # 见下
 sh0 secret set|get|list|rm ...
 sh0 daemon run [--background]   # 前台运行（调试用），通常无需手动执行
 sh0 daemon stop                 # 优雅停止后台 daemon
@@ -318,6 +342,50 @@ sh0 daemon stop                 # 优雅停止后台 daemon
 
 daemon 由 `sh0` 自动拉起（首次调用 AI 接口或进 TUI 时），一般不需要手动管。
 `daemon.json` 失效（daemon 已死但文件残留）会自动清理并重启。
+
+### 6.1 `sh0 config`
+
+```bash
+sh0 config path                       # 打印配置/数据/运行时目录
+sh0 config show [--json]              # 打印当前生效配置（默认 TOML）
+sh0 config get limits.exec_timeout_secs
+sh0 config set limits.exec_timeout_secs 60
+sh0 config set theme light            # 字符串原样写入
+sh0 config reload                     # 通知 daemon 重新加载
+sh0 config check                      # 校验三份配置能否解析
+```
+
+- `get` 出来的字符串**不带引号**，可以直接用在脚本里：`sh0 config get term`。
+- `set` 遇到拼错的键名会**报错**而不是假装成功（静默忽略最难排查）。
+- `set` 之后若 daemon 在跑，会自动触发一次热重载并打印结果。
+
+### 6.2 配置热重载
+
+daemon 每 2 秒检查一次 `config.toml` / `hosts.toml` 的 mtime，改完**不用重启**：
+
+| 配置 | 是否热生效 |
+| --- | --- |
+| `limits.*`（超时、输出上限、限速、批量并发） | 立即 |
+| `risk.*`（默认档位、规则文件） | 立即 |
+| `hosts.toml` 的主机增删 | 立即（每次按名字现读文件） |
+| `term` / `keepalive_secs` / `cols` / `rows` / `memory_budget_mb` / `audit.enabled` | 需重启 |
+
+改到最后一类时，`sh0 config reload` 的回显会点名提示哪些项要重启。
+
+### 6.3 导入既有配置（只读）
+
+```bash
+sh0 host import --from ssh --dry-run        # 先看会导入什么
+sh0 host import --from ssh                  # 真的写进 hosts.toml
+sh0 host import --from xsh --path "D:/Xshell/Sessions"
+```
+
+- 只**读**源文件，绝不回写 `~/.ssh/config`。
+- 映射：`HostName→addr`、`User→user`、`Port→port`、`IdentityFile→私钥认证`
+  （`~/` 会自动展开成绝对路径）、`ProxyJump→proxy_jump`（取逗号分隔的最后一跳）。
+- `Host *` 这类通配段、含 `%h` 占位符的条目会被**跳过**并在回显里说明原因。
+- Xshell 只导入 `PROTOCOL=SSH` 的会话；口令字段一律不导入。
+- 与现有主机**重名时保留现有配置**，回显里标为 `=`。
 
 ---
 
