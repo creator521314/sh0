@@ -1416,10 +1416,8 @@ impl DaemonState {
 
         let results: Vec<Value> = hosts
             .iter()
-            .zip(slots.into_iter())
-            .map(|(h, o)| {
-                o.unwrap_or(BatchOutcome::Skipped).to_json(&h.name)
-            })
+            .zip(slots)
+            .map(|(h, o)| o.unwrap_or(BatchOutcome::Skipped).to_json(&h.name))
             .collect();
         let ok_n = results
             .iter()

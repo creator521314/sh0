@@ -1029,7 +1029,7 @@ async fn dispatch(
                         "csv" => batch_csv(&data),
                         _ => serde_json::to_string_pretty(&data).unwrap_or_default(),
                     };
-                    std::fs::write(&path, text).map_err(|e| {
+                    std::fs::write(path, text).map_err(|e| {
                         AiError::Other(format!("写导出文件失败 {}: {e}", path.display()))
                     })?;
                     if !ctx.quiet {
@@ -1037,7 +1037,7 @@ async fn dispatch(
                     }
                 }
 
-                let text = batch_text(&data, &out);
+                let text = batch_text(&data, out);
                 let failed = data.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
                 if failed > 0 {
                     // 部分失败：退出码非零，但整份结果仍在 data 里（§6.3）

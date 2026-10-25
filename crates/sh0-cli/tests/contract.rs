@@ -1383,8 +1383,7 @@ async fn broadcast_fans_out_to_all_sessions() {
         .call(methods::SESSION_OPEN, json!({ "host": "mockbox" }))
         .await
         .unwrap();
-    let b = fx
-        .call(methods::SESSION_OPEN, json!({ "host": "mockbox" }))
+    fx.call(methods::SESSION_OPEN, json!({ "host": "mockbox" }))
         .await
         .unwrap();
     let sa = a["id"].as_str().unwrap().to_string();
@@ -1595,7 +1594,7 @@ async fn batch_runs_in_parallel_within_budget() {
 /// 部分失败要如实汇总；fail_fast 时剩下的不再跑（FR-5.3 / FR-5.4）
 #[tokio::test]
 async fn batch_reports_partial_failure_and_fail_fast() {
-    let mut f = EchoShellFactory::with_exec(vec![ExecOutput {
+    let f = EchoShellFactory::with_exec(vec![ExecOutput {
         stdout: "ok".into(),
         stderr: String::new(),
         exit_code: Some(0),
