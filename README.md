@@ -7,9 +7,10 @@
 - **原生为 AI 设计**：所有能力以结构化子命令暴露，AI Agent 通过命令行即可操作远程主机，
   并受内置风险分级引擎约束。
 
-## 当前进度：M2「AI 接口 MVP」已完成 ★
+## 当前进度：M4「SFTP 落地」已完成 ★
 
-人类能用 TUI 日常运维，AI 能用 CLI 完整操作——**首个完整可交付点**。
+M2 让人类能用 TUI 运维、AI 能用 CLI 操作；**M4 补上了文件这一半**——双栏管理、
+传输队列，以及 AI 侧的 `upload/download`。
 
 | 能力 | 说明 |
 | --- | --- |
@@ -28,15 +29,19 @@
 | 确认机制 | 有人值守：TUI 弹确认框（y / n）；无人值守：返回 `needs_confirmation` + 一次性令牌，带令牌二次调用闭环 |
 | 审计 | SQLite 单文件，脱敏后落库（口令 / token / 私钥 / AKIA），输出可归档，默认保留 30 天 / 512 MB |
 | 凭据 | OS 钥匙串优先（Keychain / 凭据管理器 / Secret Service），回落主密码 vault（Argon2id + ChaCha20-Poly1305）；配置与数据目录**无明文** |
+| 双栏文件管理 | `F9` 切到文件视图：左本机 / 右远端，各自独立 cwd、排序与选中行；`Space` 标记多项、`F5` 传走、`F6` 改名、`F7` 建目录、`F8` 删除、`p` 改权限、`g` 跳路径。远端列目录复用会话已有的 SSH 连接，不新开 TCP |
+| 传输队列 | 每帧推进 256 KB 的块，底部面板显示进度条 / 速度 / 失败原因；单块失败自动重试 3 次（`R` 重排、`c` 清理）。二进制自动 base64，逐字节一致 |
+| AI 文件接口 | `ai file list/stat/read/write/mkdir/rm/rename/chmod/upload/download`，`--session`（复用连接）与 `--host`（一键式）两种用法；`upload/download` 同样分块搬运 |
 
-尚未实现（后续里程碑）：批量与广播（M3）、SFTP 文件管理（M4）、主题与键位自定义、
-导入导出、`keyboard-interactive` / 2FA（M5）。
+尚未实现（后续里程碑）：批量与广播（M3）、主题与键位自定义、导入导出、
+`keyboard-interactive` / 2FA（M5）；文件侧还差目录递归传输与断点续传（P2）。
 
 ## 发布
 
 | 标签 | 内容 |
 | --- | --- |
-| **v0.1**（当前） | M0~M2：上述全部能力。已在真实 Debian / aarch64 主机上端到端验证（会话、双模式 exec、屏幕、按键、风险三档、确认令牌闭环、审计回溯、AC-4~AC-8）。81 条测试 + clippy 零警告 |
+| v0.1 | M0~M2：终端、会话、AI 接口、风险引擎、审计。已在真实 Debian / aarch64 主机上端到端验证 |
+| **v0.2（当前工作区）** | M4：SFTP 文件管理（双栏 UI + 传输队列 + `ai file *`）。101 条测试 + clippy 零警告；真机回归待环境在线时补做 |
 
 构建：`cargo build --release`。跨平台产物与 CI 矩阵属 M5（W5.4），v0.1 阶段只保证
 Windows / macOS / Linux 能从源码构建。
@@ -174,7 +179,7 @@ docs/
 （`R` 重新排队、`c` 清理已完成）。二进制自动 base64。目录递归传输暂不支持。
 键位可在 `config.toml` 里改，`keymap = "vim"` / `"xshell"` 切换预设。
 
-## 已知限制（M2）
+## 已知限制
 
 - 复制走 OSC 52，需要父终端支持（Windows Terminal / iTerm2 / kitty / Alacritty 均支持）；
   不支持时内容仍会留在 `sh0` 内部，可用 `p` 粘回会话
@@ -187,3 +192,6 @@ docs/
   回显折行等极端形态下可能退化为部分输出（此时 `timeout=true`、退出码为 `null`），
   可切 `--mode exec` 规避
 - `known_hosts` 采用 TOFU：首次连接自动记录指纹，指纹变更时拒绝连接
+- 文件视图不支持目录递归传输与非空目录删除（要带进度的递归，属于传输队列的下一轮）
+- M4 的分块读写（`file.read_range` / `file.write_at`）已在内存替身上跑通逐字节一致性，
+  真机（OpenSSH）回归待环境在线时补做
