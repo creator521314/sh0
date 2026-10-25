@@ -1482,6 +1482,173 @@ async fn tui_broadcast_toggle_and_mark() {
 }
 
 // ---------------------------------------------------------------------------
+// M5 W5.1（先行）：鼠标操作主机树（FR-3.9）
+// ---------------------------------------------------------------------------
+
+/// 左键按下
+fn mouse_down(col: u16, row: u16) -> crossterm::event::MouseEvent {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn mouse_event(
+    kind: crossterm::event::MouseEventKind,
+    col: u16,
+    row: u16,
+    modifiers: crossterm::event::KeyModifiers,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers,
+    }
+}
+
+/// 鼠标点击主机树：单击选中、双击连接、滚轮滚动；点在树外不响应（FR-3.9）
+///
+/// 不真的渲染一帧——直接把布局矩形喂给 App（真实渲染时由 `draw_tree` 写入同一个字段）。
+#[tokio::test]
+async fn tui_mouse_click_selects_and_double_click_connects() {
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![
+            host_named("h1", &["prod"], &[]),
+            host_named("h2", &["prod"], &[]),
+        ],
+    )
+    .await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+
+    // 主机树内区画在 (1,2) 起、26×8：第 0 行是分组 prod，第 1/2 行是 h1 / h2
+    app.set_tree_area(ratatui::layout::Rect::new(1, 2, 26, 8));
+
+    // 1) 单击 h1 那一行：选中它，并把焦点交给树（省掉先按 Ctrl+B）
+    app.on_mouse(mouse_down(3, 3)).await.unwrap();
+    assert_eq!(app.tree_selection(), 1, "点击第 1 行应选中 h1");
+    assert!(app.focus_is_tree(), "点在树上应把焦点给树");
+    assert_eq!(app.tab_count(), 0, "单击不发起连接");
+
+    // 2) 同一行再点一次（双击）→ 发起连接
+    app.on_mouse(mouse_down(3, 3)).await.unwrap();
+    assert_eq!(app.tab_count(), 1, "双击应打开一个会话");
+
+    // 3) 滚轮在树区滚动选择
+    app.on_mouse(mouse_event(MouseEventKind::ScrollDown, 3, 3, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.tree_selection(), 2, "滚轮下滚应选中下一行");
+    app.on_mouse(mouse_event(MouseEventKind::ScrollUp, 3, 3, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.tree_selection(), 1, "滚轮上滚应回到上一行");
+
+    // 4) 点在树区之外（终端区）不该动选择
+    app.on_mouse(mouse_down(60, 5)).await.unwrap();
+    assert_eq!(app.tree_selection(), 1, "树区外的点击不该改变选中行");
+    assert_eq!(app.tab_count(), 1, "树区外的点击不该开会话");
+
+    // 5) 点在可见行之外（第 20 行 > 8 行高度）也不该越界
+    app.on_mouse(mouse_down(3, 20)).await.unwrap();
+    assert_eq!(app.tree_selection(), 1, "超出可见区的点击应忽略");
+}
+
+/// 命中测试用的矩形必须来自**真实渲染**，不是拍脑袋写死的常量：
+/// 渲染一帧后按渲染结果点击，验证 draw → 记录矩形 → 命中 这条链路是通的。
+#[tokio::test]
+async fn tui_mouse_hit_test_uses_the_rendered_tree_area() {
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![
+            host_named("h1", &["prod"], &[]),
+            host_named("h2", &["prod"], &[]),
+        ],
+    )
+    .await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+
+    // 未渲染过时矩形是全零，点击不该命中
+    assert_eq!(app.tree_area().height, 0, "还没画过就不该有命中区");
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+
+    // 左栏 28 列 + 边框 → 内区 x=1；上面让给标签栏一行 + 边框 → 内区 y=2
+    let area = app.tree_area();
+    assert_eq!((area.x, area.y), (1, 2), "渲染后应记下主机树内区: {area:?}");
+    assert!(area.height >= 3, "要装得下分组行 + 两台主机: {area:?}");
+
+    // 按渲染出来的坐标点第二行（h1）
+    app.on_mouse(mouse_down(area.x + 2, area.y + 1)).await.unwrap();
+    assert_eq!(app.tree_selection(), 1, "按渲染坐标点击应命中 h1");
+}
+
+/// Shift + 鼠标 = 把鼠标交回父终端（拖选复制要用），覆盖期间不接受点击
+#[tokio::test]
+async fn tui_mouse_shift_hands_back_to_terminal() {
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &["prod"], &[])],
+    )
+    .await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+    app.set_tree_area(ratatui::layout::Rect::new(1, 2, 26, 8));
+
+    // 先把捕获打开（测试环境 stdout 未必是终端，拿不到就算了，不强断言）
+    app.restore_mouse();
+    if app.mouse_captured() {
+        app.on_mouse(mouse_event(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            3,
+            3,
+            KeyModifiers::SHIFT,
+        ))
+        .await
+        .unwrap();
+        assert!(!app.mouse_captured(), "Shift + 鼠标后应挂起捕获");
+        assert_eq!(app.tree_selection(), 0, "挂起期间不该处理点击");
+    }
+
+    // 配置关掉鼠标时，一切鼠标事件都不处理
+    let mut cfg = AppConfig::default();
+    cfg.mouse = false;
+    let events2 = tokio::sync::mpsc::unbounded_channel().1;
+    let mut off = sh0_tui::App::new(fx.client.clone(), events2, fx.store.clone(), cfg);
+    off.set_tree_area(ratatui::layout::Rect::new(1, 2, 26, 8));
+    off.on_mouse(mouse_down(3, 3)).await.unwrap();
+    assert_eq!(off.tree_selection(), 0, "mouse=false 时点击应完全忽略");
+    assert!(!off.mouse_captured(), "mouse=false 时不该开捕获");
+}
+
+// ---------------------------------------------------------------------------
 // M3 W3.2 / W3.3：批量执行编排与结果汇总（FR-5.2 / FR-5.3）
 // ---------------------------------------------------------------------------
 

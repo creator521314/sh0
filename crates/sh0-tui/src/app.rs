@@ -1,10 +1,14 @@
 //! TUI 主应用：布局、键盘、事件循环（需求 FR-3.1~FR-3.4，W1.4 / W1.5 / W1.7）
 
+use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -33,6 +37,8 @@ use sh0_term::keymap::Action;
 
 const TREE_WIDTH: u16 = 28;
 const FRAME_MS: u64 = 16;
+/// 双击判定窗口（FR-3.9）：同一个主机行两次点击落在这个间隔内才算双击
+const DOUBLE_CLICK_MS: u128 = 400;
 /// 传输分块大小：每帧一块，256 KB 在"进度够细"和"往返次数"之间取平衡
 const CHUNK_SIZE: usize = 256 * 1024;
 /// 单块失败后的最大重试次数（FR-4.4）
@@ -232,6 +238,14 @@ pub struct App {
     broadcast: bool,
     /// 参与广播的会话 id；空 = 全部已打开会话
     broadcast_targets: std::collections::HashSet<String>,
+    /// 鼠标支持总开关（配置 `mouse`，FR-3.9）
+    mouse: bool,
+    /// 当前是否处于鼠标捕获态。Shift 拖选时会临时挂起，之后由按键事件恢复
+    mouse_captured: bool,
+    /// 最近一次绘制的主机树内区（鼠标命中测试要用；`draw` 是 `&self`，故用 `Cell`）
+    tree_area: Cell<Rect>,
+    /// 上一次点击 `(时刻, 行号)`，用于双击判定
+    last_click: Option<(Instant, usize)>,
 }
 
 impl App {
@@ -285,7 +299,142 @@ impl App {
             transfers: Vec::new(),
             broadcast: false,
             broadcast_targets: std::collections::HashSet::new(),
+            mouse: cfg.mouse,
+            mouse_captured: false,
+            tree_area: Cell::new(Rect::default()),
+            last_click: None,
         }
+    }
+
+    // --- 鼠标（FR-3.9）----------------------------------------------------
+    //
+    // 取舍：开启鼠标捕获后，父终端就收不到鼠标事件了，"按住左键拖选复制"会失效。
+    // 因此约定 **Shift + 鼠标 = 交回父终端**：检测到 Shift 修饰就挂起捕获，
+    // 之后的键盘事件再恢复。这样两种用法都保得住。
+
+    /// 鼠标事件入口。目前只处理左侧主机树：单击选中、双击连接、滚轮滚动。
+    pub async fn on_mouse(&mut self, m: MouseEvent) -> anyhow::Result<()> {
+        if !self.mouse {
+            return Ok(());
+        }
+        // Shift + 鼠标：用户想用系统自带的拖选复制，把事件交回父终端
+        if m.modifiers.contains(KeyModifiers::SHIFT) {
+            self.suspend_mouse();
+            return Ok(());
+        }
+        // 表单 / 确认弹窗 / 输入提示期间不接受点击——这些界面是键盘模态的，
+        // 点半下就可能把正在填的东西弄丢
+        if self.form.is_some()
+            || self.confirm.is_some()
+            || self.pending_delete.is_some()
+            || self.file_prompt.is_some()
+            || self.file_delete.is_some()
+        {
+            return Ok(());
+        }
+
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(idx) = self.tree_row_at(m.column, m.row) else {
+                    return Ok(());
+                };
+                // 点在树上就等于把焦点给树（省掉先按 Ctrl+B 这一步）
+                if self.focus != Focus::Tree {
+                    self.focus = Focus::Tree;
+                }
+                let now = Instant::now();
+                let is_double = matches!(self.last_click,
+                    Some((t, r)) if r == idx
+                        && now.duration_since(t).as_millis() < DOUBLE_CLICK_MS);
+                self.last_click = Some((now, idx));
+
+                self.tree.selected = idx;
+                if is_double {
+                    // 与回车完全同一条路径：分组行展开/折叠，主机行发起连接
+                    if let Some(h) = self.tree.activate() {
+                        self.open(&h.name).await?;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp if self.tree_row_at(m.column, m.row).is_some() => {
+                self.tree.move_selection(-1);
+            }
+            MouseEventKind::ScrollDown if self.tree_row_at(m.column, m.row).is_some() => {
+                self.tree.move_selection(1);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 屏幕坐标 → 主机树行号。不在树区、或落在可见行之外，返回 `None`。
+    fn tree_row_at(&self, col: u16, row: u16) -> Option<usize> {
+        if !self.show_tree {
+            return None;
+        }
+        let area = self.tree_area.get();
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if col < area.x
+            || col >= area.x.saturating_add(area.width)
+            || row < area.y
+            || row >= area.y.saturating_add(area.height)
+        {
+            return None;
+        }
+        let idx = (row - area.y) as usize;
+        // 渲染时只画 `inner.height` 行，超出部分点不到
+        let visible = self.tree.rows().len().min(area.height as usize);
+        (idx < visible).then_some(idx)
+    }
+
+    /// 挂起鼠标捕获（Shift 拖选用）。失败只告警——捕获态错了最多是鼠标不灵，
+    /// 不该让 TUI 崩掉。
+    fn suspend_mouse(&mut self) {
+        if self.mouse_captured {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+            self.mouse_captured = false;
+        }
+    }
+
+    /// 恢复鼠标捕获。挂起之后由任意键盘事件触发（捕获关着时收不到鼠标事件，
+    /// 只能借键盘回来）。
+    pub fn restore_mouse(&mut self) {
+        if self.mouse && !self.mouse_captured && execute!(io::stdout(), EnableMouseCapture).is_ok()
+        {
+            self.mouse_captured = true;
+        }
+    }
+
+    /// 测试与宿主注入布局用：告诉 App 主机树画在哪（避免为命中测试真的渲染一帧）
+    pub fn set_tree_area(&mut self, area: Rect) {
+        self.tree_area.set(area);
+    }
+
+    /// 最近一次渲染记下的主机树内区（测试用）
+    pub fn tree_area(&self) -> Rect {
+        self.tree_area.get()
+    }
+
+    /// 当前选中的主机树行号（测试用）
+    pub fn tree_selection(&self) -> usize {
+        self.tree.selected
+    }
+
+    /// 已打开的会话（标签）数量（测试用）
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// 焦点是否在主机树上（测试用）
+    pub fn focus_is_tree(&self) -> bool {
+        self.focus == Focus::Tree
+    }
+
+    /// 当前是否处于鼠标捕获态（测试用）
+    pub fn mouse_captured(&self) -> bool {
+        self.mouse_captured
     }
 
     /// 接入 daemon 里已经存在的会话（TUI 退出并不关闭会话）
@@ -366,6 +515,8 @@ impl App {
     // ---- 事件 ----
 
     async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // 鼠标捕获可能因为 Shift 拖选被挂起，按键回来时顺手恢复
+        self.restore_mouse();
         // 0) 风险确认弹窗优先：AI 在等一个"人"拍板，此刻任何键都属于这次决定
         if let Some(pc) = self.confirm.take() {
             // 强退键放行：令牌留给 daemon 5 分钟自然过期，人永远能退出 TUI
@@ -1671,7 +1822,7 @@ impl App {
 
     // ---- 渲染 ----
 
-    fn draw(&self, f: &mut ratatui::Frame) {
+    pub fn draw(&self, f: &mut ratatui::Frame) {
         if let Some(form) = &self.form {
             self.draw_form(f, form);
             // 确认弹窗优先级更高，可以压在表单之上
@@ -2034,6 +2185,8 @@ impl App {
             .border_style(Style::default().fg(border))
             .title(" 主机 ");
         let inner = block.inner(area);
+        // 记下主机树的内区，鼠标事件要拿它做命中测试
+        self.tree_area.set(inner);
         f.render_widget(block, area);
 
         let rows = self.tree.rows();
@@ -2288,6 +2441,10 @@ pub async fn run(
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // 鼠标捕获（FR-3.9）。关掉配置 `mouse` 就完全不碰鼠标，父终端照旧能拖选复制
+    if app.mouse && execute!(stdout, EnableMouseCapture).is_ok() {
+        app.mouse_captured = true;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -2296,6 +2453,8 @@ pub async fn run(
 
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    // 捕获态必须还原，否则退出后父终端的鼠标选择还是坏的
+    let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, LeaveAlternateScreen);
 
     result
@@ -2314,6 +2473,7 @@ async fn loop_inner(
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(key) => app.on_key(key).await?,
+                Event::Mouse(m) => app.on_mouse(m).await?,
                 Event::Resize(_, _) => {
                     let size = terminal.size()?;
                     let cols = size.width.saturating_sub(TREE_WIDTH).max(20);

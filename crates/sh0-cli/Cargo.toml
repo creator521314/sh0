@@ -36,3 +36,6 @@ dirs = { workspace = true }
 [dev-dependencies]
 ## 契约测试用假传输层驱动 daemon（NFR-10：不连真机验证 AI 接口）
 sh0-core = { workspace = true, features = ["mock"] }
+## TUI 契约测试要构造鼠标事件与布局矩形
+crossterm = { workspace = true }
+ratatui = { workspace = true }

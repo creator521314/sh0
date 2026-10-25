@@ -37,6 +37,10 @@ pub struct AppConfig {
     /// 键位预设：default / vim / xshell（需求 FR-3.6）
     #[serde(default = "default_keymap")]
     pub keymap: String,
+    /// 鼠标支持（需求 FR-3.9）：点击主机树选中 / 双击连接 / 滚轮滚动。
+    /// 关闭后鼠标事件全部交回父终端——想用系统自带的"拖选复制"时关掉它。
+    #[serde(default = "default_mouse")]
+    pub mouse: bool,
     /// 键位覆盖表，形如 `quit = "ctrl+x"`，优先级高于预设
     #[serde(default)]
     pub keys: HashMap<String, String>,
@@ -94,6 +98,9 @@ fn default_budget_mb() -> usize {
 }
 fn default_keymap() -> String {
     "default".to_string()
+}
+fn default_mouse() -> bool {
+    true
 }
 fn default_max_attempts() -> Option<u32> {
     Some(10)
@@ -242,6 +249,7 @@ impl Default for AppConfig {
             rows: default_rows(),
             memory_budget_mb: default_budget_mb(),
             keymap: default_keymap(),
+            mouse: default_mouse(),
             keys: HashMap::new(),
             reconnect: ReconnectConfig::default(),
             audit: AuditConfig::default(),
