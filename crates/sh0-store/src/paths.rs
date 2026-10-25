@@ -53,8 +53,18 @@ impl Paths {
     }
 
     /// 后台 daemon 的日志。后台进程没有控制台，不落盘的话出错时完全无迹可寻。
+    ///
+    /// 由 tracing 写入，按大小轮转（FR-8.5）：`daemon.log` / `.1` / `.2`……
     pub fn daemon_log(&self) -> PathBuf {
         self.runtime_dir.join("daemon.log")
+    }
+
+    /// 兜底日志：进程启动早期（tracing 还没接管）的 stdout/stderr 与 panic。
+    ///
+    /// 与 `daemon_log` 分开是因为这边是**覆盖写**、每次启动归零，
+    /// 而那边是追加 + 轮转。混在一个文件里会互相截断。
+    pub fn daemon_boot_log(&self) -> PathBuf {
+        self.runtime_dir.join("daemon.boot.log")
     }
 
     /// 审计库（SQLite 单文件，需求 FR-9.2：与配置同目录 → 放 data_dir）

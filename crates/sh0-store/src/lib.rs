@@ -7,6 +7,7 @@ pub mod config;
 pub mod creds;
 pub mod db;
 pub mod error;
+pub mod log;
 pub mod paths;
 
 pub use config::{AppConfig, AuditConfig, HostsFile, LimitsConfig, RiskConfig, Store, CONFIG_VERSION};
@@ -16,4 +17,5 @@ pub use db::{
     BatchRunSummary, redact,
 };
 pub use error::{Result, StoreError};
+pub use log::{LogConfig, RotatingFileWriter, prune_old_logs, rotate_file};
 pub use paths::{Paths, APP_NAME};

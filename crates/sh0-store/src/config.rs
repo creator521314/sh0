@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use sh0_core::{Host, HostSelector, RiskLevel};
+use crate::log::LogConfig;
 
 use crate::error::{Result, StoreError};
 use crate::paths::Paths;
@@ -59,6 +60,9 @@ pub struct AppConfig {
     /// 风险引擎（需求 FR-7.5）
     #[serde(default)]
     pub risk: RiskConfig,
+    /// daemon 日志轮转与保留（需求 FR-8.5）
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 /// 重连策略的可持久化形式
@@ -262,6 +266,7 @@ impl Default for AppConfig {
             audit: AuditConfig::default(),
             limits: LimitsConfig::default(),
             risk: RiskConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
