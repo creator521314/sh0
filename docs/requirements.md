@@ -163,6 +163,12 @@ FR-6.6 的 `ai file list/stat/read/write/mkdir/rm/rename/chmod/upload/download` 
 | FR-5.4 | 并发上限可配置（默认 16），避免打爆目标机 | P1 |
 | FR-5.5 | 批量执行同样受风险分级引擎约束 | P1 |
 
+**M3 进度**：FR-5.1（W3.1，广播开关 + 逐台勾选，`ai broadcast *`）、FR-5.2 / FR-5.4
+（W3.2，主机选择器 + 并发池默认 16 + 逐台超时 + `fail_fast`）、FR-5.3（W3.3，汇总表格 +
+`--out table/json/csv` 导出）、FR-5.5（W3.4，整批一次风险判定 + 一次速率配额 + 批量令牌）、
+OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回看）。
+30 台并发 16 跑 `df -h /` 的验收已由契约测试覆盖（总耗时远低于 10s）。
+
 ### FR-6 AI 接口（核心差异化）
 
 > **M2 已实现**：FR-6.1 ~ FR-6.5、FR-6.7 ~ FR-6.11（file 系列 FR-6.6 属 M4；MCP adapter FR-6.12 属 P2）。

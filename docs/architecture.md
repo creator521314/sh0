@@ -424,6 +424,52 @@ pub enum Event {   // daemon → 前端的推送
 `IpcClient::connect` / `serve` 是唯一接触网络细节的函数，换后端时协议层（`protocol.rs`）
 与上层代码完全不动。
 
+### 5.6 批量与广播（M3 / FR-5.x）
+
+从"单台精细操作"扩展到"一组机器统一动作"，两组 IPC 方法：`broadcast.*`、`batch.*`。
+
+**广播（FR-5.1）**
+
+- 会话名单存在 daemon 的 `Broadcast { enabled, targets }`，`targets` **空 = 全部已打开会话**
+  ——最常见的用法就是连上几台、打开广播、敲的命令同时生效，不必维护名单。
+- `broadcast.send` 在**广播未开启且未显式给名单时直接报错**：一次误触把命令打进所有机器
+  的代价太大，宁可让调用方多写一次 `broadcast.set`。
+- TUI：`Alt+B` 开关、`Alt+M` 逐台勾选/取消；状态栏常驻 `广播×N`，参与的标签带 `*` 前缀
+  ——开着广播时不该让人忘了自己开着。勾选同步到 daemon（**空名单也要发**，否则最后一个
+  勾选取消不掉）。
+- 审计只落**一条汇总**（`host_name = broadcast×N`）：TUI 广播时每次按键都会走到这里，
+  逐台记录会把审计表刷爆。
+
+**批量（FR-5.2 / FR-5.4）**
+
+- 选择器 `HostSelector { hosts, group, tag, all }`：三种来源取并集去重，
+  `all` 必须显式写出——"对全部机器执行"不能由"条件都没给"隐式触发。
+  显式名单里有找不到的名字 → **整批失败**：少跑一台比跑不了更难发现。
+- 并发：`tokio::Semaphore` 限并发（默认 16，`limits.batch_concurrency` 可配）+ `JoinSet`
+  收结果，**逐台独立超时**；结果按输入顺序归位（`JoinSet` 返回无序，靠 idx 回填）。
+- `fail_fast`：先失败的那台置位 `cancelled`，还在排队的任务直接标 `skipped`。
+- 模式：默认 **exec channel**（各建一次性连接，30 台并行才有意义）；
+  `--mode shell` 时改为一次性会话 + 哨兵截取，且**不进会话表**——
+  否则批量一次几十条临时会话会把 `session.list` 淹没。
+
+**风险与配额按整批算一次（FR-5.5）**
+
+- 多台主机的 `risk_cap` 取**最严**的那台（cap 越小越严，未配置视为不限制），
+  用一次 `assess().capped(min_cap)` 得出整批档位。
+- 速率配额整批扣 **1 次**：30 台各扣一次等于把批量判死。
+- confirm 档签发**批量令牌**（`PendingConfirm.batch`），带令牌重放时校验命令一致，
+  令牌同样一次性；错误信封的 `data` 里带回 `hosts` 清单，AI 知道这次会影响哪几台。
+
+**结果与历史（FR-5.3 / OQ-5）**
+
+- 返回 `{run_id, total, ok, failed, skipped, duration_ms, results[]}`，
+  每台带 `status: ok|failed|timeout|error|skipped` 与 `exit_code / duration_ms / error`。
+- AI 侧部分失败 → 退出码 1（`batch_partial`），**整份结果仍在 `data` 里**——
+  批量场景下"哪几台失败"比"失败了"重要得多。
+- `--out csv` 按 RFC4180 转义（Excel / `jq` 可直接读），`--output F` 落文件。
+- 落库：`batch_run` 存汇总、`batch_result` 存逐台，**同一事务**；`ai batch list/show` 回看，
+  明细里的 stdout 跟随 `archive_output` 策略（见 §8.2）。
+
 ---
 
 ## 6. AI 子命令契约
@@ -449,8 +495,11 @@ pub enum Event {   // daemon → 前端的推送
 | `sh0 ai file read (--session <id> \| --host X) --path P [--max-bytes N]` | 读远程文件 ✅ | P1 |
 | `sh0 ai file write (--session <id> \| --host X) --path P [--data S]` | 写远程文件（支持 `--encoding base64`） ✅ | P1 |
 | `sh0 ai file stat / mkdir / rm / rename / chmod` | 其余文件操作 ✅ | P1 |
-| `sh0 ai batch exec --hosts a,b,c --cmd <cmd> [--concurrency N]` | 批量执行并汇总 | P1 |
-| `sh0 ai broadcast send --sessions a,b --text T` | 广播输入 | P1 |
+| `sh0 ai batch exec (--hosts a,b \| --group G \| --tag T \| --all) --cmd C [--mode exec\|shell] [--concurrency N] [--fail-fast] [--out table\|json\|csv] [--output F]` | 批量执行并汇总 ✅ | P1 |
+| `sh0 ai batch list [--limit N]` | 最近 N 次批量执行 ✅ | P1 |
+| `sh0 ai batch show --run-id <id> [--out table\|json]` | 回看一次批量的逐台明细 ✅ | P1 |
+| `sh0 ai broadcast enable [--session S...]` / `disable` / `status` | 广播开关与参与名单 ✅ | P1 |
+| `sh0 ai broadcast send (--text T \| --keys K \| --hex H) [--session S...]` | 把同一份输入发给所有参与会话 ✅ | P1 |
 
 ### 6.2 输出规范
 
@@ -719,6 +768,23 @@ CREATE TABLE audit (
 CREATE INDEX idx_audit_ts ON audit(ts);
 CREATE INDEX idx_audit_host ON audit(host_name, ts);
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);       -- schema 版本等
+
+-- M3：批量执行历史（OQ-5）。一条 run 对多台 result，
+-- 列表页只查汇总，明细按 run_id 单独取。
+CREATE TABLE batch_run (
+  id INTEGER PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, ts TEXT NOT NULL,
+  trace_id TEXT, actor TEXT NOT NULL, command TEXT, mode TEXT,
+  risk TEXT, decision TEXT, concurrency INTEGER,
+  total INTEGER, ok INTEGER, failed INTEGER, skipped INTEGER, duration_ms INTEGER
+);
+CREATE TABLE batch_result (
+  id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, host TEXT NOT NULL,
+  status TEXT NOT NULL,                -- ok|failed|timeout|error|skipped
+  exit_code INTEGER, duration_ms INTEGER, truncated INTEGER, timeout INTEGER,
+  stdout TEXT, error TEXT              -- stdout 跟随 archive_output
+);
+CREATE INDEX idx_batch_run_ts ON batch_run(ts);
+CREATE INDEX idx_batch_result_run ON batch_result(run_id);
 ```
 
 - **脱敏先行**：写入前对 `key=value` 口令、`Authorization: Bearer/Basic`、PEM 私钥块、

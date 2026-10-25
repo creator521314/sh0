@@ -7,10 +7,10 @@
 - **原生为 AI 设计**：所有能力以结构化子命令暴露，AI Agent 通过命令行即可操作远程主机，
   并受内置风险分级引擎约束。
 
-## 当前进度：M4「SFTP 落地」已完成 ★
+## 当前进度：M3「批量与广播」+ M4「SFTP 落地」已完成 ★
 
-M2 让人类能用 TUI 运维、AI 能用 CLI 操作；**M4 补上了文件这一半**——双栏管理、
-传输队列，以及 AI 侧的 `upload/download`。
+M2 让人类能用 TUI 运维、AI 能用 CLI 操作；**M4 补上了文件这一半**（双栏管理、
+传输队列、`ai file *`），**M3 则从"单台"走到"一组机器"**——广播输入与批量执行。
 
 | 能力 | 说明 |
 | --- | --- |
@@ -23,7 +23,7 @@ M2 让人类能用 TUI 运维、AI 能用 CLI 操作；**M4 补上了文件这�
 | resize | 窗口变化同步到远端（`window_change`），本地网格同步重建 |
 | 按键编码 | 方向键 / F1-F12 / Ctrl-Alt 组合编码，键位映射三套预设（default / vim / xshell） |
 | 文本选择与剪贴板 | 选择模式（Alt+V）方向键扩选，Enter/y 复制，OSC 52 写父终端剪贴板 |
-| AI 接口 | `ai host list/show`、`ai session open/close/list/status/reconnect`、`ai exec run`、`ai screen read`、`ai input send`、`ai log query`、`ai ping`，默认纯文本 + `--json`，12 类语义化退出码 |
+| AI 接口 | `ai host list/show`、`ai session open/close/list/status/reconnect`、`ai exec run`、`ai screen read`、`ai input send`、`ai log query`、`ai batch exec/list/show`、`ai broadcast enable/disable/status/send`、`ai ping`，默认纯文本 + `--json`，12 类语义化退出码 |
 | 命令执行 | 双模式：`shell`（默认，复用交互 shell + 哨兵截取）/ `exec`（独立通道，stdout/stderr 分离）；一键式 `--host X --cmd Y` 自动建连→执行→关闭 |
 | 风险引擎 | 三档 `auto / confirm / deny`：shell 词法切分 + 分段判定 + 内置规则集 + 用户 `risk.toml` + 主机 `risk_cap`；默认档是 `confirm`（宁拦勿放） |
 | 确认机制 | 有人值守：TUI 弹确认框（y / n）；无人值守：返回 `needs_confirmation` + 一次性令牌，带令牌二次调用闭环 |
@@ -32,16 +32,19 @@ M2 让人类能用 TUI 运维、AI 能用 CLI 操作；**M4 补上了文件这�
 | 双栏文件管理 | `F9` 切到文件视图：左本机 / 右远端，各自独立 cwd、排序与选中行；`Space` 标记多项、`F5` 传走、`F6` 改名、`F7` 建目录、`F8` 删除、`p` 改权限、`g` 跳路径。远端列目录复用会话已有的 SSH 连接，不新开 TCP |
 | 传输队列 | 每帧推进 256 KB 的块，底部面板显示进度条 / 速度 / 失败原因；单块失败自动重试 3 次（`R` 重排、`c` 清理）。二进制自动 base64，逐字节一致 |
 | AI 文件接口 | `ai file list/stat/read/write/mkdir/rm/rename/chmod/upload/download`，`--session`（复用连接）与 `--host`（一键式）两种用法；`upload/download` 同样分块搬运 |
+| 广播输入 | `Alt+B` 开广播、`Alt+M` 逐台勾选；开着时终端输入同时发到所有参与会话，状态栏常驻 `广播×N`、参与的标签带 `*`。AI 侧 `ai broadcast enable/disable/status/send` |
+| 批量执行 | `ai batch exec (--hosts a,b \| --group G \| --tag T \| --all) --cmd C`：并发池（默认 16）+ 逐台超时，`--fail-fast` 提前收尾；结果汇总支持 `--out table/json/csv` 与 `--output` 导出。`ai batch list/show` 回看历史 |
+| 批量风险与配额 | 整批只判一次风险（多台 `risk_cap` 取最严）、只扣一次速率配额；confirm 档签发批量令牌，带令牌重放校验命令一致 |
 
-尚未实现（后续里程碑）：批量与广播（M3）、主题与键位自定义、导入导出、
-`keyboard-interactive` / 2FA（M5）；文件侧还差目录递归传输与断点续传（P2）。
+尚未实现（后续里程碑）：主题与键位自定义、导入导出、`keyboard-interactive` / 2FA（M5）；
+文件侧还差目录递归传输与断点续传（P2）；批量暂未提供 TUI 结果面板（当前走 AI 侧汇总）。
 
 ## 发布
 
 | 标签 | 内容 |
 | --- | --- |
 | v0.1 | M0~M2：终端、会话、AI 接口、风险引擎、审计。已在真实 Debian / aarch64 主机上端到端验证 |
-| **v0.2（当前工作区）** | M4：SFTP 文件管理（双栏 UI + 传输队列 + `ai file *`）。101 条测试 + clippy 零警告；真机回归待环境在线时补做 |
+| **v0.2（当前工作区）** | M3 + M4：批量与广播（`ai batch exec` + `ai broadcast *`）、SFTP 文件管理（双栏 UI + 传输队列 + `ai file *`）。112 条测试 + clippy 零警告；M4 已在真机（Debian 13 / aarch64）跑通 600 KB 分块上传下载逐字节一致 |
 
 构建：`cargo build --release`。跨平台产物与 CI 矩阵属 M5（W5.4），v0.1 阶段只保证
 Windows / macOS / Linux 能从源码构建。
@@ -165,6 +168,8 @@ docs/
 | Alt+C | 复制选区 |
 | Alt+R | 手动重连 |
 | Ctrl+L | 清屏 |
+| Alt+B | 广播开关（开着时输入同时发给所有参与会话） |
+| Alt+M | 勾选/取消当前会话参与广播 |
 | F9 | 终端视图 / 双栏文件视图切换 |
 
 选择模式内：方向键或 hjkl 扩选，Enter / y 复制，p 粘贴回会话，Esc 取消。
@@ -193,5 +198,7 @@ docs/
   可切 `--mode exec` 规避
 - `known_hosts` 采用 TOFU：首次连接自动记录指纹，指纹变更时拒绝连接
 - 文件视图不支持目录递归传输与非空目录删除（要带进度的递归，属于传输队列的下一轮）
-- M4 的分块读写（`file.read_range` / `file.write_at`）已在内存替身上跑通逐字节一致性，
-  真机（OpenSSH）回归待环境在线时补做
+- M4 的分块读写（`file.read_range` / `file.write_at`）已在真机（OpenSSH / Debian 13 aarch64）
+  跑通：600 KB 分 3 块上传下载，与本地文件逐字节一致
+- 批量执行目前只有 AI 侧入口（`ai batch exec`），TUI 里的批量结果面板尚未实现；
+  批量默认走 exec channel，`--mode shell` 会为每台临时建会话（不进会话表）
