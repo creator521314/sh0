@@ -12,8 +12,8 @@ sh0 是单个二进制，无运行时依赖（SQLite 与 crypto 已静态编译�
 
 ```bash
 cargo build                      # 调试构建
-cargo build --release            # 发布构建（Windows 下 rustc LTO 可能访问冲突，见 §11）
-cargo test --workspace           # 112 条测试
+cargo build --release            # 发布构建（已用 lto="thin"，见 §11）
+cargo test --workspace           # 145 条测试
 cargo clippy --workspace --all-targets   # 应零警告
 ```
 
@@ -90,6 +90,7 @@ rows = 32
 memory_budget_mb = 64        # 全部会话共享的 scrollback 内存预算，0 = 不限制
 keymap = "default"           # default | vim | xshell
 mouse = true                 # 鼠标：主机树单击选中 / 双击连接 / 滚轮滚动（false = 完全不用鼠标）
+theme = "dark"               # dark | light | high-contrast（high-contrast 给强光/弱视环境）
 
 [keys]                       # 单键覆盖，优先级高于预设
 quit = "ctrl+x"
@@ -106,6 +107,11 @@ enabled = true
 archive_output = true        # 归档命令输出
 retention_days = 30
 max_db_mb = 512              # 超限从最旧记录开始淘汰
+
+[log]                        # daemon 运行日志（与上面 [audit] 的审计库是两套策略）
+max_mb = 8                   # 单个 daemon.log 的大小上限，超出即切新文件
+keep = 3                     # 保留的历史文件个数（.1 ~ .keep）
+retention_days = 30          # 超期的历史文件直接删
 
 [limits]
 max_output_bytes = 65536     # 单次 exec 的 stdout+stderr 上限，超出截断并置 truncated
@@ -645,6 +651,7 @@ sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json
 | 改了 `config.toml` 没生效 | 只有 `limits.*` / `risk.*` / 主机清单是热生效；`term`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、`audit.enabled` 要重启 daemon。用 `sh0 config reload` 看提示 |
 | `Ctrl+Shift+P` 唤不出命令面板 | 部分终端不区分 `Ctrl+Shift+P` 与 `Ctrl+P`。在 `config.toml` 里覆盖：`[keys] command.palette = "alt+p"` |
 | 导入后主机连不上 | 检查导入的 `addr`/`user`；ssh config 里的 `%h` 占位符与通配段会被跳过（回显里标 `-`） |
+| 输入每个字符都变双份（`ls` → `llss`） | 按键的"松开"事件也被当成了一次输入。Windows 控制台每次按键会给按下 + 松开两个事件，已在事件循环过滤（`should_handle_key` 丢弃 `Release`）。若仍出现，确认用的是最新构建 |
 
 ---
 

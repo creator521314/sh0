@@ -74,7 +74,10 @@ clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 opt-level = "z"
-lto = true
+# thin LTO 而非 fat：本项目的体积大头在 russh/ring/rusqlite(bundled) 的固有代码，
+# fat LTO 相对 thin 只能再省几百 KB，却让 Windows 上的链接耗时从分钟级涨到十几分钟、
+# 内存峰值翻倍（曾因磁盘与内存压力导致构建中断）。thin 换取可复现的构建，体积仍达标。
+lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true

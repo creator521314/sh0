@@ -707,7 +707,7 @@ async fn dispatch(
             } => {
                 let store = sh0_store::Store::new()
                     .map_err(|e| AiError::Other(format!("无法读取配置: {e}")))?;
-                let source = sh0_store::ImportSource::parse(&from, path.as_deref())
+                let source = sh0_store::ImportSource::parse(from, path.as_deref())
                     .map_err(|e| AiError::Other(format!("导入来源无效: {e}")))?;
                 let report = source
                     .collect()

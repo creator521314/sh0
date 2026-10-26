@@ -3,9 +3,9 @@
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | 架构设计（Architecture Design）+ AI 接口契约 |
-| 版本 | v1.2（M3 批量与广播 + M4 SFTP 已落地） |
-| 日期 | 2026-10-25 |
-| 状态 | 已实现至 M4；M5 打磨项待设计 |
+| 版本 | v1.3（M5 打磨层已落地） |
+| 日期 | 2026-10-26 |
+| 状态 | 已实现至 M5（命令面板 / 主题 / 热重载 / 导入 / ProxyJump / 日志轮转，见 §5.7）；W5.7 端口转发与 W5.8 MCP adapter 两项 P2 未做 |
 | 上游文档 | `docs/requirements.md` |
 | 配套文档 | `docs/usage.md`（使用说明：怎么用）、`docs/development-plan.md`（里程碑进度） |
 
@@ -474,6 +474,78 @@ pub enum Event {   // daemon → 前端的推送
 - 落库：`batch_run` 存汇总、`batch_result` 存逐台，**同一事务**；`ai batch list/show` 回看，
   明细里的 stdout 跟随 `archive_output` 策略（见 §8.2）。
 
+### 5.7 打磨层（M5 / FR-1.9、FR-1.10、FR-3.6~3.8、FR-8.5、FR-9.3~9.5）
+
+这一节记的是 M5 新增的五块能力，以及各自**为什么这么做**的取舍。
+
+**命令面板（FR-3.8）**
+
+- 新增 `crates/sh0-tui/src/palette.rs`：动作清单是**手工维护的静态表**（`items()`，
+  带标题 / 分组 / 说明），过滤用简单的子串匹配（`filter()`），不引入模糊匹配库。
+  代价是覆盖不全——目前只有连接、断开、搜索、切换主题、切视图、批量等常用动作；
+  好处是每一项都能写清楚人话说明，且不与键位表产生第二份真相。
+- 键位归一有个坑：xterm 把 `Shift+G` 上报成大写 `Char('G')`，而键位表写的是 `shift+g`。
+  解决办法是 `sh0-term/src/keymap.rs` 末尾的自由函数 `normalize()`，在 `bind` / `get` /
+  `from_pairs` 三处统一折成小写再比对，否则三套预设里 `Ctrl+Shift+P` 在部分终端上会失灵。
+- 面板打开时鼠标事件一律忽略：面板占满主区，此时把点击透传给主机树会造成"点了别处
+  却连上了某台主机"的误操作。
+
+**多主题（FR-3.7）**
+
+- `config.theme` 一个字符串决定整套配色（`dark` 默认 / `light` / `high-contrast`，
+  见 `sh0-tui/src/theme.rs` 的 `THEME_NAMES`），主机树、标签栏、状态栏、边框共用一张配色表，
+  不提供逐项覆盖——逐项配色是配置膨胀的经典起点，收益却只在极少数人身上。
+- 命令面板里也列了"切换主题"这一类动作，改完 `config.toml` 由热重载生效，不用重启。
+
+**配置热重载（FR-9.3）**
+
+- daemon 侧把 `AppConfig` 放进 `RwLock`，每个请求进来的第一行取**快照**克隆
+  （`let cfg = self.cfg.read().unwrap().clone();`），而不是全程持锁。
+  这样配置变更不会和请求处理抢锁，也避免了一次请求里读到"半新半旧"的配置。
+- 检测方式是 **mtime 轮询（2 秒）**，没上 `notify` 之类的文件监视库：
+  Windows 上网络盘与部分编辑器的事件不可靠，轮询的实现成本更低，2 秒延迟对配置项可接受。
+- **不是所有键都能热生效**。`term.*`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、
+  `audit.enabled` 属于"必须重启"——它们影响终端网格的初始尺寸、已建连接的保活定时器等
+  已经固化的状态。这些键变更时日志明确提示需要重启，而不是假装生效。
+- IPC 新增 `CONFIG_RELOAD` / `CONFIG_GET`，`sh0 config reload` 走的就是前者。
+
+**主机导入（FR-1.10，仅导入侧）**
+
+- `crates/sh0-store/src/import.rs`：`ImportSource::SshConfig` 读 `~/.ssh/config`（含 `Include`
+  展开），`ImportSource::Xsh` 读 Xshell 会话文件并在 UTF-8 失败时回退 UTF-16。
+- 两条硬约束：**只读源文件**（绝不回写），**重名不覆盖**（按主机名去重，已存在则跳过）。
+  导入是"我已有几十台机器，别让我重录一遍"的场景，静默覆盖已有条目的风险远大于收益。
+- `--dry-run` 先报"会新增几台、跳过几台"，确认后再真跑。
+
+**ProxyJump（FR-1.9）**
+
+- 模型层：`Host` 加 `proxy_jump`（配置里写的名字，如 `bastion` 或内联 `user@host:port`），
+  运行时再加一个 `#[serde(skip)]` 的 `jump: Option<Box<Host>>`——**展开后的链只在内存里**，
+  不写回配置文件，避免下次加载时把已展开的链又当配置读一遍。
+- 传输层：`sh0-ssh` 的 `open_stream()` 返回 `ConnStream` 枚举，`Tcp` 是直连，
+  `Jump` 持有 `channel_open_direct_tcpip` 出来的 `Pin<Box<ChannelStream>>`。
+  上层拿到的还是同一个 `ConnStream`，跳板与否对调用方透明。
+- 这里踩过一个栈溢出：最初 `find_host` → `with_jump_chain` → `find_host` 相互递归，
+  深度计数每轮归零，配置里若写成环就无限展开。修法是把"只查库不展开"的 `lookup_host`
+  拆出来，链内递归一律调 `lookup_host`，展开只在最外层做一次，并加 `MAX_JUMP_DEPTH = 5`。
+
+**日志轮转（FR-8.5）**
+
+- 运行日志与**审计库保留是两套策略**，别混：审计库是 SQLite（30 天 / 512 MB，超限时删最旧
+  并 VACUUM，见 §8.2）；这里的轮转针对 `data_dir/daemon.log`（按 `log.max_mb` 切分、保留
+  `log.keep` 个，再按 `log.retention_days` 清理过期文件）。
+- 启动期日志单独走 `daemon.boot.log`，**覆盖写**不参与轮转：启动阶段的问题要看的是"这一次"
+  的完整过程，跟历史混在一起反而添乱；而 `daemon.log` 由 tracing 追加写并轮转。
+
+**体积与启动（NFR-1 / NFR-2）**
+
+- release profile：`opt-level="z"` + `lto="thin"` + `codegen-units=1` + `panic="abort"` + `strip`。
+- 实测（Windows x86_64 / MSVC，2026-10-26）：二进制 **5.77 MB**（上限 15 MB），
+  `sh0 --version` 冷启动 **82~94 ms**（首次冷页 182 ms，上限 200 ms）。
+- 选 thin 而非 fat LTO 是实测后的决定：本项目的体积大头是 russh / ring / rusqlite(bundled)
+  的固有代码，fat 只能再省几百 KB，却让 Windows 链接耗时涨到十几分钟、内存峰值翻倍
+  （曾直接把构建拖挂）。
+
 ---
 
 ## 6. AI 子命令契约
@@ -484,6 +556,7 @@ pub enum Event {   // daemon → 前端的推送
 | --- | --- | --- |
 | `sh0 ai host list [--group G] [--tag T]` | 列出主机（不含凭据） | P0 |
 | `sh0 ai host show <selector>` | 单台主机详情 | P0 |
+| `sh0 ai host import --from ssh\|xsh [--path P] [--dry-run]` | 导入既有主机（只读源文件、重名不覆盖）✅ | P2 |
 | `sh0 ai session list` | 列出活跃会话 | P0 |
 | `sh0 ai session open --host <sel> [--cols N] [--rows N]` | 打开会话，返回 session_id | P0 |
 | `sh0 ai session close --session <id>\|--all` | 关闭会话 | P0 |
@@ -881,6 +954,29 @@ M2 契约测试正是被这个点卡住过（症状：daemon 明明已应答，�
 2. **EOF 后要再等一会儿收退出码**。OpenSSH 常在 `EOF` 之后才补发 `exit-status`，
    见 EOF 就退出会让 `exit_code` 恒为 `null`（AC-4 直接不成立）。现在 EOF 后多等 500ms。
 
+### 9.5 按键事件必须过滤 `Release`（否则输入全是双份）
+
+crossterm 0.26 起 `KeyEvent` 带 `kind`：`Press` / `Repeat` / `Release`。**Windows 控制台
+（以及开启 kitty 键盘协议的终端）会为每次按键同时产生按下与松开两个事件**。事件循环若
+不加区分地 `Event::Key(k) => on_key(k)`，每个字符就会被发往远端两遍——敲 `ls` 变成 `llss`
+（M5 收尾时在 Windows 上实测到的现象）。
+
+修法是在事件循环入口丢掉 `Release`、保留 `Press` 与 `Repeat`（长按属于真实的重复输入）：
+
+```rust
+pub fn should_handle_key(key: KeyEvent) -> bool {
+    !matches!(key.kind, KeyEventKind::Release)
+}
+```
+
+两点值得记：
+
+- 过滤放在**事件循环**而不是 `on_key` 里，是因为 `on_key` 只是"处理一个按键"的动作，
+  是否算一次输入属于事件源的语义。
+- 为了让回归测试测到生产代码本身，过滤被抽成 `sh0_tui::dispatch_key(app, key)`，
+  测试投递"按下 + 松开"成对事件，断言输入框里是 `web` 而不是 `wweebb`——
+  若只在测试里复制一遍同样的 if，这类 bug 下次还会溜过去。
+
 ---
 
 ## 10. 测试策略
@@ -931,3 +1027,9 @@ M2 契约测试正是被这个点卡住过（症状：daemon 明明已应答，�
 | `sh0-store`（§8） | FR-8、FR-9、FR-1.6 |
 | 批量编排（`sh0-core/batch`） | FR-5.1~FR-5.5 |
 | `sh0-ssh` trait 化（§5.1） | NFR-9、NFR-10、约束 4 |
+| 命令面板 / 主题（§5.7） | FR-3.7、FR-3.8 |
+| 配置热重载与 `sh0 config`（§5.7） | FR-9.3、FR-9.4、FR-9.5 |
+| 主机导入（§5.7） | FR-1.10（导入侧） |
+| ProxyJump（§5.7） | FR-1.9 |
+| 日志轮转（§5.7） | FR-8.5 |
+| release profile（§5.7） | NFR-1、NFR-2 |

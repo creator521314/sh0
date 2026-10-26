@@ -7,10 +7,12 @@
 - **原生为 AI 设计**：所有能力以结构化子命令暴露，AI Agent 通过命令行即可操作远程主机，
   并受内置风险分级引擎约束。
 
-## 当前进度：M3「批量与广播」+ M4「SFTP 落地」已完成 ★
+## 当前进度：M5「打磨与发布」已完成 ★
 
-M2 让人类能用 TUI 运维、AI 能用 CLI 操作；**M4 补上了文件这一半**（双栏管理、
-传输队列、`ai file *`），**M3 则从"单台"走到"一组机器"**——广播输入与批量执行。
+M2 让人类能用 TUI 运维、AI 能用 CLI 操作；M3 走到"一组机器"（广播 + 批量），
+M4 补上文件这一半（双栏 + 传输队列）；**M5 是把"能用"打磨成"好用、可信、可分发出去"**：
+命令面板与多主题、配置热重载、`sh0 config` 子命令、`~/.ssh/config` 与 Xshell 会话导入、
+ProxyJump 跳板机、daemon 日志轮转，以及体积/启动的实测把关。
 
 | 能力 | 说明 |
 | --- | --- |
@@ -36,20 +38,36 @@ M2 让人类能用 TUI 运维、AI 能用 CLI 操作；**M4 补上了文件这�
 | 广播输入 | `Alt+B` 开广播、`Alt+M` 逐台勾选；开着时终端输入同时发到所有参与会话，状态栏常驻 `广播×N`、参与的标签带 `*`。AI 侧 `ai broadcast enable/disable/status/send` |
 | 批量执行 | `ai batch exec (--hosts a,b \| --group G \| --tag T \| --all) --cmd C`：并发池（默认 16）+ 逐台超时，`--fail-fast` 提前收尾；结果汇总支持 `--out table/json/csv` 与 `--output` 导出。`ai batch list/show` 回看历史 |
 | 批量风险与配额 | 整批只判一次风险（多台 `risk_cap` 取最严）、只扣一次速率配额；confirm 档签发批量令牌，带令牌重放校验命令一致 |
+| 命令面板 | `Ctrl+Shift+P` 唤出，列出全部可用动作（连接 / 断开 / 搜索 / 主题 / 视图 / 批量…），输入即过滤，`Enter` 执行、`Esc` 取消；三套键位预设都绑了同一个组合键 |
+| 多主题 | `theme = "dark" \| "light" \| "high-contrast"`（默认 `dark`，`high-contrast` 是纯黑白 + 高饱和语义色，给强光 / 弱视环境）；主机树 / 标签栏 / 状态栏 / 边框共用一套配色表，命令面板里也能随时切 |
+| 配置热重载 | 改完 `config.toml` 约 2 秒内 daemon 自动生效，无需重启；少数必须重启的键（`term.*`、`keepalive_secs` 等）在日志里明确提示；`sh0 config reload` 也可手动触发 |
+| `sh0 config` 子命令 | `show` 看全部、`get/set` 改单键（`set` 顺带做键名与取值校验）、`reload` 通知 daemon、`check` 体检（路径可写 / 键位合法 / 主机重名） |
+| 主机导入 | `sh0 host import --from ssh`（读 `~/.ssh/config`，含 `Include` 展开）或 `--from xsh`（Xshell 会话文件，UTF-16 自动回退）；**只读不写源**、重名不覆盖，先用 `--dry-run` 预览 |
+| ProxyJump 跳板机 | 主机配 `proxy_jump = "bastion"` 或内联 `"user@host:port"`，可链式；走 `direct-tcpip` 通道，链深上限 5（`MAX_JUMP_DEPTH`）防成环 |
+| 日志轮转 | `daemon.log` 按 `max_mb` 切分并保留 `keep` 个，再按 `retention_days` 清旧；启动期的 `daemon.boot.log` 单独覆盖写，不参与轮转 |
+| AI 接口 | `sh0 ai host import --from ssh\|xsh [--path P] [--dry-run]`（与 CLI 同一套参数 `--json` 输出）；配置读写只提供 CLI 侧的 `sh0 config`，AI 侧不暴露——改配置属于人类运维动作 |
 
-尚未实现（后续里程碑）：主题与键位自定义、导入导出、`keyboard-interactive` / 2FA（M5）；
+尚未实现（后续里程碑）：`keyboard-interactive` / 2FA 交互应答（M5 清单里的 P2 项）；
+端口转发（本地 / 远程 / SOCKS，W5.7）与 MCP adapter（W5.8）两项 P2 未做；
 文件侧还差目录递归传输与断点续传（P2）；批量暂未提供 TUI 结果面板（当前走 AI 侧汇总）；
-鼠标目前只覆盖左侧主机树，点击标签栏与拖拽分隔条仍在 M5。
+鼠标仍只覆盖左侧主机树，点击标签栏与拖拽分隔条未做。
 
 ## 发布
 
 | 标签 | 内容 |
 | --- | --- |
 | v0.1 | M0~M2：终端、会话、AI 接口、风险引擎、审计。已在真实 Debian / aarch64 主机上端到端验证 |
-| **v0.2（当前工作区）** | M3 + M4：批量与广播（`ai batch exec` + `ai broadcast *`）、SFTP 文件管理（双栏 UI + 传输队列 + `ai file *`）。112 条测试 + clippy 零警告；M4 已在真机（Debian 13 / aarch64）跑通 600 KB 分块上传下载逐字节一致 |
+| v0.2 | M3 + M4：批量与广播（`ai batch exec` + `ai broadcast *`）、SFTP 文件管理（双栏 UI + 传输队列 + `ai file *`）。112 条测试 + clippy 零警告；M4 已在真机（Debian 13 / aarch64）跑通 600 KB 分块上传下载逐字节一致 |
+| **v0.3（当前工作区）** | M5 打磨：命令面板与多主题、配置热重载与 `sh0 config`、主机导入（ssh / xsh）、ProxyJump 跳板机、daemon 日志轮转。**145 条契约测试 + clippy 零警告** |
 
-构建：`cargo build --release`。跨平台产物与 CI 矩阵属 M5（W5.4），v0.1 阶段只保证
-Windows / macOS / Linux 能从源码构建。
+**实测（Windows x86_64 / MSVC，2026-10-26）**：release 二进制 **5.77 MB**（NFR-1 上限 15 MB）、
+`sh0 --version` 冷启动 **82~94 ms**（首次冷页 182 ms，NFR-2 上限 200 ms）。
+TUI 首帧依赖真实终端，未纳入自动化测量，仍属手工验证项。
+
+构建：`cargo build --release`。release profile 为 `opt-level="z"` + `lto="thin"` +
+`codegen-units=1` + `panic="abort"` + `strip`；这里选 thin 而非 fat LTO 是刻意的——
+fat 只能再省几百 KB，却让 Windows 链接从分钟级涨到十几分钟且内存峰值翻倍（曾据此中断构建）。
+跨平台 CI 产物矩阵仍未提供（W5.4 只做了本机体积/启动把关）。
 
 ## 快速开始
 

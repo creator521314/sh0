@@ -3,9 +3,9 @@
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | 需求说明书（Requirements Specification） |
-| 版本 | v1.1（M3 / M4 需求已实现） |
-| 日期 | 2026-10-25 |
-| 状态 | 已实现至 M4（FR-4.1~4.4、FR-5.1~5.5、FR-6.6 已交付） |
+| 版本 | v1.2（M5 打磨需求已实现） |
+| 日期 | 2026-10-26 |
+| 状态 | 已实现至 M5（FR-1.9 / FR-1.10、FR-3.6~FR-3.8、FR-8.5、FR-9.3~FR-9.5 已交付；W5.7 端口转发与 W5.8 MCP adapter 两项 P2 未做） |
 | 项目代号 | sh0（命令行名，可重命名） |
 | 实现语言 | Rust |
 | 相关文档 | `docs/architecture.md`（架构设计与 AI 接口契约）、`docs/usage.md`（使用说明） |
@@ -98,8 +98,8 @@
 | FR-1.6 | 凭据存储：优先 OS 钥匙串（Keychain / DPAPI / Secret Service）；不可用或用户选择时回落到主密码加密的本地文件（ChaCha20-Poly1305 + Argon2 派生） | P0 |
 | FR-1.7 | 配置文件中**绝不出现明文密码**；私钥只存路径，不内嵌内容 | P0 |
 | FR-1.8 | 首次连接指纹确认（trust-on-first-use），指纹存于 `known_hosts` 兼容格式 | P0 |
-| FR-1.9 | 跳板机 / ProxyJump 链式连接 | P1 |
-| FR-1.10 | 配置导入导出（Xshell `.xsh`、OpenSSH `~/.ssh/config` 只读导入） | P2 |
+| FR-1.9 | 跳板机 / ProxyJump 链式连接 ✅ | P1 |
+| FR-1.10 | 配置导入导出（Xshell `.xsh`、OpenSSH `~/.ssh/config` 只读导入）✅ 导入侧已交付（W5.3），导出未做 | P2 |
 
 ### FR-2 会话与终端
 
@@ -127,9 +127,9 @@
 | FR-3.3 | 标签栏支持多会话切换、关闭、重命名，超过宽度时横向滚动 | P0 |
 | FR-3.4 | 状态栏显示：当前主机、连接状态、延迟、当前风险档位、AI 调用活跃数 | P0 |
 | FR-3.5 | 键盘优先：所有操作有快捷键，支持 vim 风格导航（hjkl / gg / G） | P0 |
-| FR-3.6 | 键位映射可配置（TOML），内置 `default` / `vim` / `xshell` 三套预设 | P1 |
-| FR-3.7 | 主题与配色可配置（TOML 配色表） | P1 |
-| FR-3.8 | 命令面板（Ctrl+Shift+P）列出全部可用动作 | P1 |
+| FR-3.6 | 键位映射可配置（TOML），内置 `default` / `vim` / `xshell` 三套预设 ✅ | P1 |
+| FR-3.7 | 主题与配色可配置（TOML 配色表）✅ `dark`（默认）/ `light` / `high-contrast` 三套，命令面板内可切换 | P1 |
+| FR-3.8 | 命令面板（Ctrl+Shift+P）列出全部可用动作 ✅ | P1 |
 | FR-3.9 | 鼠标支持（点击切换标签、选中文本、拖拽分隔条）——**部分实现**：主机树单击选中 / 双击连接 / 滚轮滚动 / `Shift+鼠标` 交回终端 ✅；点击标签、终端内选中文本、拖拽分隔条待 M5 | P1 |
 | FR-3.10 | SFTP 面板作为终端主区的可切换视图（同一区域切换，不弹新窗） | P1 |
 
@@ -208,9 +208,14 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 
 ### FR-8 日志与审计
 
-> **M2 已实现**：FR-8.1 ~ FR-8.5 全部。SQLite 单文件（`data_dir/audit.db`），写入前脱敏
-> （password / token / Bearer / PEM 私钥 / AKIA / `-p<值>`），默认开启输出归档、保留 30 天、
+> **M2 已实现**：FR-8.1 ~ FR-8.4。SQLite 单文件（`data_dir/audit.db`），写入前脱敏
+> （password / token / Bearer / PEM 私钥 / AKIA / `-p<值>`、URL 里的 `token=`、引号包裹的值、
+> `--password=` 形式），默认开启输出归档、保留 30 天、
 > 体积上限 512 MB（超限删最旧并 VACUUM）；`sh0 ai log query` 为查询接口（TUI 检索面板属 M5）。
+>
+> **M5 补充**：FR-8.5 的**运行日志**轮转由 W5.5 落地——`daemon.log` 按 `log.max_mb` 切分、
+> 保留 `log.keep` 个，再按 `log.retention_days` 清理过期文件；启动期的 `daemon.boot.log`
+> 独立覆盖写，不参与轮转。注意这与上面的**审计库**保留（30 天 / 512 MB）是两套策略。
 
 | 编号 | 需求 | 优先级 |
 | --- | --- | --- |
@@ -226,9 +231,9 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 | --- | --- | --- |
 | FR-9.1 | 主机/分组/偏好配置：TOML，位于平台配置目录（Linux `~/.config/sh0/`、macOS `~/Library/Application Support/sh0/`、Windows `%APPDATA%\sh0\`） | P0 |
 | FR-9.2 | 日志与审计：SQLite 单文件，与配置同目录 | P0 |
-| FR-9.3 | 配置热重载：文件变更时自动生效，不打断已有会话 | P1 |
-| FR-9.4 | `sh0 config` 子命令：打印路径、校验、迁移版本 | P1 |
-| FR-9.5 | 配置文件版本号，跨版本自动迁移 | P1 |
+| FR-9.3 | 配置热重载：文件变更时自动生效，不打断已有会话 ✅ daemon 每 2 秒比对 mtime；`term.*`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、`audit.enabled` 属"必须重启"键，改动时日志提示 | P1 |
+| FR-9.4 | `sh0 config` 子命令：打印路径、校验、迁移版本 ✅ `show` / `get` / `set` / `reload` / `check` | P1 |
+| FR-9.5 | 配置文件版本号，跨版本自动迁移 ✅ 版本号字段已在，未知键保留不丢；尚未出现过破坏性改版，故迁移逻辑只做了"保留未知键 + 缺键填默认"这一层 | P1 |
 
 ---
 
@@ -236,8 +241,8 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 
 | 编号 | 类别 | 需求 |
 | --- | --- | --- |
-| NFR-1 | 体积 | release 单二进制 ≤ 15 MB（strip + LTO + `opt-level="z"` 或 `"s"`）；不静态链接 OpenSSL |
-| NFR-2 | 启动 | 冷启动到 TUI 首帧 ≤ 200 ms（不含联网） |
+| NFR-1 | 体积 | release 单二进制 ≤ 15 MB（strip + LTO + `opt-level="z"` 或 `"s"`）；不静态链接 OpenSSL。**实测 ✅**：Windows x86_64 / MSVC 下 **5.77 MB**（2026-10-26，release profile 用 `lto="thin"`） |
+| NFR-2 | 启动 | 冷启动到 TUI 首帧 ≤ 200 ms（不含联网）。**实测（近似）✅**：`sh0 --version` 冷启动 82~94 ms（首次冷页 182 ms）；TUI 首帧依赖真实终端，未自动化测量 |
 | NFR-3 | 内存 | 常驻 daemon 空闲 ≤ 30 MB；50 会话规模下 ≤ 200 MB（滚动缓冲受配额约束） |
 | NFR-4 | 并发 | 单机稳定支撑 100 个会话；批量执行并发上限可配，默认 16 |
 | NFR-5 | 跨平台 | Linux (glibc/musl)、macOS (x86_64/aarch64)、Windows 10+ (x86_64) 行为一致；Windows 端键鼠与 Unicode 渲染正常 |
@@ -282,7 +287,7 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 | M2 | AI 接口 MVP ✅ | `ai` 子命令全套（session/exec/screen/input/log）、`--json` 输出、风险三档引擎、审计入库、凭据无明文 |
 | M3 | 批量与广播 ✅ | 广播输入、批量执行与结果汇总视图、批量风险与配额、批量历史持久化 |
 | M4 | SFTP 落地 ✅ | 双栏文件管理、传输队列、进度与重试、`ai file *` 全套子命令 |
-| M5 | 打磨 | 主题/键位配置、命令面板、导入导出、性能与体积优化、跨平台 CI 产物 |
+| M5 | 打磨 ✅ | 命令面板与多主题、配置热重载与 `sh0 config`、主机导入（ssh / xsh）、ProxyJump 跳板机、日志轮转、体积与启动实测（5.77 MB / ~90 ms）；端口转发与 MCP adapter 两项 P2 未做，跨平台 CI 产物未提供 |
 
 ---
 

@@ -76,10 +76,12 @@ impl ImportSource {
                     // Xshell 常用 UTF-16 存会话，UTF-8 读会失败
                     Err(_) => {
                         let bytes = std::fs::read(path)?;
+                        // as_chunks 直接给出 &[[u8; 2]]，末尾凑不成一对的字节丢掉（同 chunks_exact）
+                        let (units, _rem) = bytes.as_chunks::<2>();
                         let text = String::from_utf16_lossy(
-                            &bytes
-                                .chunks_exact(2)
-                                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            &units
+                                .iter()
+                                .map(|c| u16::from_le_bytes(*c))
                                 .collect::<Vec<u16>>(),
                         );
                         let mut r = ImportReport::default();
@@ -165,7 +167,9 @@ pub fn parse_ssh_config(text: &str) -> ImportReport {
             "identityfile" => block.identity = Some(expand_home(value)),
             "proxyjump" => {
                 // `ProxyJump a,b` 在 ssh 里表示逐跳转发；我们要的是最后一跳
-                let last = value.split(',').filter(|s| !s.trim().is_empty()).last();
+                // 从后往前找第一段非空的：等价于"取最后一跳"，还顺带避开
+                // filter().next_back() 那种先全扫再回头的写法
+                let last = value.rsplit(',').map(str::trim).find(|s| !s.is_empty());
                 block.proxy_jump = last
                     .map(|s| s.trim())
                     .filter(|s| *s != "none")
@@ -349,10 +353,11 @@ pub fn import_xsh_dir(dir: &Path) -> std::io::Result<ImportReport> {
             Err(_) => {
                 // Xshell 会用 UTF-16 存会话文件，读成 UTF-8 会有一堆 NUL
                 let bytes = std::fs::read(&path)?;
+                let (units, _rem) = bytes.as_chunks::<2>();
                 String::from_utf16_lossy(
-                    &bytes
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    &units
+                        .iter()
+                        .map(|c| u16::from_le_bytes(*c))
                         .collect::<Vec<u16>>(),
                 )
             }
@@ -392,10 +397,10 @@ fn current_user() -> String {
 /// 所以导入时必须先展开，否则导入完就连接不上。
 fn expand_home(p: &str) -> PathBuf {
     let p = p.trim_matches('"');
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(p)
 }
