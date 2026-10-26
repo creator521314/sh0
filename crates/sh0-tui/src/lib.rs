@@ -11,7 +11,7 @@ pub mod palette;
 pub mod render;
 pub mod theme;
 
-pub use app::{App, Focus, Tab, View, run};
+pub use app::{App, Focus, Tab, View, dispatch_key, run, should_handle_key};
 pub use hosts::{HostForm, HostTree};
 pub use palette::Palette;
 pub use theme::Theme;

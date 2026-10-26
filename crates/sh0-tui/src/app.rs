@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -2662,7 +2662,7 @@ async fn loop_inner(
         // 1) 本地输入
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
-                Event::Key(key) => app.on_key(key).await?,
+                Event::Key(key) => dispatch_key(app, key).await?,
                 Event::Mouse(m) => app.on_mouse(m).await?,
                 Event::Resize(_, _) => {
                     let size = terminal.size()?;
@@ -2703,6 +2703,27 @@ async fn loop_inner(
         terminal.draw(|f| app.draw(f))?;
 
         tokio::time::sleep(Duration::from_millis(FRAME_MS)).await;
+    }
+}
+
+/// 这个按键事件要不要交给 `on_key` 处理。
+///
+/// Windows 控制台为**每一次**按键产生两个事件：按下（`Press`）与松开（`Release`）
+/// （启用 kitty 键盘协议的终端同理）。不过滤的话，每个字符都会被发往远端两遍——
+/// 敲 `ls` 会变成 `llss`。长按产生的 `Repeat` 是真实的重复输入，要保留。
+pub fn should_handle_key(key: KeyEvent) -> bool {
+    !matches!(key.kind, KeyEventKind::Release)
+}
+
+/// 事件循环里处理按键的**唯一入口**：先按 `should_handle_key` 过滤，再交给 `App::on_key`。
+///
+/// 单独抽出来是因为"过滤"如果只写在事件循环里，测试就只能复制一遍同样的 if，
+/// 那样测不到生产代码走的是不是同一条路。
+pub async fn dispatch_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+    if should_handle_key(key) {
+        app.on_key(key).await
+    } else {
+        Ok(())
     }
 }
 

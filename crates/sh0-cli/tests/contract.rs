@@ -2119,6 +2119,58 @@ async fn tui_command_palette_esc_cancels() {
     assert!(!app.palette_open(), "关闭后按键不该重新唤出面板");
 }
 
+/// 回归：Windows 控制台（与开了 kitty 键盘协议的终端）为**每次**按键都给 Press + Release
+/// 两个事件。不过滤 Release，敲 `ls` 就会往远端发两遍变成 `llss`。
+/// 这里走的是事件循环用的同一个入口 `dispatch_key`，不是在测试里复制一遍 if。
+#[tokio::test]
+async fn tui_key_release_event_is_not_treated_as_input() {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("web-01", &["prod"], &[])],
+    )
+    .await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(
+        fx.client.clone(),
+        events,
+        fx.store.clone(),
+        AppConfig::default(),
+    );
+
+    // 先单独钉住过滤规则：Release 掉，Press / Repeat 留（Repeat 是长按，属于真实重复）
+    let mut k = key(KeyCode::Char('l'), KeyModifiers::NONE);
+    assert!(sh0_tui::should_handle_key(k), "Press 应当处理");
+    k.kind = KeyEventKind::Repeat;
+    assert!(sh0_tui::should_handle_key(k), "Repeat（长按）应当处理");
+    k.kind = KeyEventKind::Release;
+    assert!(!sh0_tui::should_handle_key(k), "Release 必须丢弃");
+
+    // 再走真实分发路径：命令面板当输入框，按下 + 松开成对投递
+    sh0_tui::dispatch_key(
+        &mut app,
+        key(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+    )
+    .await
+    .unwrap();
+    assert!(app.palette_open(), "面板应先打开");
+
+    for c in "web".chars() {
+        let mut down = key(KeyCode::Char(c), KeyModifiers::NONE);
+        down.kind = KeyEventKind::Press;
+        let mut up = key(KeyCode::Char(c), KeyModifiers::NONE);
+        up.kind = KeyEventKind::Release;
+        sh0_tui::dispatch_key(&mut app, down).await.unwrap();
+        sh0_tui::dispatch_key(&mut app, up).await.unwrap();
+    }
+    assert_eq!(
+        app.palette_input(),
+        "web",
+        "松开事件不该被算作一次输入（否则会变成 wweebb）"
+    );
+}
+
 /// 键位归一：终端对 Shift+G 上报大写 G，配置里写的却是 `shift+g`
 #[test]
 fn keymap_matches_uppercase_shift_letters() {
