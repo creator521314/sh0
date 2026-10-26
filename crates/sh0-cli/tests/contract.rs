@@ -1655,6 +1655,241 @@ async fn tui_mouse_shift_hands_back_to_terminal() {
 }
 
 // ---------------------------------------------------------------------------
+// M5 补完：标签栏点击、分隔条拖拽、终端滚轮与拖选（FR-3.9 剩下的三项）
+// ---------------------------------------------------------------------------
+
+/// 直接构造 App（几个鼠标用例都要，省得每个都抄一遍）
+fn new_app(fx: &Fixture) -> sh0_tui::App {
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    sh0_tui::App::new(fx.client.clone(), events, fx.store.clone(), AppConfig::default())
+}
+
+/// 标签栏：点主体切会话、点 × 关会话、中键也关（FR-3.9）
+#[tokio::test]
+async fn tui_mouse_click_tab_switches_and_closes() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("web-01", &[], &[]), host_named("db-01", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+    app.open("web-01").await.unwrap();
+    app.open("db-01").await.unwrap();
+    assert_eq!(app.tab_count(), 2);
+
+    let bar = Rect::new(0, 0, 80, 1);
+    app.set_tab_bar_area(bar);
+    let hits = app.tab_hits(bar);
+    assert_eq!(hits.len(), 2, "两个标签都该有命中区");
+    assert_eq!(app.active_tab(), 1, "刚打开的会话是当前的");
+
+    // 1) 点第一个标签的主体 → 切回去
+    app.on_mouse(mouse_down(hits[0].body.0 + 1, 0)).await.unwrap();
+    assert_eq!(app.active_tab(), 0, "点标签主体应切到该会话");
+    // 再点第二个
+    let hits = app.tab_hits(bar);
+    app.on_mouse(mouse_down(hits[1].body.0 + 1, 0)).await.unwrap();
+    assert_eq!(app.active_tab(), 1);
+
+    // 2) 点第一个标签的 × → 关掉它（当前会话仍是 db-01，active 要往回退一格）
+    let hits = app.tab_hits(bar);
+    assert!(hits[0].close.1 > hits[0].close.0, "开了鼠标就该画出 ×");
+    app.on_mouse(mouse_down(hits[0].close.0, 0)).await.unwrap();
+    assert_eq!(app.tab_count(), 1, "点 × 应关掉那个会话");
+    assert_eq!(app.active_tab(), 0);
+
+    // 3) 中键关标签：浏览器习惯
+    app.open("web-01").await.unwrap();
+    let hits = app.tab_hits(bar);
+    app.on_mouse(mouse_event(
+        MouseEventKind::Down(MouseButton::Middle),
+        hits[0].body.0 + 1,
+        0,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(app.tab_count(), 1, "中键应关掉被点的那个标签");
+}
+
+/// 拖拽主机树与主区之间的分隔条（FR-3.9）
+#[tokio::test]
+async fn tui_mouse_drag_divider_resizes_tree() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![host_named("h1", &[], &[])])
+        .await;
+    let mut app = new_app(&fx);
+    // 主机树宽 28，主区从 x=28 开始
+    app.set_main_area(Rect::new(28, 1, 52, 20));
+    let w0 = app.tree_width();
+
+    // 按在缝上（树的最右一列）
+    app.on_mouse(mouse_down(w0 - 1, 5)).await.unwrap();
+    // 拖到 40 列
+    app.on_mouse(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        40,
+        5,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.tree_width() > w0, "往右拖应该把树拖宽：{w0} → {}", app.tree_width());
+
+    // 松手：把新尺寸同步下去（没有会话也不会崩）
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        40,
+        5,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+
+    // 往回拖：不能把终端挤到没地方显示
+    let w1 = app.tree_width();
+    app.on_mouse(mouse_down(w1 - 1, 5)).await.unwrap();
+    app.on_mouse(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        0,
+        5,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(
+        app.tree_width() >= 12,
+        "树再窄也得留 12 列，现在是 {}",
+        app.tree_width()
+    );
+}
+
+/// 滚轮在终端区回看历史（FR-3.9 的滚动一侧）
+#[tokio::test]
+async fn tui_mouse_wheel_scrolls_terminal() {
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![host_named("h1", &[], &[])])
+        .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    // 喂够多的行，让 scrollback 里真有东西可回看
+    let lines: Vec<&str> = (0..80).map(|_| "some output line").collect();
+    app.feed_lines(0, &lines);
+    assert_eq!(app.scroll_offset(), 0, "刚连上应该贴着最新输出");
+
+    app.set_main_area(Rect::new(28, 1, 52, 20));
+    app.on_mouse(mouse_event(MouseEventKind::ScrollUp, 40, 5, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.scroll_offset(), 3, "滚轮向上 = 往回看 3 行");
+
+    app.on_mouse(mouse_event(MouseEventKind::ScrollDown, 40, 5, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.scroll_offset(), 0, "滚轮向下应回到最新");
+}
+
+/// 终端里拖选文本，松手即复制（FR-3.9）
+#[tokio::test]
+async fn tui_mouse_drag_selects_text_and_copies() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![host_named("h1", &[], &[])])
+        .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    app.feed_lines(0, &["hello world", "second line"]);
+    // 主区从 (0,1) 开始：屏幕 y=1 就是视图第 0 行
+    app.set_main_area(Rect::new(0, 1, 80, 20));
+
+    // 从 "hello world" 的 h 拖到 o（列 0 → 4）
+    app.on_mouse(mouse_down(0, 1)).await.unwrap();
+    app.on_mouse(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        4,
+        1,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.selection().is_some(), "拖动时应有选区");
+
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        4,
+        1,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.selection().is_none(), "松手复制完该清掉选区");
+    assert_eq!(app.last_copy(), "hello", "拖到哪就该复制到哪");
+}
+
+/// 文件视图：点条目选中并把焦点给那一栏，双击进入目录（FR-3.9 的鼠标一侧）
+#[tokio::test]
+async fn tui_mouse_click_file_row_selects_and_double_click_enters() {
+    use ratatui::layout::Rect;
+
+    let (fx, _fs) = fixture_sftp().await;
+    let events = tokio::sync::mpsc::unbounded_channel().1;
+    let mut app = sh0_tui::App::new(fx.client.clone(), events, fx.store.clone(), AppConfig::default());
+    app.open("mockbox").await.unwrap();
+    app.enter_files().await;
+    assert!(app.in_file_view());
+
+    // 左栏 (1,2) 起、右栏 (41,2) 起，各自 38×18 的内区
+    let left = Rect::new(1, 2, 38, 18);
+    let right = Rect::new(41, 2, 38, 18);
+    app.set_pane_areas(left, right);
+
+    // 点右栏第 0 行（logs）：选中它，并把焦点从默认的左栏挪到右栏
+    assert!(app.file_focus_is_left(), "默认焦点在左栏");
+    app.remote_files(); // 右栏开局已列过目录
+    app.on_mouse(mouse_down(right.x + 2, right.y)).await.unwrap();
+    assert!(!app.file_focus_is_left(), "点右栏应把焦点给右栏");
+    assert_eq!(app.remote_files().selected, 0);
+
+    // 双击同一个条目 → 进入目录（与回车同一条路）
+    app.on_mouse(mouse_down(right.x + 2, right.y)).await.unwrap();
+    assert_eq!(app.remote_files().cwd, "/tmp/logs", "双击目录应进入");
+}
+
+/// 只是点一下（没拖动）不该往剪贴板里塞东西
+#[tokio::test]
+async fn tui_mouse_click_without_drag_clears_selection() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![host_named("h1", &[], &[])])
+        .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    app.feed_lines(0, &["hello world"]);
+    app.set_main_area(Rect::new(0, 1, 80, 20));
+
+    app.on_mouse(mouse_down(0, 1)).await.unwrap();
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        0,
+        1,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.selection().is_none(), "没拖动就不该留下选区");
+    assert!(app.last_copy().is_empty(), "没拖动就不该复制出东西");
+}
+
+// ---------------------------------------------------------------------------
 // M3 W3.2 / W3.3：批量执行编排与结果汇总（FR-5.2 / FR-5.3）
 // ---------------------------------------------------------------------------
 

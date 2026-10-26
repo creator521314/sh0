@@ -37,7 +37,14 @@ use crate::theme::Theme;
 use sh0_core::sftp::FileEntry;
 use sh0_term::keymap::Action;
 
-const TREE_WIDTH: u16 = 28;
+/// 主机树默认宽度。可以被鼠标拖分隔条改掉，所以是"默认"而不是固定值
+const DEFAULT_TREE_WIDTH: u16 = 28;
+/// 主机树最窄拖到多少：再窄就显示不下 `[名字]` 了
+const MIN_TREE_WIDTH: u16 = 12;
+/// 终端区至少留这么多列，否则远端 shell 的折行会乱成一团
+const MIN_TERM_COLS: u16 = 20;
+/// 滚轮一次滚几行。比整页慢、比单行快，手感接近一般终端
+const WHEEL_LINES: isize = 3;
 const FRAME_MS: u64 = 16;
 /// 双击判定窗口（FR-3.9）：同一个主机行两次点击落在这个间隔内才算双击
 const DOUBLE_CLICK_MS: u128 = 400;
@@ -149,6 +156,43 @@ pub struct Selection {
     pub head: (usize, usize),
 }
 
+/// 标签栏上一个标签的命中区（FR-3.9 的"点击切换标签"）
+///
+/// 标签栏只有一行高，所以只需要横向区间。分两段：
+/// 主体点一下切过去，`×` 那一段点一下关掉。
+#[derive(Debug, Clone, Copy)]
+pub struct TabHit {
+    pub idx: usize,
+    /// 标签主体 `[起, 止)`，点这里 = 切换会话
+    pub body: (u16, u16),
+    /// 关闭按钮 `[起, 止)`，点这里 = 关闭会话。没开鼠标时是空区间
+    pub close: (u16, u16),
+}
+
+/// 渲染一段标签要的东西：文本、是否当前标签，外加它的命中区
+#[derive(Debug, Clone)]
+pub struct TabSegment {
+    pub hit: TabHit,
+    pub label: String,
+    pub active: bool,
+}
+
+/// 点在标签栏的哪儿：主体（切换）还是 `×`（关闭）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabTarget {
+    Switch(usize),
+    Close(usize),
+}
+
+/// 鼠标拖拽中：要么在拖分隔条，要么在终端里框选文本
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drag {
+    /// 拖主机树与主区之间的分隔条
+    Divider,
+    /// 终端内框选（`selection.anchor` 已经在按下时定好）
+    Select,
+}
+
 /// 待人工确认的 exec 请求（daemon 广播 confirm.requested，FR-7.4）
 ///
 /// 会话型调用带 session  id，一键式 `--host` 调用不带——所以确认事件
@@ -246,6 +290,17 @@ pub struct App {
     mouse_captured: bool,
     /// 最近一次绘制的主机树内区（鼠标命中测试要用；`draw` 是 `&self`，故用 `Cell`）
     tree_area: Cell<Rect>,
+    /// 主机树当前宽度（鼠标拖分隔条可调，FR-3.9）
+    tree_width: u16,
+    /// 最近一次绘制的标签栏矩形（命中区由它现场算，见 `tab_hits`）
+    tab_bar_area: Cell<Rect>,
+    /// 最近一次绘制的主区（终端或文件视图）——滚轮与拖选的命中区
+    main_area: Cell<Rect>,
+    /// 最近一次绘制的文件双栏内区（鼠标点条目要用）
+    pane_left_area: Cell<Rect>,
+    pane_right_area: Cell<Rect>,
+    /// 鼠标正在拖什么：`None` 表示没在拖
+    drag: Option<Drag>,
     /// 上一次点击 `(时刻, 行号)`，用于双击判定
     last_click: Option<(Instant, usize)>,
     /// 命令面板（FR-3.6 / W5.1）；Some 时拦截全部按键
@@ -309,6 +364,12 @@ impl App {
             mouse: cfg.mouse,
             mouse_captured: false,
             tree_area: Cell::new(Rect::default()),
+            tree_width: DEFAULT_TREE_WIDTH,
+            tab_bar_area: Cell::new(Rect::default()),
+            main_area: Cell::new(Rect::default()),
+            pane_left_area: Cell::new(Rect::default()),
+            pane_right_area: Cell::new(Rect::default()),
+            drag: None,
             last_click: None,
             palette: None,
             theme_name: cfg.theme.clone(),
@@ -345,6 +406,53 @@ impl App {
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // 1) 分隔条：压在主机树与主区的缝上，最容易误触，优先级给最高
+                if self.on_divider(m.column, m.row) {
+                    self.drag = Some(Drag::Divider);
+                    return Ok(());
+                }
+                // 2) 标签栏：点主体切过去，点 × 关掉（FR-3.9）
+                if let Some(target) = self.tab_hit_at(m.column, m.row) {
+                    match target {
+                        TabTarget::Switch(i) => self.switch_to_tab(i).await?,
+                        TabTarget::Close(i) => self.close_tab(i).await?,
+                    }
+                    return Ok(());
+                }
+                // 3) 主区终端：按下即定选区起点，拖到哪选到哪，松手复制
+                if self.view == View::Terminal
+                    && let Some(cell) = self.view_cell_at(m.column, m.row)
+                {
+                    self.selection = Some(Selection {
+                        anchor: cell,
+                        head: cell,
+                    });
+                    self.drag = Some(Drag::Select);
+                    self.focus = Focus::Terminal;
+                    return Ok(());
+                }
+                // 4) 文件视图：点一下选中并把焦点给这一栏，双击进入（与回车同一条路）
+                if self.view == View::Files
+                    && let Some((is_left, idx)) = self.file_row_at(m.column, m.row)
+                {
+                    self.file_focus_left = is_left;
+                    let pane = if is_left {
+                        &mut self.files_left
+                    } else {
+                        &mut self.files_right
+                    };
+                    pane.selected = idx;
+                    let now = Instant::now();
+                    let is_double = matches!(self.last_click,
+                        Some((t, r)) if r == idx
+                            && now.duration_since(t).as_millis() < DOUBLE_CLICK_MS);
+                    self.last_click = Some((now, idx));
+                    if is_double {
+                        self.file_enter().await;
+                    }
+                    return Ok(());
+                }
+                // 5) 主机树（M5 先行项的行为不变）
                 let Some(idx) = self.tree_row_at(m.column, m.row) else {
                     return Ok(());
                 };
@@ -366,14 +474,233 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollUp if self.tree_row_at(m.column, m.row).is_some() => {
-                self.tree.move_selection(-1);
+            // 中键关标签：浏览器的习惯，比精准点那个 × 省事
+            MouseEventKind::Down(MouseButton::Middle) => {
+                if let Some(target) = self.tab_hit_at(m.column, m.row) {
+                    let i = match target {
+                        TabTarget::Switch(i) | TabTarget::Close(i) => i,
+                    };
+                    self.close_tab(i).await?;
+                }
             }
-            MouseEventKind::ScrollDown if self.tree_row_at(m.column, m.row).is_some() => {
-                self.tree.move_selection(1);
+            MouseEventKind::Drag(MouseButton::Left) => match self.drag {
+                Some(Drag::Divider) => self.drag_divider_to(m.column),
+                Some(Drag::Select) => {
+                    if let (Some(cell), Some(sel)) =
+                        (self.view_cell_at(m.column, m.row), self.selection.as_mut())
+                    {
+                        sel.head = cell;
+                    }
+                }
+                None => {}
+            },
+            MouseEventKind::Up(MouseButton::Left) => {
+                match self.drag {
+                    // 拖的过程中只改本地布局，松手才把新尺寸同步给所有会话，
+                    // 否则每一帧都要发一轮 resize，拖一下就是几十次 IPC
+                    Some(Drag::Divider) => {
+                        let (c, r) = self.term_size;
+                        self.on_resize(c, r).await?;
+                    }
+                    Some(Drag::Select) => self.finish_mouse_select().await?,
+                    None => {}
+                }
+                self.drag = None;
             }
+            MouseEventKind::ScrollUp => self.on_wheel(WHEEL_LINES, m.column, m.row).await,
+            MouseEventKind::ScrollDown => self.on_wheel(-WHEEL_LINES, m.column, m.row).await,
             _ => {}
         }
+        Ok(())
+    }
+
+    async fn on_wheel(&mut self, delta: isize, col: u16, row: u16) {
+        // 主机树：滚选中行（M5 先行项的行为）。
+        // delta 的符号沿用终端那套（正 = 往回看/往上），所以树里要反过来用
+        if self.tree_row_at(col, row).is_some() {
+            if delta > 0 {
+                self.tree.move_selection(-1);
+            } else {
+                self.tree.move_selection(1);
+            }
+            return;
+        }
+        if !self.in_main(col, row) {
+            return;
+        }
+        match self.view {
+            View::Terminal => {
+                // 正 delta = 往回看历史（scroll_offset 变大）
+                self.scroll_active(delta);
+            }
+            View::Files => self.file_move(if delta > 0 { -1 } else { 1 }),
+        }
+    }
+
+    /// 标签栏命中测试（只有一行高，故只需比对 x 区间）
+    fn tab_hit_at(&self, col: u16, row: u16) -> Option<TabTarget> {
+        let area = self.tab_bar_area.get();
+        if row != area.y || area.width == 0 {
+            return None;
+        }
+        self.tab_hits(area)
+            .into_iter()
+            .find_map(|h| {
+                if h.body.0 <= col && col < h.body.1 {
+                    Some(TabTarget::Switch(h.idx))
+                } else if h.close.0 <= col && col < h.close.1 {
+                    Some(TabTarget::Close(h.idx))
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// 是否落在主区（终端 / 文件视图）
+    fn in_main(&self, col: u16, row: u16) -> bool {
+        let a = self.main_area.get();
+        a.width > 0
+            && a.height > 0
+            && col >= a.x
+            && col < a.x.saturating_add(a.width)
+            && row >= a.y
+            && row < a.y.saturating_add(a.height)
+    }
+
+    /// 屏幕坐标 → 终端视图坐标 `(行, 列)`。
+    ///
+    /// 终端内容是从主区左上角 (0,0) 开始画的，而 `extract_view_text` 用的也是视图坐标，
+    /// 所以这里**不用**扣滚动偏移——滚动已经在 `view_lines()` 里体现过了。
+    fn view_cell_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        if !self.in_main(col, row) {
+            return None;
+        }
+        let a = self.main_area.get();
+        Some((
+            (row.saturating_sub(a.y)) as usize,
+            (col.saturating_sub(a.x)) as usize,
+        ))
+    }
+
+    /// 文件视图命中测试：屏幕坐标 → `(是否左栏, 条目索引)`。
+    ///
+    /// 底部那一行是状态（条目数 / 排序 / 错误），点它不算点条目。
+    fn file_row_at(&self, col: u16, row: u16) -> Option<(bool, usize)> {
+        if self.view != View::Files {
+            return None;
+        }
+        for (is_left, area) in [
+            (true, self.pane_left_area.get()),
+            (false, self.pane_right_area.get()),
+        ] {
+            if area.width == 0 || area.height == 0 {
+                continue;
+            }
+            if col < area.x
+                || col >= area.x.saturating_add(area.width)
+                || row < area.y
+                || row >= area.y.saturating_add(area.height)
+            {
+                continue;
+            }
+            let pane = if is_left {
+                &self.files_left
+            } else {
+                &self.files_right
+            };
+            // 条目区比内区矮一行（最后一行留给状态）
+            let rows = area.height.saturating_sub(1) as usize;
+            let line = (row - area.y) as usize;
+            if line >= rows {
+                continue;
+            }
+            let idx = pane.scroll + line;
+            if idx < pane.entries.len() {
+                return Some((is_left, idx));
+            }
+        }
+        None
+    }
+
+    /// 是否点在主机树与主区之间的分隔条上
+    fn on_divider(&self, col: u16, row: u16) -> bool {
+        if !self.show_tree {
+            return false;
+        }
+        let a = self.main_area.get();
+        if a.height == 0 || row < a.y || row >= a.y.saturating_add(a.height) {
+            return false;
+        }
+        let seam = self.tree_width;
+        col == seam.saturating_sub(1) || col == seam
+    }
+
+    /// 拖动分隔条：跟着鼠标改树宽，同时把腾出来/占掉的列数记进终端尺寸
+    fn drag_divider_to(&mut self, col: u16) {
+        // 总宽 = 当前终端列数 + 当前树宽（拖拽中终端还没同步，两者相加仍是窗口宽度）
+        let total = self.term_size.0.saturating_add(self.tree_width);
+        let max_w = total
+            .saturating_sub(MIN_TERM_COLS)
+            .max(MIN_TREE_WIDTH);
+        let want = col.saturating_add(1).max(MIN_TREE_WIDTH);
+        let w = want.clamp(MIN_TREE_WIDTH, max_w);
+        let delta = w as isize - self.tree_width as isize;
+        self.tree_width = w;
+        self.term_size.0 =
+            (self.term_size.0 as isize - delta).clamp(MIN_TERM_COLS as isize, total as isize) as u16;
+    }
+
+    /// 鼠标框选松手：真拖过就复制，只点一下就当取消
+    async fn finish_mouse_select(&mut self) -> anyhow::Result<()> {
+        let Some(sel) = self.selection else {
+            return Ok(());
+        };
+        if sel.anchor == sel.head {
+            // 没有拖动：清掉选区就好，别往剪贴板里塞一个字符
+            self.selection = None;
+            return Ok(());
+        }
+        self.copy_selection().await
+    }
+
+    /// 切到第 idx 个标签，并把焦点给终端——点标签的人就是要去打字
+    async fn switch_to_tab(&mut self, idx: usize) -> anyhow::Result<()> {
+        if idx >= self.tabs.len() {
+            return Ok(());
+        }
+        // 点标签的人是要去操作那个会话：终端视图给终端，文件视图给文件区
+        self.focus = if self.view == View::Files {
+            Focus::Files
+        } else {
+            Focus::Terminal
+        };
+        if idx == self.active {
+            return Ok(());
+        }
+        self.active = idx;
+        self.tab_changed().await;
+        Ok(())
+    }
+
+    /// 关掉第 idx 个标签（键盘的 Ctrl+W 只关当前，鼠标能点任意一个）
+    async fn close_tab(&mut self, idx: usize) -> anyhow::Result<()> {
+        if idx >= self.tabs.len() {
+            return Ok(());
+        }
+        let tab = self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if idx < self.active {
+            self.active -= 1;
+        } else if idx == self.active && self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        let _ = self
+            .client
+            .call(methods::SESSION_CLOSE, json!({ "session": tab.id }))
+            .await;
+        self.notice = format!("已关闭 {}", tab.name);
+        self.tab_changed().await;
         Ok(())
     }
 
@@ -425,6 +752,67 @@ impl App {
     /// 最近一次渲染记下的主机树内区（测试用）
     pub fn tree_area(&self) -> Rect {
         self.tree_area.get()
+    }
+
+    /// 测试与宿主注入布局用：标签栏画在哪
+    pub fn set_tab_bar_area(&mut self, area: Rect) {
+        self.tab_bar_area.set(area);
+    }
+
+    /// 测试与宿主注入布局用：主区（终端 / 文件视图）画在哪
+    pub fn set_main_area(&mut self, area: Rect) {
+        self.main_area.set(area);
+    }
+
+    /// 测试与宿主注入布局用：文件双栏的内区画在哪
+    pub fn set_pane_areas(&mut self, left: Rect, right: Rect) {
+        self.pane_left_area.set(left);
+        self.pane_right_area.set(right);
+    }
+
+    /// 文件视图里焦点是否在左栏（测试用）
+    pub fn file_focus_is_left(&self) -> bool {
+        self.file_focus_left
+    }
+
+    /// 当前活动标签的序号（测试用）
+    pub fn active_tab(&self) -> usize {
+        self.active
+    }
+
+    /// 主机树当前宽度（测试用；拖分隔条会改它）
+    pub fn tree_width(&self) -> u16 {
+        self.tree_width
+    }
+
+    /// 当前选区（测试用）
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// 测试与宿主注入用：往第 idx 个会话的屏幕塞几行（模拟 daemon 推送输出）。
+    ///
+    /// 契约测试跑不起真终端，滚动与选区这类"依赖屏幕上真有内容"的行为
+    /// 只能这样喂进去——否则 scrollback 是空的，测什么都是 0。
+    pub fn feed_lines(&mut self, idx: usize, lines: &[&str]) {
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            for l in lines {
+                tab.screen.feed(format!("{l}\r\n").as_bytes());
+            }
+        }
+    }
+
+    /// 最近一次复制的内容（测试用）
+    pub fn last_copy(&self) -> &str {
+        &self.last_copy
+    }
+
+    /// 当前标签回看了多少行（测试用；0 表示贴着最新输出）
+    pub fn scroll_offset(&self) -> usize {
+        self.tabs
+            .get(self.active)
+            .map(|t| t.screen.scroll_offset())
+            .unwrap_or(0)
     }
 
     /// 当前选中的主机树行号（测试用）
@@ -1959,13 +2347,15 @@ impl App {
         let body = if self.show_tree {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(TREE_WIDTH), Constraint::Min(1)])
+                .constraints([Constraint::Length(self.tree_width), Constraint::Min(1)])
                 .split(chunks[1]);
             self.draw_tree(f, cols[0]);
             cols[1]
         } else {
             chunks[1]
         };
+        // 主区矩形留给鼠标：滚轮滚终端、拖选文本都要拿它做命中测试
+        self.main_area.set(body);
 
         if self.view == View::Files {
             self.draw_files(f, body);
@@ -2202,6 +2592,11 @@ impl App {
             .border_style(Style::default().fg(border))
             .title(pane.title(host));
         let inner = block.inner(area);
+        // 记下这一栏的内区，鼠标点条目要用（draw 是 &self，故用 Cell）
+        match pane.side {
+            crate::files::Side::Local => self.pane_left_area.set(inner),
+            crate::files::Side::Remote => self.pane_right_area.set(inner),
+        }
         f.render_widget(block, area);
 
         let width = inner.width as usize;
@@ -2327,9 +2722,13 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_tabs(&self, f: &mut ratatui::Frame, area: Rect) {
-        let mut spans: Vec<Span> = Vec::new();
-        let mut used = 0usize;
+    /// 标签栏布局：把每个标签算成"文本 + 命中区"。
+    ///
+    /// 抽成纯函数是为了让命中测试与渲染共用**同一份**计算——
+    /// 两边各算一遍的话，稍微改一下间距就会出现"看着点在标签上却没反应"。
+    pub fn tab_segments(&self, area: Rect) -> Vec<TabSegment> {
+        let mut out: Vec<TabSegment> = Vec::new();
+        let mut x = area.x;
         for (i, tab) in self.tabs.iter().enumerate() {
             // 广播开着时给参与的标签加个 *：一眼能看出命令会打到哪几台
             let mark = if self.broadcast && self.in_broadcast(&tab.id) {
@@ -2337,20 +2736,52 @@ impl App {
             } else {
                 " "
             };
-            let label = format!(" {}{}{} ", mark, state_dot(tab.state), tab.name);
-            if used + label.chars().count() > area.width as usize {
-                spans.push(Span::raw(format!(" +{}", self.tabs.len() - i)));
+            // 关闭按钮只在开了鼠标时才画：没鼠标就没法点，白占两列
+            let (close_txt, close_w) = if self.mouse { ("× ", 2u16) } else { ("", 0u16) };
+            let label = format!(" {}{}{} {}", mark, state_dot(tab.state), tab.name, close_txt);
+            let w = label.chars().count() as u16;
+            if x.saturating_add(w) > area.x.saturating_add(area.width) {
                 break;
             }
-            used += label.chars().count();
-            let style = if i == self.active {
+            out.push(TabSegment {
+                hit: TabHit {
+                    idx: i,
+                    body: (x, x + w.saturating_sub(close_w)),
+                    close: (x + w.saturating_sub(close_w), x + w),
+                },
+                label,
+                active: i == self.active,
+            });
+            x += w;
+        }
+        out
+    }
+
+    /// 命中区（不含文本），鼠标事件用它
+    pub fn tab_hits(&self, area: Rect) -> Vec<TabHit> {
+        self.tab_segments(area)
+            .into_iter()
+            .map(|s| s.hit)
+            .collect()
+    }
+
+    fn draw_tabs(&self, f: &mut ratatui::Frame, area: Rect) {
+        self.tab_bar_area.set(area);
+        let segs = self.tab_segments(area);
+        let mut spans: Vec<Span> = Vec::with_capacity(segs.len() + 1);
+        for seg in &segs {
+            let style = if seg.active {
                 Style::default()
                     .fg(self.theme.status_fg)
                     .bg(self.theme.status_bg)
             } else {
                 Style::default().fg(self.theme.fg)
             };
-            spans.push(Span::styled(label, style));
+            spans.push(Span::styled(seg.label.clone(), style));
+        }
+        // 画不下的那部分用 "+N" 提示还有几个
+        if segs.len() < self.tabs.len() {
+            spans.push(Span::raw(format!(" +{}", self.tabs.len() - segs.len())));
         }
         if self.tabs.is_empty() {
             spans.push(Span::styled(
@@ -2617,7 +3048,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((cfg.cols, cfg.rows));
     // 终端区尺寸：减去标签栏与状态栏，再减去可选树宽
-    let term_cols = cols.saturating_sub(TREE_WIDTH).max(20);
+    let term_cols = cols.saturating_sub(DEFAULT_TREE_WIDTH).max(MIN_TERM_COLS);
     let term_rows = rows.saturating_sub(2).max(5);
 
     let mut app = App::new(client, events, store, cfg);
@@ -2666,7 +3097,7 @@ async fn loop_inner(
                 Event::Mouse(m) => app.on_mouse(m).await?,
                 Event::Resize(_, _) => {
                     let size = terminal.size()?;
-                    let cols = size.width.saturating_sub(TREE_WIDTH).max(20);
+                    let cols = size.width.saturating_sub(app.tree_width).max(MIN_TERM_COLS);
                     let rows = size.height.saturating_sub(2).max(5);
                     app.on_resize(cols, rows).await?;
                 }
