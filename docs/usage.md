@@ -640,8 +640,11 @@ sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json
 | `ai` 报 `ipc_unreachable` | daemon 没起来。看 `<data_dir>/sh0/run/` 与 daemon 日志；必要时 `sh0 daemon stop` 后重试 |
 | 报 `session_unavailable` | 会话没了，重新 `session open`。**不要**去重启 daemon |
 | 触发 `rate_limited` | 按 `data.retry_after_sec` 等待；批量执行整批只算 1 次配额 |
-| Windows 上 release 构建崩 | rustc LTO 访问冲突，先用 debug 构建（M5 会处理体积与发布产物） |
+| Windows 上 release 构建崩 | `0xc0000005`（rustc fat LTO 访问冲突）。改用 `lto = "thin"` 或 debug 构建；磁盘空间不足时也会报同样的错 |
 | Git Bash 里 `/tmp/xxx` 报 `not_found` | MSYS 会把 `/tmp` 转成 Windows Temp 路径再传给程序。用绝对路径，或 `MSYS_NO_PATHCONV=1` |
+| 改了 `config.toml` 没生效 | 只有 `limits.*` / `risk.*` / 主机清单是热生效；`term`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、`audit.enabled` 要重启 daemon。用 `sh0 config reload` 看提示 |
+| `Ctrl+Shift+P` 唤不出命令面板 | 部分终端不区分 `Ctrl+Shift+P` 与 `Ctrl+P`。在 `config.toml` 里覆盖：`[keys] command.palette = "alt+p"` |
+| 导入后主机连不上 | 检查导入的 `addr`/`user`；ssh config 里的 `%h` 占位符与通配段会被跳过（回显里标 `-`） |
 
 ---
 
@@ -656,13 +659,40 @@ sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json
 - 文件视图：不支持目录递归传输与非空目录删除；不支持断点续传（均为 P2）。
 - 批量执行目前只有 AI 侧入口，TUI 里的批量结果面板尚未实现。
 - 鼠标目前只作用于**左侧主机树**（单击选中 / 双击连接 / 滚轮）；点击标签栏切换会话、
-  拖拽分隔条、鼠标选中终端文本属于 M5 剩余部分（FR-3.9）。
-- 主题与键位自定义（命令面板 / 多主题）、配置热重载、`~/.ssh/config` 与 Xshell
-  导入、ProxyJump 跳板机属于 M5。
+  拖拽分隔条、鼠标选中终端文本仍未实现（FR-3.9 剩余部分）。
+- `Ctrl+Shift+P` 命令面板已可用，但面板里目前只有内置动作 / 连主机 / 切主题三类。
+- 跳板机的密钥认证若需要指定私钥，请把跳板写成 hosts.toml 里的一台正式主机；
+  内联写法 `user@host:port` 固定走 agent。
+- 端口转发（本地 / 远程 / SOCKS）与 MCP adapter 未实现（P2）。
 
 ---
 
-## 13. 相关文档
+## 13. 安全与威胁模型
+
+M5 做了一轮安全复查，下面是**当前的防护边界**——知道它防什么、不防什么，
+比"我们做了加密"更重要。
+
+| 资产 | 怎么保护 | 边界 |
+| --- | --- | --- |
+| 口令 / 私钥口令 | 优先 OS 钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；不可用时落到主密码加密的 `creds.vault`（Argon2id + ChaCha20-Poly1305） | 钥匙串本身的强度取决于 OS 登录态；vault 的强度取决于主密码 |
+| 审计库 | 明文落 SQLite，但写入前过 `redact()` 脱敏（口令、token、Bearer、PEM 私钥、AKIA、`-p` 后的值） | 脱敏是**正则兜底**，不是保证。自定义规则请写 `risk.toml`，敏感输出尽量别落库（`audit.archive_output = false`） |
+| IPC | 只监听 127.0.0.1 的随机端口 + 一次性令牌；`daemon.json` 仅本机可读 | 同机的**任何用户进程**若能读到该文件即可调用本机 daemon。多用户机器请自行收紧目录权限 |
+| 主机密钥 | TOFU + OpenSSH 兼容 `known_hosts`，指纹变更直接拒绝 | 首次连接不校验指纹来源（与 OpenSSH 默认行为一致） |
+| 命令风险 | 三档引擎（auto / confirm / deny）+ 主机级 `risk_cap` 上限 + 令牌确认（5 分钟过期） | `--yes` 与 AI 侧的 `auto` 档命令不会打断人 |
+| 令牌文件 | 目录 0700（Unix）/ 仅当前用户（Windows） | 若目录权限被改宽，令牌会泄露 |
+
+**复查时确认过的几条：**
+
+- AI 侧任何路径都拿不到明文凭据：`host list/show`、`session status` 只返回认证**方式**（agent/key/password），不返回值。
+- 广播输入只落**一条**汇总审计，不逐台复制命令内容。
+- 导入配置文件只**读** `~/.ssh/config`，不回写；Xshell 的加密口令字段不导入。
+- 跳板机的凭据与目标的凭据各自独立解析，不会互相串用。
+
+**还没做的（明确不在 v1.0）**：`keyboard-interactive` / 2FA 交互应答；对 daemon 的跨用户鉴权。
+
+---
+
+## 14. 相关文档
 
 - `docs/requirements.md` —— 需求说明书（FR / NFR / 验收标准）
 - `docs/architecture.md` —— 架构设计、AI 子命令契约、错误码表、SQLite 表结构

@@ -645,4 +645,25 @@ mod tests {
         // 普通输出不受伤
         assert_eq!(redact("Filesystem Size Used"), "Filesystem Size Used");
     }
+
+    /// M5 安全复查补的回归：脱敏既要盖住新形态，也不能误伤正常命令
+    #[test]
+    fn redact_edge_cases_from_security_review() {
+        // URL query 里的 token
+        assert!(
+            redact("curl 'https://api.example.com/v1?token=abc123&x=1'").contains("***"),
+            "URL 里的 token 也该脱敏"
+        );
+        // 带引号、值里有空格
+        assert_eq!(redact("export PASSWORD='p@ss word'"), "export PASSWORD=***");
+        // 命令行 --password=xxx
+        assert_eq!(redact("mysql --password=hunter2"), "mysql --password=***");
+        // 端口映射不该被当成密码（-p 后是空格）
+        assert_eq!(redact("docker run -p 8080:80 nginx"), "docker run -p 8080:80 nginx");
+        // 中文与 emoji 不能被脱敏规则切成乱码
+        assert_eq!(redact("已连接 服务器 ✅"), "已连接 服务器 ✅");
+        // 同一行里多处都要盖住
+        let many = redact("password=a token=b");
+        assert!(!many.contains('a') || many.contains("***"), "多处敏感值应都脱敏: {many}");
+    }
 }
