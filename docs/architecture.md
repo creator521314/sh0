@@ -57,11 +57,10 @@ TUI 与 AI CLI 必须看到**同一批会话**。若 AI 子命令每次都新建
 
 | 命令 | 行为 |
 | --- | --- |
-| `sh0` | 若 daemon 未运行则自动拉起（fork/spawn 后台），随后以 TUI 前端接入 |
-| `sh0 daemon run` | 显式前台运行 daemon（调试/系统服务场景） |
-| `sh0 daemon stop` | 优雅关闭（先断开全部会话再退出） |
-| `sh0 ai ...` | 连 daemon 执行一次性动作，返回后退出 |
-| `sh0 host/config/log ...` | 管理类子命令，可直接读配置库，无需 daemon |
+| `sh0 tui [host]` | 进入 TUI；daemon 未运行则自动拉起（spawn 后台），前端经 IPC 接入 |
+| `sh0 ai ...` | 连 daemon 执行一次性动作，返回后退出；`ai host list/import` 只读/写配置，不拉 daemon |
+| `sh0 help`（或裸 `sh0`） | 打印用法与配置/数据目录，不拉 daemon |
+| `sh0 daemon run/stop` | 可见运维命令：前台调试 / 优雅停止。正常使用无需手动执行；daemon 在无会话且 5 分钟无请求时自动退出 |
 
 ### 1.2 数据流
 
@@ -520,7 +519,8 @@ pub enum Event {   // daemon → 前端的推送
 - **不是所有键都能热生效**。`term.*`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、
   `audit.enabled` 属于"必须重启"——它们影响终端网格的初始尺寸、已建连接的保活定时器等
   已经固化的状态。这些键变更时日志明确提示需要重启，而不是假装生效。
-- IPC 新增 `CONFIG_RELOAD` / `CONFIG_GET`，`sh0 config reload` 走的就是前者。
+- IPC 新增 `CONFIG_RELOAD` / `CONFIG_GET`。M6 起不再有 `sh0 config reload`：
+  改文件后 daemon 的 2 秒 mtime 轮询自动重载，`CONFIG_RELOAD` 保留给内部/测试使用。
 
 **主机导入（FR-1.10，仅导入侧）**
 
@@ -890,13 +890,16 @@ CREATE INDEX idx_batch_result_run ON batch_result(run_id);
 ### 8.3 凭据
 
 - 优先 OS 钥匙串：`keyring` crate（macOS Keychain / Windows Credential Manager / Linux Secret Service）。
-- 回落：主密码 → Argon2id（19 MiB / t=2 / p=1）派生密钥 → ChaCha20-Poly1305 加密 `creds.vault`
-  （JSON 文件，salt / nonce / 密文 hex 编码，tmp + rename 原子写）。
-- 主密码来源：`SH0_MASTER_PASSWORD` 环境变量，否则 stdin 提示（daemon 后台场景 stdin 为 null，
-  此时 vault 处于 `Locked`——不会静默降级成"什么都读不到但也不报错"）。
+- 回落：本地 data-key（`creds.key`，32 字节随机，0600）→ ChaCha20-Poly1305 加密 `creds.vault`
+  （JSON 文件，nonce / 密文 hex 编码，tmp + rename 原子写）。M6 起不再要求主密码，
+  daemon 无 TTY 也能解密，支撑「TUI 输一次密码、之后无感重连」。
+- 旧版主密码 vault 一次性迁移：有 `SH0_MASTER_PASSWORD` 时自动重加密为 v2；没有则备份为
+  `creds.vault.legacy` 并新建空库。
 - `SH0_DISABLE_KEYRING=1` 可强制走 vault（CI / 测试用它保证确定性）。
-- 私钥：只存文件路径，不复制内容；私钥自身的 passphrase 走上述加密存储。
-- `sh0 secret set/get/list/rm` 是面向命令行的管理入口。
+- 私钥：支持两种——外部路径引用（`key_file`，只存路径）与导入加密库（`key`，存 PEM 内容）；
+  私钥自身的 passphrase 走上述加密存储。
+- 写入入口只有 TUI：新增 IPC `credential.set/delete/status`，daemon 是唯一写者；
+  `ai` 侧不暴露凭据读写，`host list/show` 只返回认证方式。
 
 ---
 

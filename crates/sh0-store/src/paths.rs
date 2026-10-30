@@ -77,6 +77,12 @@ impl Paths {
         self.data_dir.join("creds.vault")
     }
 
+    /// vault 的本地数据密钥（0600）。与 vault 分离存放，
+    /// 让 daemon 在没有主密码、没有 TTY 的情况下也能解密（见 creds.rs）。
+    pub fn cred_key(&self) -> PathBuf {
+        self.data_dir.join("creds.key")
+    }
+
     /// 目录不存在时创建（幂等）
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;

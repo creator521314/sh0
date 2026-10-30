@@ -1,7 +1,8 @@
 # sh0 使用说明
 
-> 对应版本：**v0.2（当前工作区，M0~M4 已完成）**
-> 本文覆盖：安装构建、TUI 操作、命令行子命令、AI 接口全套用法、配置与凭据、审计复盘、故障排查。
+> 对应版本：**v0.4（当前工作区，M0~M6 已完成）**
+> 本文覆盖：安装构建、TUI 主机管理与连接、`ai` 接口、配置与凭据、审计复盘、故障排查。
+> 顶层命令：核心入口 `tui / ai / help`，外加运维命令 `daemon`（run / stop）。
 > 契约细节（JSON 信封字段、错误码、表结构）以 `docs/architecture.md` 为准，本文件只讲"怎么用"。
 
 ---
@@ -13,7 +14,7 @@ sh0 是单个二进制，无运行时依赖（SQLite 与 crypto 已静态编译�
 ```bash
 cargo build                      # 调试构建
 cargo build --release            # 发布构建（已用 lto="thin"，见 §11）
-cargo test --workspace           # 151 条测试
+cargo test --workspace           # 171 条测试
 cargo clippy --workspace --all-targets   # 应零警告
 ```
 
@@ -27,14 +28,15 @@ cargo clippy --workspace --all-targets   # 应零警告
 ## 2. 五分钟上手
 
 ```bash
-sh0 config path        # 看看配置目录在哪（config.toml 首次加载时会自动写成一份全默认值）
-sh0 tui                # 主机清单为空时会生成一份示例 hosts.toml 并提示你编辑，然后退出
-#   → 编辑配置目录下的 hosts.toml，填入真实主机
-#   → 再次 sh0 tui，左侧主机树里选中主机回车即连接
+sh0 help               # 用法 + 配置/数据目录
+sh0 tui                # 进入界面；主机清单为空也能直接按 n 新建
+#   → 填地址/用户/密码（默认 password，掩码；agent/key 用 ←/→ 切换）
+#   → Enter 保存并连接；Ctrl+Q 退出
 sh0 tui web-01         # 也可以直接指定主机进入
 ```
 
-在 TUI 里：`Ctrl+Q` 退出、`Ctrl+T` 新标签、`Alt+←/→` 切标签、`PageUp/PageDown` 回看历史。
+在 TUI 里：`Ctrl+Q` 退出、`Ctrl+T` 选主机开新会话、`Alt+←/→` 切标签、`PageUp/PageDown` 回看历史。
+主机树里：`n` 新建并连接、`e` 编辑、`d` 删除、`/` 搜索、`Enter` 连接。
 
 不进界面，直接用命令行（AI 接口同时也是很好的脚本接口）：
 
@@ -47,7 +49,7 @@ sh0 ai exec run --host web-01 --cmd "df -h /" --json
 
 ## 3. 配置目录与文件
 
-`sh0 config path` 会打印三个目录：
+`sh0 help` 会打印三个目录：
 
 | 平台 | 配置目录 | 数据目录 |
 | --- | --- | --- |
@@ -64,7 +66,8 @@ sh0 ai exec run --host web-01 --cmd "df -h /" --json
 └── risk.toml        # 自定义风险规则（可选，缺省时用内置规则集）
 <data_dir>/sh0/
 ├── known_hosts      # OpenSSH 兼容格式，TOFU 自动记录
-├── creds.vault      # 主密码加密的凭据（钥匙串不可用时的回落）
+├── creds.key        # 本地 data-key（0600，首次使用自动生成）
+├── creds.vault      # 密码/私钥的密文库（ChaCha20-Poly1305）
 ├── audit.db         # SQLite：审计与输出归档
 └── run/
     ├── daemon.json  # daemon 存活时的 IPC 端点 + token
@@ -129,17 +132,20 @@ unmatched = "confirm"        # 未命中任何规则时的默认档：auto | con
 
 ### 3.2 `hosts.toml`
 
+> 正常使用不需要手写：在 `sh0 tui` 里按 `n` 新建，TUI 会生成 id、写好认证引用，
+> 并把密码/私钥存进加密库。下面是文件形态，便于排障与手工维护。
+
 ```toml
 version = 1
 
 [[hosts]]
-id = "01M5N06QYP6GW5W2JK73XVCH38"   # 省略会自动生成
+id = "01M5N06QYP6GW5W2JK73XVCH38"   # 可省略，加载时自动生成
 name = "web-01"
 group = ["prod", "web"]             # 分组面包屑，支持多级
 addr = "10.0.0.11"
 port = 22                           # 默认 22
 user = "root"
-auth = "agent"                      # agent | key_file | password
+auth = "agent"                      # agent | key_file | key | password
 tags = ["nginx"]
 note = "主站"
 risk_cap = "confirm"                # 该主机允许的最高档位，省略 = 不限制
@@ -151,19 +157,21 @@ addr = "10.0.0.21"
 user = "dba"
 
 [hosts.auth]
+# 外部私钥文件（只引用路径，不代管）
 key_file = { path = "/home/u/.ssh/id_ed25519" }
-# key_file = { path = "/home/u/.ssh/id_rsa", passphrase = { env = "SH0_KEY_PW" } }
-# password  = { secret = { env = "SH0_PW" } }
-# password  = { secret = "prompt" }                 # 运行时询问（TUI raw mode 下不可用）
-# password  = { secret = { keyring = { service = "sh0", account = "web-01" } } }
+# 已导入加密库的私钥（TUI「认证文件」导入后写的就是这种）
+# key = { secret = { keyring = { service = "sh0", account = "<host.id>.key" } },
+#         passphrase = { keyring = { service = "sh0", account = "<host.id>.key.pass" } } }
+# password = { secret = { env = "SH0_PW" } }
+# password = { secret = { keyring = { service = "sh0", account = "<host.id>" } } }
 ```
 
 三条易踩的写法规则：
 
 1. `auth` 只有两种写法：单元变体写字符串（`auth = "agent"`），结构化变体写成嵌套表
-   （`[hosts.auth]` 下填 `key_file = {...}` 或 `password = {...}`）。
-2. `password` 的字段名是 `secret`，中间这一层别漏。
-3. 私钥路径不支持 `~` 展开，写绝对路径。
+   （`[hosts.auth]` 下填 `key_file = {...}`、`key = {...}` 或 `password = {...}`）。
+2. `password` / `key` 的字段名是 `secret`，中间这一层别漏。
+3. 外部私钥路径（`key_file`）不支持 `~` 展开，写绝对路径；TUI 导入模式不受此限。
 
 `risk_cap` 的语义：命令判定档位高于 `risk_cap` 时按 `risk_cap` 处理（引擎仍可能给更高档，
 daemon 取较小值）。给生产组设 `confirm`，可以让 auto 档的危险命令也被拦下来问一次。
@@ -192,15 +200,20 @@ max_level = "confirm"
 
 ## 4. 凭据管理
 
-配置文件**永远不存明文口令**，只存"去哪里取"：`agent` / `key_file` / `env` / `prompt` /
-`keyring`。钥匙串优先，不可用时回落到主密码 vault（Argon2id + ChaCha20-Poly1305）。
+配置文件**永远不存明文口令**，只存"去哪里取"：`agent` / `key_file` / `key` / `env` /
+`prompt` / `keyring`。正常使用**不需要任何命令行**：在 TUI 新建/编辑主机时直接输密码或
+导入私钥，daemon 负责写入加密库。
 
-```bash
-printf '%s' "$PW" | sh0 secret set sh0 web-01 --stdin   # 存（走 stdin，不进 shell 历史）
-sh0 secret get sh0 web-01                               # 取（明文打印到 stdout，注意管道）
-sh0 secret list                                         # 列 vault 条目名（钥匙串无法枚举）
-sh0 secret rm  sh0 web-01                               # 删
-```
+- 后端：OS 钥匙串优先（Keychain / 凭据管理器 / Secret Service）；不可用时回落本地
+  `creds.vault`，用 `creds.key`（0600）做 data-key 加密，**不再需要主密码**。
+- 主机引用：密码存 `<host.id>`，私钥 PEM 存 `<host.id>.key`，私钥口令存
+  `<host.id>.key.pass`（`service = "sh0"`）。
+- 删除主机会先关闭该主机关联的连接，再级联清理旧 account；切换认证方式只清理旧 account。
+- 旧版主密码 vault：设置 `SH0_MASTER_PASSWORD` 后任意 `sh0` 启动会自动迁移；
+  未设置则备份为 `creds.vault.legacy` 并新建空库。
+
+> 信任边界：`creds.key` 与 `creds.vault` 同机同用户，强度等于文件权限（0600），
+> 与 `~/.ssh` 私钥同档——防其他用户/备份泄漏，不防本机 OS 账户本身。
 
 ---
 
@@ -226,11 +239,11 @@ sh0 secret rm  sh0 web-01                               # 删
 | 按键 | 作用 |
 | --- | --- |
 | Ctrl+Q | 退出 |
-| Ctrl+T / Ctrl+W | 新建 / 关闭会话 |
+| Ctrl+T / Ctrl+W | 选择主机开新会话 / 关闭会话 |
 | Alt+← / Alt+→ | 切换会话 |
 | Ctrl+B | 焦点在主机树与终端间切换 |
 | Ctrl+F | 搜索主机 |
-| Ctrl+N | 新建主机 |
+| Ctrl+N | 新建主机并连接 |
 | PageUp / PageDown | 回看历史输出 |
 | Ctrl+PageUp / Ctrl+PageDown | 回到顶部 / 回到底部 |
 | Alt+V | 进入/退出文本选择模式 |
@@ -242,6 +255,9 @@ sh0 secret rm  sh0 web-01                               # 删
 | F9 | 终端视图 / 双栏文件视图切换 |
 | **Ctrl+Shift+P** | **命令面板**（模糊搜索：内置动作 / 连接主机 / 切换主题） |
 
+> 焦点标识：当前焦点区域的边框使用主题强调色；终端区标题在聚焦时显示
+> `终端 [焦点]`，否则只显示 `终端`。`Ctrl+B` 在主机树与终端（或文件区）之间切换。
+
 另两套预设：`keymap = "vim"`（hjkl / `/` 搜索，`Alt+G` 到顶、`Shift+G` 到底）、
 `keymap = "xshell"`（Alt 组合为主，`Shift+PageUp` 回看）。任意单键可在 `config.toml` 的
 `[keys]` 里覆盖，例如 `quit = "ctrl+x"`、`command.palette = "alt+p"`。写错的键名只会在日志里
@@ -249,6 +265,30 @@ sh0 secret rm  sh0 web-01                               # 删
 
 带 Shift 的字母键按**小写**匹配：终端上报的是 `Shift+G` 对应的大写 `G`，配置里写 `shift+g`
 即可，两边都会归一成小写再比。
+
+**主机树内**（焦点在左侧树时）：
+
+| 按键 | 作用 |
+| --- | --- |
+| `n` | 新建主机并连接 |
+| `e` | 编辑当前主机 |
+| `d` | 删除当前主机（再按 `y` 确认；该主机的连接会一起关闭） |
+| `/` | 搜索主机 |
+| `Enter` | 连接当前主机 / 展开分组 |
+
+**新建/编辑表单**：
+
+| 按键 | 作用 |
+| --- | --- |
+| `Tab` / `Shift+Tab` / `↑` / `↓` | 切换字段（跳过当前认证方式下不显示的字段） |
+| `←` / `→` | 切换认证方式：agent → password → key → none |
+| `Enter` | 保存并连接 |
+| `Ctrl+S` | 仅保存，不连接 |
+| `Esc` | 取消 |
+
+新建默认 `password`，此时出现「密码」字段（掩码 `*`，编辑时留空 = 保持原密码）；
+选 `key` 时出现「私钥文件」与「私钥口令」：填路径后保存会把 PEM 导入加密库，
+之后即使原文件被删除也能连接。选 `agent` / `none` 无凭据字段。
 
 ### 5.2.1 命令面板（Ctrl+Shift+P）
 
@@ -376,39 +416,27 @@ kitty / Alacritty 均支持）；不支持时内容仍留在 sh0 内部，可用
 
 ---
 
-## 6. 命令行（非 AI 子命令）
+## 6. 命令行
+
+顶层命令：
 
 ```bash
-sh0 tui [主机名或ID]     # 启动 TUI；省略时若只有一台主机则自动使用
-sh0 host list [--json]   # 列出主机
-sh0 host import --from ssh [--path ~/.ssh/config] [--dry-run] [--json]
-sh0 host import --from xsh --path <会话文件或目录> [--dry-run]
-sh0 config path|show|get|set|reload|check   # 见下
-sh0 secret set|get|list|rm ...
-sh0 daemon run [--background]   # 前台运行（调试用），通常无需手动执行
-sh0 daemon stop                 # 优雅停止后台 daemon
+sh0 tui [主机名或ID]     # 启动 TUI；省略时进入主机树（即使一台主机都没有）
+sh0 ai <对象> <命令> ...  # 面向 AI/脚本的结构化接口（见 §7）
+sh0 help                 # 用法 + 配置/数据/日志目录
+sh0 daemon run           # 前台运行 daemon（调试用）
+sh0 daemon stop          # 优雅停止后台 daemon
 ```
 
-daemon 由 `sh0` 自动拉起（首次调用 AI 接口或进 TUI 时），一般不需要手动管。
-`daemon.json` 失效（daemon 已死但文件残留）会自动清理并重启。
+daemon 平时由 `sh0` 自动拉起，一般不需要手动执行；`daemon` 命令保留给调试/排障。
+它在**没有活跃会话、且 5 分钟没有请求**时自动退出（TUI 每 30 秒 ping 一次保活），
+所以正常使用不需要停它。`sh0 help` 的「后台 daemon」一段会说明它的职责与日志位置。
 
-### 6.1 `sh0 config`
+> 旧版的 `sh0 host` / `sh0 config` / `sh0 secret` 已移除：
+> 主机管理在 TUI 里；`ai host list/import` 覆盖了只读查询与导入；
+> 配置直接改文件（自动热重载）；密码/私钥在 TUI 新建主机时录入。
 
-```bash
-sh0 config path                       # 打印配置/数据/运行时目录
-sh0 config show [--json]              # 打印当前生效配置（默认 TOML）
-sh0 config get limits.exec_timeout_secs
-sh0 config set limits.exec_timeout_secs 60
-sh0 config set theme light            # 字符串原样写入
-sh0 config reload                     # 通知 daemon 重新加载
-sh0 config check                      # 校验三份配置能否解析
-```
-
-- `get` 出来的字符串**不带引号**，可以直接用在脚本里：`sh0 config get term`。
-- `set` 遇到拼错的键名会**报错**而不是假装成功（静默忽略最难排查）。
-- `set` 之后若 daemon 在跑，会自动触发一次热重载并打印结果。
-
-### 6.2 配置热重载
+### 6.1 配置热重载
 
 daemon 每 2 秒检查一次 `config.toml` / `hosts.toml` 的 mtime，改完**不用重启**：
 
@@ -419,21 +447,22 @@ daemon 每 2 秒检查一次 `config.toml` / `hosts.toml` 的 mtime，改完**�
 | `hosts.toml` 的主机增删 | 立即（每次按名字现读文件） |
 | `term` / `keepalive_secs` / `cols` / `rows` / `memory_budget_mb` / `audit.enabled` | 需重启 |
 
-改到最后一类时，`sh0 config reload` 的回显会点名提示哪些项要重启。
+改到最后一类时，`daemon.log` 里会提示哪些项需要重启。配置写错时，任意 `sh0` 调用
+启动时都会解析并报错（等效于旧版的 `config check`）。
 
-### 6.3 导入既有配置（只读）
+### 6.2 导入既有配置（只读）
 
 ```bash
-sh0 host import --from ssh --dry-run        # 先看会导入什么
-sh0 host import --from ssh                  # 真的写进 hosts.toml
-sh0 host import --from xsh --path "D:/Xshell/Sessions"
+sh0 ai host import --from ssh --dry-run        # 先看会导入什么
+sh0 ai host import --from ssh                  # 真的写进 hosts.toml
+sh0 ai host import --from xsh --path "D:/Xshell/Sessions"
 ```
 
 - 只**读**源文件，绝不回写 `~/.ssh/config`。
 - 映射：`HostName→addr`、`User→user`、`Port→port`、`IdentityFile→私钥认证`
   （`~/` 会自动展开成绝对路径）、`ProxyJump→proxy_jump`（取逗号分隔的最后一跳）。
 - `Host *` 这类通配段、含 `%h` 占位符的条目会被**跳过**并在回显里说明原因。
-- Xshell 只导入 `PROTOCOL=SSH` 的会话；口令字段一律不导入。
+- Xshell 只导入 `PROTOCOL=SSH` 的会话；**口令字段一律不导入**，需要连接时在 TUI 里补。
 - 与现有主机**重名时保留现有配置**，回显里标为 `=`。
 
 ---
@@ -680,18 +709,21 @@ sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json
 | 现象 | 原因与处理 |
 | --- | --- |
 | 复制后剪贴板没有内容 | OSC 52 需要父终端支持。不支持时内容仍在 sh0 内，用 `p` 粘回会话 |
-| TUI 里输不了密码 | raw mode 下无法交互式输入。改用 `agent` / `env`，或先 `sh0 secret set` 预存 |
-| 私钥读不到 | 路径不支持 `~` 展开，写绝对路径 |
+| TUI 新建主机时密码框没反应 | 先用 `←/→` 把认证方式切到 `password`，密码字段才会出现；输入显示为 `*` |
+| 密码登录报认证失败 | 编辑主机时密码留空表示"保持原密码"，新主机则必须输入；也检查是否误选了 `agent` |
+| 私钥读不到 | 外部 `key_file` 路径不支持 `~` 展开，写绝对路径；TUI 导入模式会把 PEM 存进加密库，不依赖原路径 |
+| 报 `vault 已锁定` | `<data_dir>/sh0/creds.vault` 存在但 `creds.key` 丢失/不匹配。从备份恢复 `creds.key`，或删掉 vault 重新录入凭据 |
+| 旧版凭据不见了 | 升级后首次启动会把旧主密码 vault 迁移为 data-key；若当时没设 `SH0_MASTER_PASSWORD`，旧库被备份为 `creds.vault.legacy`，设好主密码后重启即可迁移 |
 | 没法用鼠标拖选复制 | 鼠标捕获开着时父终端收不到鼠标。按一次 **Shift + 鼠标** 挂起捕获，或配置 `mouse = false` |
 | 首次连不上 / 指纹变更被拒 | TOFU：首次自动记录指纹，指纹变更时拒绝连接。确认主机身份后删掉 `<data_dir>/sh0/known_hosts` 里对应行 |
-| daemon 起不来 / 行为异常 | 看 `<data_dir>/sh0/run/daemon.log`；`sh0 daemon stop` 后重试（失效的 `daemon.json` 会自动清理） |
+| daemon 起不来 / 行为异常 | 看 `<data_dir>/sh0/run/daemon.log`；`sh0 daemon stop` 后重试（失效的 `daemon.json` 会自动清理）。没有会话时 daemon 也会在 5 分钟空闲后自退出 |
 | shell 模式拿到半截输出 | 远端改写 `PS1`、`clear` 刷屏、回显折行会让哨兵退化为部分输出。切 `--mode exec` |
 | `ai` 报 `ipc_unreachable` | daemon 没起来。看 `<data_dir>/sh0/run/` 与 daemon 日志；必要时 `sh0 daemon stop` 后重试 |
 | 报 `session_unavailable` | 会话没了，重新 `session open`。**不要**去重启 daemon |
 | 触发 `rate_limited` | 按 `data.retry_after_sec` 等待；批量执行整批只算 1 次配额 |
 | Windows 上 release 构建崩 | `0xc0000005`（rustc fat LTO 访问冲突）。改用 `lto = "thin"` 或 debug 构建；磁盘空间不足时也会报同样的错 |
 | Git Bash 里 `/tmp/xxx` 报 `not_found` | MSYS 会把 `/tmp` 转成 Windows Temp 路径再传给程序。用绝对路径，或 `MSYS_NO_PATHCONV=1` |
-| 改了 `config.toml` 没生效 | 只有 `limits.*` / `risk.*` / 主机清单是热生效；`term`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、`audit.enabled` 要重启 daemon。用 `sh0 config reload` 看提示 |
+| 改了 `config.toml` 没生效 | 只有 `limits.*` / `risk.*` / 主机清单是热生效；`term`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、`audit.enabled` 要重启 daemon（`daemon.log` 会点名） |
 | `Ctrl+Shift+P` 唤不出命令面板 | 部分终端不区分 `Ctrl+Shift+P` 与 `Ctrl+P`。在 `config.toml` 里覆盖：`[keys] command.palette = "alt+p"` |
 | 导入后主机连不上 | 检查导入的 `addr`/`user`；ssh config 里的 `%h` 占位符与通配段会被跳过（回显里标 `-`） |
 | 输入每个字符都变双份（`ls` → `llss`） | 按键的"松开"事件也被当成了一次输入。Windows 控制台每次按键会给按下 + 松开两个事件，已在事件循环过滤（`should_handle_key` 丢弃 `Release`）。若仍出现，确认用的是最新构建 |
@@ -724,7 +756,7 @@ M5 做了一轮安全复查，下面是**当前的防护边界**——知道它�
 
 | 资产 | 怎么保护 | 边界 |
 | --- | --- | --- |
-| 口令 / 私钥口令 | 优先 OS 钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；不可用时落到主密码加密的 `creds.vault`（Argon2id + ChaCha20-Poly1305） | 钥匙串本身的强度取决于 OS 登录态；vault 的强度取决于主密码 |
+| 口令 / 私钥口令 | 优先 OS 钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；不可用时落到本地 data-key 加密的 `creds.vault`（`creds.key` 0600 + ChaCha20-Poly1305） | 钥匙串强度取决于 OS 登录态；vault 强度取决于 `creds.key` 的文件权限，与 `~/.ssh` 私钥同档 |
 | 审计库 | 明文落 SQLite，但写入前过 `redact()` 脱敏（口令、token、Bearer、PEM 私钥、AKIA、`-p` 后的值） | 脱敏是**正则兜底**，不是保证。自定义规则请写 `risk.toml`，敏感输出尽量别落库（`audit.archive_output = false`） |
 | IPC | 只监听 127.0.0.1 的随机端口 + 一次性令牌；`daemon.json` 仅本机可读 | 同机的**任何用户进程**若能读到该文件即可调用本机 daemon。多用户机器请自行收紧目录权限 |
 | 主机密钥 | TOFU + OpenSSH 兼容 `known_hosts`，指纹变更直接拒绝 | 首次连接不校验指纹来源（与 OpenSSH 默认行为一致） |
@@ -733,7 +765,7 @@ M5 做了一轮安全复查，下面是**当前的防护边界**——知道它�
 
 **复查时确认过的几条：**
 
-- AI 侧任何路径都拿不到明文凭据：`host list/show`、`session status` 只返回认证**方式**（agent/key/password），不返回值。
+- AI 侧任何路径都拿不到明文凭据：`host list/show`、`session status` 只返回认证**方式**（agent/key/keyfile/password），不返回值。
 - 广播输入只落**一条**汇总审计，不逐台复制命令内容。
 - 导入配置文件只**读** `~/.ssh/config`，不回写；Xshell 的加密口令字段不导入。
 - 跳板机的凭据与目标的凭据各自独立解析，不会互相串用。

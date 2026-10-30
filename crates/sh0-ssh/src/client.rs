@@ -13,7 +13,7 @@ use russh::client::{self, AuthResult, Handle, Handler};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::agent::AgentIdentity;
 use russh::keys::ssh_key::PublicKey;
-use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key, load_secret_key};
 use russh::{ChannelMsg, Disconnect};
 
 use sh0_core::transport::ExecOutput;
@@ -378,19 +378,26 @@ async fn authenticate(
             };
             let key = load_secret_key(path, pp.as_deref())
                 .map_err(|e| SshError::Credential(format!("{path:?} 加载失败: {e}")))?;
-            let hash: Option<HashAlg> = session
-                .best_supported_rsa_hash()
-                .await
-                .map_err(|e| SshError::Auth(e.to_string()))?
-                .flatten();
-            let res = session
-                .authenticate_publickey(
-                    host.user.clone(),
-                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                )
-                .await
-                .map_err(|e| SshError::Auth(e.to_string()))?;
-            ensure_success(res)?;
+            authenticate_public_key(session, host, key).await?;
+        }
+        CredentialRef::Key { secret, passphrase } => {
+            // 私钥 PEM 存在加密库里（TUI「导入认证文件」），与文件路径无关
+            let pem = resolve_secret(
+                resolver,
+                secret,
+                &format!("{} 的私钥", host.endpoint()),
+            )?;
+            let pp = match passphrase {
+                Some(s) => Some(resolve_secret(
+                    resolver,
+                    s,
+                    &format!("{} 的私钥口令", host.endpoint()),
+                )?),
+                None => None,
+            };
+            let key = decode_secret_key(&pem, pp.as_deref())
+                .map_err(|e| SshError::Credential(format!("导入的私钥解析失败: {e}")))?;
+            authenticate_public_key(session, host, key).await?;
         }
         CredentialRef::Agent => {
             authenticate_with_agent(session, host).await?;
@@ -408,6 +415,28 @@ async fn authenticate(
             ensure_success(res)?;
         }
     }
+    Ok(())
+}
+
+/// 用已加载的私钥做公钥认证（文件路径与加密库两条来源共用）。
+async fn authenticate_public_key(
+    session: &mut Handle<ClientHandler>,
+    host: &Host,
+    key: PrivateKey,
+) -> Result<()> {
+    let hash: Option<HashAlg> = session
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|e| SshError::Auth(e.to_string()))?
+        .flatten();
+    let res = session
+        .authenticate_publickey(
+            host.user.clone(),
+            PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+        )
+        .await
+        .map_err(|e| SshError::Auth(e.to_string()))?;
+    ensure_success(res)?;
     Ok(())
 }
 

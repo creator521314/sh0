@@ -167,6 +167,14 @@ pub mod methods {
     pub const CONFIG_RELOAD: &str = "config.reload";
     /// 回看 daemon 当前生效的配置（AI 用它确认"改的是不是生效的那份"）
     pub const CONFIG_GET: &str = "config.get";
+
+    // ---- M6 · TUI 主机管理 / 凭据本地加密 ----
+    /// 写入一条凭据（仅 TUI 调用；AI 侧不暴露）
+    pub const CREDENTIAL_SET: &str = "credential.set";
+    /// 删除一条凭据
+    pub const CREDENTIAL_DELETE: &str = "credential.delete";
+    /// 凭据后端状态（钥匙串是否可用 / vault 是否就绪）
+    pub const CREDENTIAL_STATUS: &str = "credential.status";
 }
 
 /// 事件名常量

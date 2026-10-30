@@ -29,7 +29,7 @@ use sh0_store::Store;
 use sh0_term::{Keymap, Screen, ScreenOptions};
 
 use crate::files::{FilePane, entry_line};
-use crate::hosts::{HostForm, HostTree, Row};
+use crate::hosts::{CRED_SERVICE, HostDraft, HostForm, HostTree, Row, accounts_of_host};
 use crate::render::{render_line, render_line_with_cursor};
 use crate::palette;
 use crate::palette::Palette;
@@ -52,10 +52,17 @@ const DOUBLE_CLICK_MS: u128 = 400;
 const CHUNK_SIZE: usize = 256 * 1024;
 /// 单块失败后的最大重试次数（FR-4.4）
 const MAX_RETRIES: u32 = 3;
+/// 主机表单左侧标签列宽（显示列，不是字符数）。最长标签约 21 列。
+const FORM_LABEL_COLS: usize = 22;
+/// 终端区边框占用的列/行（左右各 1 列、上下各 1 行）
+const FRAME_X: u16 = 2;
+const FRAME_Y: u16 = 2;
 
 /// 一个标签页 = 一个远端会话 + 本地一份 Screen
 pub struct Tab {
     pub id: String,
+    /// 会话对应的主机 id（删除主机时按它精确关连接；空 = 旧会话，退回按名字匹配）
+    pub host_id: String,
     pub name: String,
     pub host: String,
     pub screen: Screen,
@@ -294,8 +301,10 @@ pub struct App {
     tree_width: u16,
     /// 最近一次绘制的标签栏矩形（命中区由它现场算，见 `tab_hits`）
     tab_bar_area: Cell<Rect>,
-    /// 最近一次绘制的主区（终端或文件视图）——滚轮与拖选的命中区
+    /// 最近一次绘制的主区（终端或文件视图）——滚轮与分隔条的命中区
     main_area: Cell<Rect>,
+    /// 终端区**边框以内**的矩形——鼠标坐标 → 终端网格坐标要用它
+    term_area: Cell<Rect>,
     /// 最近一次绘制的文件双栏内区（鼠标点条目要用）
     pane_left_area: Cell<Rect>,
     pane_right_area: Cell<Rect>,
@@ -307,6 +316,8 @@ pub struct App {
     palette: Option<Palette>,
     /// 当前主题名，供面板显示"当前"标记与切换后回写配置
     theme_name: String,
+    /// 最近一次 ping 的时间：TUI 活着就定期保活，daemon 才能安全地空闲自退出
+    last_heartbeat: Instant,
 }
 
 impl App {
@@ -367,12 +378,14 @@ impl App {
             tree_width: DEFAULT_TREE_WIDTH,
             tab_bar_area: Cell::new(Rect::default()),
             main_area: Cell::new(Rect::default()),
+            term_area: Cell::new(Rect::default()),
             pane_left_area: Cell::new(Rect::default()),
             pane_right_area: Cell::new(Rect::default()),
             drag: None,
             last_click: None,
             palette: None,
             theme_name: cfg.theme.clone(),
+            last_heartbeat: Instant::now(),
         }
     }
 
@@ -421,6 +434,7 @@ impl App {
                 }
                 // 3) 主区终端：按下即定选区起点，拖到哪选到哪，松手复制
                 if self.view == View::Terminal
+                    && self.tabs.get(self.active).is_some()
                     && let Some(cell) = self.view_cell_at(m.column, m.row)
                 {
                     self.selection = Some(Selection {
@@ -572,10 +586,22 @@ impl App {
     /// 终端内容是从主区左上角 (0,0) 开始画的，而 `extract_view_text` 用的也是视图坐标，
     /// 所以这里**不用**扣滚动偏移——滚动已经在 `view_lines()` 里体现过了。
     fn view_cell_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
-        if !self.in_main(col, row) {
+        // 真实渲染时用边框内区；测试里没走 draw，退回手动注入的 main_area
+        let area = self.term_area.get();
+        let a = if area.width == 0 || area.height == 0 {
+            self.main_area.get()
+        } else {
+            area
+        };
+        if a.width == 0
+            || a.height == 0
+            || col < a.x
+            || col >= a.x.saturating_add(a.width)
+            || row < a.y
+            || row >= a.y.saturating_add(a.height)
+        {
             return None;
         }
-        let a = self.main_area.get();
         Some((
             (row.saturating_sub(a.y)) as usize,
             (col.saturating_sub(a.x)) as usize,
@@ -637,10 +663,15 @@ impl App {
 
     /// 拖动分隔条：跟着鼠标改树宽，同时把腾出来/占掉的列数记进终端尺寸
     fn drag_divider_to(&mut self, col: u16) {
-        // 总宽 = 当前终端列数 + 当前树宽（拖拽中终端还没同步，两者相加仍是窗口宽度）
-        let total = self.term_size.0.saturating_add(self.tree_width);
+        // 总宽 = 当前终端列数 + 当前树宽 + 终端左右边框（拖拽中终端还没同步，
+        // 三者相加仍是窗口宽度）
+        let total = self
+            .term_size
+            .0
+            .saturating_add(self.tree_width)
+            .saturating_add(FRAME_X);
         let max_w = total
-            .saturating_sub(MIN_TERM_COLS)
+            .saturating_sub(MIN_TERM_COLS + FRAME_X)
             .max(MIN_TREE_WIDTH);
         let want = col.saturating_add(1).max(MIN_TREE_WIDTH);
         let w = want.clamp(MIN_TREE_WIDTH, max_w);
@@ -830,6 +861,31 @@ impl App {
         self.tabs.len()
     }
 
+    /// 与某台主机关联的标签页索引。
+    /// 优先用 host_id（主机改名也不受影响）；旧会话没有 host_id 时退回名字匹配。
+    fn tab_indices_for_host(&self, host: &sh0_core::Host) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let by_id = !t.host_id.is_empty() && t.host_id == host.id;
+                let by_name =
+                    t.host == host.name || t.name == host.name || t.host == host.id;
+                (by_id || by_name).then_some(i)
+            })
+            .collect()
+    }
+
+    /// 删除主机前用它提示「会关掉几个连接」
+    pub fn tab_count_for_host(&self, host: &sh0_core::Host) -> usize {
+        self.tab_indices_for_host(host).len()
+    }
+
+    /// 当前标签页显示的主机名（测试用）
+    pub fn tab_host_names(&self) -> Vec<&str> {
+        self.tabs.iter().map(|t| t.name.as_str()).collect()
+    }
+
     /// 焦点是否在主机树上（测试用）
     pub fn focus_is_tree(&self) -> bool {
         self.focus == Focus::Tree
@@ -858,8 +914,14 @@ impl App {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_string();
+            let host_id = s
+                .get("host_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
             let state = s.get("state").and_then(|v| v.as_str()).unwrap_or("closed");
-            let mut tab = self.new_tab(id.to_string(), name.clone(), name.clone());
+            let mut tab =
+                self.new_tab(id.to_string(), name.clone(), name.clone(), host_id);
             tab.state = parse_state(state);
             tab.screen.push_notice(
                 "已接入 daemon 中的既有会话（历史输出请用 `sh0 ai screen read` 查看）",
@@ -869,12 +931,13 @@ impl App {
         Ok(())
     }
 
-    fn new_tab(&self, id: String, name: String, host: String) -> Tab {
+    fn new_tab(&self, id: String, name: String, host: String, host_id: String) -> Tab {
         let (cols, rows) = self.term_size;
         let mut opts = ScreenOptions::new(cols.max(20) as usize, rows.max(5) as usize);
         opts.scrollback_lines = 5000;
         Tab {
             id,
+            host_id,
             name,
             host,
             screen: Screen::new(opts),
@@ -903,8 +966,13 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or(host)
             .to_string();
+        let host_id = res
+            .get("host_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         self.tabs
-            .push(self.new_tab(id, name.clone(), host.to_string()));
+            .push(self.new_tab(id, name.clone(), host.to_string(), host_id));
         self.active = self.tabs.len() - 1;
         if self.view != View::Files {
             self.focus = Focus::Terminal;
@@ -912,6 +980,94 @@ impl App {
         self.notice = format!("已连接 {name}");
         // 文件视图下右栏要切到这台主机
         self.tab_changed().await;
+        Ok(())
+    }
+
+    /// 表单提交：写 hosts.toml + 写加密库，成功后按需立即连接。
+    ///
+    /// 顺序是刻意的：先校验/读私钥 → 写 hosts.toml → 写凭据；凭据失败就回滚
+    /// hosts.toml。这样不会留下「有凭据没主机」的孤儿，且旧凭据在失败时未被覆盖。
+    async fn commit_host(&mut self, draft: HostDraft, connect: bool) -> anyhow::Result<()> {
+        // 0) 名称唯一：以磁盘为准（TUI 开着时也可能被 `ai host import` 改过）。
+        //    daemon 的 find_host 遇到重名会拒绝，这里提前拦下来。
+        let before = self.store.load_hosts()?;
+        if before
+            .hosts
+            .iter()
+            .any(|h| h.name == draft.host.name && h.id != draft.host.id)
+        {
+            self.notice = format!("名称 `{}` 已被另一台主机使用", draft.host.name);
+            self.form = Some(HostForm::new(Some(&draft.host)));
+            return Ok(());
+        }
+
+        // 1) 私钥先读进内存（失败就停在表单，不写任何东西）
+        let pem = match draft.key_path.as_deref() {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    self.notice = format!("读取私钥 {path} 失败：{e}");
+                    self.form = Some(HostForm::new(Some(&draft.host)));
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        if let Some(p) = &pem
+            && !p.contains("PRIVATE KEY")
+        {
+            self.notice = "该文件不像 PEM 私钥（缺少 PRIVATE KEY 标记）".into();
+            self.form = Some(HostForm::new(Some(&draft.host)));
+            return Ok(());
+        }
+
+        // 2) 先落 hosts.toml，失败则整体放弃（凭据还没写）
+        let mut file = before.clone();
+        if let Some(h) = file.hosts.iter_mut().find(|h| h.id == draft.host.id) {
+            *h = draft.host.clone();
+        } else {
+            file.hosts.push(draft.host.clone());
+        }
+        if let Err(e) = self.store.save_hosts(&file) {
+            self.notice = format!("保存主机失败：{e}");
+            self.form = Some(HostForm::new(Some(&draft.host)));
+            return Ok(());
+        }
+
+        // 3) 写凭据（只发 account + value，daemon 只回 backend，不回显明文）
+        let writes = draft.cred_writes(pem);
+        for (account, value) in writes {
+            let res = self
+                .client
+                .call(
+                    methods::CREDENTIAL_SET,
+                    json!({ "service": CRED_SERVICE, "account": account, "value": value }),
+                )
+                .await;
+            if let Err(e) = res {
+                let _ = self.store.save_hosts(&before);
+                self.notice = format!("保存凭据失败（已回滚主机）：{e}");
+                self.form = Some(HostForm::new(Some(&draft.host)));
+                return Ok(());
+            }
+        }
+
+        // 4) 认证方式变了：清理不再引用的旧 account（尽力而为）
+        for account in &draft.deletes {
+            let _ = self
+                .client
+                .call(
+                    methods::CREDENTIAL_DELETE,
+                    json!({ "service": CRED_SERVICE, "account": account }),
+                )
+                .await;
+        }
+
+        self.tree.upsert(draft.host.clone());
+        self.notice = "主机已保存".into();
+        if connect {
+            self.open(&draft.host.name).await?;
+        }
         Ok(())
     }
 
@@ -985,40 +1141,43 @@ impl App {
         }
 
         // 2) 主机编辑表单优先
-        if let Some(form) = self.form.as_mut() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.form = None;
-                }
-                KeyCode::Tab => form.next(),
-                KeyCode::BackTab => form.prev(),
-                KeyCode::Up => form.prev(),
-                KeyCode::Down => form.next(),
-                KeyCode::Backspace => form.backspace(),
-                KeyCode::Enter => {
-                    let host: sh0_core::Host = match form.to_host() {
-                        Ok(h) => h,
-                        Err(e) => {
-                            self.notice = format!("表单有误：{e}");
-                            return Ok(());
+        if self.form.is_some() {
+            let mut submit: Option<(HostDraft, bool)> = None;
+            let mut cancel = false;
+            {
+                let form = self.form.as_mut().expect("form is some");
+                match key.code {
+                    KeyCode::Esc => cancel = true,
+                    KeyCode::Tab => form.next(),
+                    KeyCode::BackTab => form.prev(),
+                    KeyCode::Up => form.prev(),
+                    KeyCode::Down => form.next(),
+                    KeyCode::Left if form.auth_focused() => form.cycle_auth(-1),
+                    KeyCode::Right if form.auth_focused() => form.cycle_auth(1),
+                    KeyCode::Backspace => form.backspace(),
+                    KeyCode::Enter => match form.to_host() {
+                        Ok(d) => submit = Some((d, true)),
+                        Err(e) => self.notice = format!("表单有误：{e}"),
+                    },
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match form.to_host() {
+                            Ok(d) => submit = Some((d, false)),
+                            Err(e) => self.notice = format!("表单有误：{e}"),
                         }
-                    };
-                    let editing = form.editing.clone();
-                    self.form = None;
-                    self.tree.upsert(host.clone());
-                    let mut file = self.store.load_hosts()?;
-                    if let Some(id) = editing {
-                        if let Some(h) = file.hosts.iter_mut().find(|h| h.id == id) {
-                            *h = host;
-                        }
-                    } else {
-                        file.hosts.push(host);
                     }
-                    self.store.save_hosts(&file)?;
-                    self.notice = "主机已保存".into();
+                    // 控制组合键不当作文本（否则 Ctrl+Q 会往密码里塞一个 q）
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        form.input(c)
+                    }
+                    _ => {}
                 }
-                KeyCode::Char(c) => form.input(c),
-                _ => {}
+            }
+            if cancel {
+                self.form = None;
+                self.notice = "已取消".into();
+            }
+            if let Some((draft, connect)) = submit {
+                self.commit_host(draft, connect).await?;
             }
             return Ok(());
         }
@@ -1027,11 +1186,47 @@ impl App {
         if let Some(host) = self.pending_delete.take() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.tree.remove_current();
                     let mut file = self.store.load_hosts()?;
                     file.hosts.retain(|h| h.id != host.id);
-                    self.store.save_hosts(&file)?;
-                    self.notice = format!("已删除 {}", host.name);
+                    if let Err(e) = self.store.save_hosts(&file) {
+                        self.notice = format!("删除失败：{e}");
+                        return Ok(());
+                    }
+                    self.tree.remove_current();
+
+                    // 主机没了，右栏里它的连接也必须一起关掉——否则会留下
+                    // 一个指向已删除配置的会话，后续 reconnect / 文件视图都会出错。
+                    let tabs = self.tab_indices_for_host(&host);
+                    let closed = tabs.len();
+                    for idx in tabs.into_iter().rev() {
+                        self.close_tab(idx).await?;
+                    }
+
+                    // 级联清理：主机引用的 account + 按 id 约定的三条（认证方式可能变过）
+                    let mut accounts = accounts_of_host(&host);
+                    for a in [
+                        host.id.clone(),
+                        format!("{}.key", host.id),
+                        format!("{}.key.pass", host.id),
+                    ] {
+                        if !accounts.contains(&a) {
+                            accounts.push(a);
+                        }
+                    }
+                    for account in accounts {
+                        let _ = self
+                            .client
+                            .call(
+                                methods::CREDENTIAL_DELETE,
+                                json!({ "service": CRED_SERVICE, "account": account }),
+                            )
+                            .await;
+                    }
+                    self.notice = if closed > 0 {
+                        format!("已删除 {}，并关闭 {closed} 个连接", host.name)
+                    } else {
+                        format!("已删除 {}", host.name)
+                    };
                 }
                 _ => self.notice = "已取消删除".into(),
             }
@@ -2383,10 +2578,16 @@ impl App {
         }
 
         if let Some(host) = &self.pending_delete {
-            let area = centered_rect(50, 5, f.area());
+            let n = self.tab_count_for_host(host);
+            let area = centered_rect(50, 6, f.area());
             let block = Block::default().borders(Borders::ALL).title("确认删除");
             let text = vec![
                 Line::from(format!("确定删除主机 `{}`？", host.name)),
+                Line::from(if n > 0 {
+                    format!("该主机的 {n} 个连接也会被关闭。")
+                } else {
+                    String::new()
+                }),
                 Line::from(""),
                 Line::from("按 y 确认，其它键取消"),
             ];
@@ -2826,6 +3027,7 @@ impl App {
                     let auth = match &h.auth {
                         sh0_core::CredentialRef::Agent => "agent",
                         sh0_core::CredentialRef::KeyFile { .. } => "key",
+                        sh0_core::CredentialRef::Key { .. } => "key",
                         sh0_core::CredentialRef::Password { .. } => "pw",
                         sh0_core::CredentialRef::Interactive => "kbd",
                         sh0_core::CredentialRef::None => "none",
@@ -2856,21 +3058,42 @@ impl App {
     }
 
     fn draw_terminal(&self, f: &mut ratatui::Frame, area: Rect) {
+        let focused = self.focus == Focus::Terminal;
+        let border = if focused {
+            self.theme.accent
+        } else {
+            self.theme.border_dim
+        };
+        let title = if focused { " 终端 [焦点] " } else { " 终端 " };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(title);
+        let inner = block.inner(area);
+        // 鼠标坐标 → 终端网格坐标必须用边框以内，否则会整体偏一格
+        self.term_area.set(inner);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
         let Some(tab) = self.tabs.get(self.active) else {
-            let hint = "左侧选择主机后回车连接 · Ctrl+T 新建 · Ctrl+B 切换焦点 · Ctrl+Q 退出";
+            let hint = "左侧选择主机后回车连接 · Ctrl+T 选主机 · Ctrl+B 切换焦点 · Ctrl+Q 退出";
             f.render_widget(
-                Paragraph::new(hint).style(
-                    Style::default()
-                        .fg(self.theme.border)
-                        .add_modifier(Modifier::DIM),
-                ),
-                area,
+                Paragraph::new(hint)
+                    .wrap(Wrap { trim: true })
+                    .style(
+                        Style::default()
+                            .fg(self.theme.border)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                inner,
             );
             return;
         };
 
-        let rows = area.height as usize;
-        let cols = area.width as usize;
+        let rows = inner.height as usize;
+        let cols = inner.width as usize;
         let lines = tab.screen.view_lines();
         let mut out: Vec<Line> = Vec::with_capacity(rows);
 
@@ -2897,7 +3120,7 @@ impl App {
                 out[cy] = render_line_with_cursor(line, cols, cx, &self.theme);
             }
         }
-        f.render_widget(Paragraph::new(out), area);
+        f.render_widget(Paragraph::new(out), inner);
     }
 
     fn draw_status(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -2941,8 +3164,10 @@ impl App {
         }
         let right = if self.view == View::Files {
             "Tab 切栏 · ↑↓ 选择 · Space 标记 · F5 传走 · F6 改名 · F7 建目录 · F8 删除 · p 权限 · F9 回终端"
+        } else if self.focus == Focus::Tree {
+            "n 新建并连接 · e 编辑 · d 删除 · / 搜索 · Enter 连接 · Ctrl+Q 退出"
         } else {
-            "Ctrl+Q 退出 · Ctrl+T 新建 · Ctrl+W 关闭 · Ctrl+B 焦点"
+            "Ctrl+Q 退出 · Ctrl+T 选主机 · Ctrl+W 关闭 · Ctrl+B 焦点"
         };
         let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let pad = (area.width as usize).saturating_sub(left_len + right.chars().count());
@@ -2960,7 +3185,10 @@ impl App {
     }
 
     fn draw_form(&self, f: &mut ratatui::Frame, form: &HostForm) {
-        let area = centered_rect(60, form.fields.len() as u16 + 5, f.area());
+        let visible = (0..form.fields.len())
+            .filter(|i| form.field_visible(*i))
+            .count() as u16;
+        let area = centered_rect(64, visible + 7, f.area());
         let title = if form.editing.is_some() {
             " 编辑主机 "
         } else {
@@ -2975,6 +3203,9 @@ impl App {
 
         let mut lines: Vec<Line> = Vec::new();
         for (i, field) in form.fields.iter().enumerate() {
+            if !form.field_visible(i) {
+                continue;
+            }
             let focused = i == form.focus;
             let marker = if focused { "▸" } else { " " };
             let style = if focused {
@@ -2984,16 +3215,32 @@ impl App {
             } else {
                 Style::default().fg(self.theme.fg)
             };
+            // 密码/私钥口令只显示长度，不把明文画到屏幕上（防肩窥/录屏）
+            let shown = if field.secret {
+                "*".repeat(field.value.chars().count())
+            } else {
+                field.value.clone()
+            };
+            // 按**显示列宽**对齐，而不是字符数：标签里有中文/箭头，
+            // `{:<28}` 数的是 char，中文占 2 列，右侧输入框会参差不齐。
+            let label = format!("{marker} {}", field.label);
+            let pad = FORM_LABEL_COLS.saturating_sub(display_cols(&label));
             lines.push(Line::from(vec![
-                Span::raw(format!("{marker} {:<28}", field.label)),
-                Span::styled(format!(" {} ", field.value), style),
+                Span::raw(format!("{label}{}", " ".repeat(pad))),
+                Span::styled(format!(" {shown} "), style),
             ]));
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "Enter 保存 · Esc 取消 · Tab/↑↓ 切换字段",
+            "Enter 保存并连接 · Ctrl+S 仅保存 · ←/→ 切换认证 · Tab/↑↓ 换字段 · Esc 取消",
             Style::default().fg(self.theme.border),
         )));
+        if !self.notice.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(" ! {}", self.notice),
+                Style::default().fg(self.theme.accent),
+            )));
+        }
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
@@ -3027,6 +3274,11 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// 字符串在终端里占多少列（CJK/emoji 算 2，组合字符算 0）
+fn display_cols(s: &str) -> usize {
+    s.chars().map(sh0_term::cell::char_width).sum()
+}
+
 fn centered_rect(width_pct: u16, height: u16, area: Rect) -> Rect {
     let w = area.width * width_pct / 100;
     let h = height.min(area.height);
@@ -3047,9 +3299,11 @@ pub async fn run(
     host_selector: Option<&str>,
 ) -> anyhow::Result<()> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((cfg.cols, cfg.rows));
-    // 终端区尺寸：减去标签栏与状态栏，再减去可选树宽
-    let term_cols = cols.saturating_sub(DEFAULT_TREE_WIDTH).max(MIN_TERM_COLS);
-    let term_rows = rows.saturating_sub(2).max(5);
+    // 终端区尺寸：减去标签栏与状态栏，再减去树宽和终端边框
+    let term_cols = cols
+        .saturating_sub(DEFAULT_TREE_WIDTH + FRAME_X)
+        .max(MIN_TERM_COLS);
+    let term_rows = rows.saturating_sub(2 + FRAME_Y).max(5);
 
     let mut app = App::new(client, events, store, cfg);
     app.term_size = (term_cols, term_rows);
@@ -3097,8 +3351,11 @@ async fn loop_inner(
                 Event::Mouse(m) => app.on_mouse(m).await?,
                 Event::Resize(_, _) => {
                     let size = terminal.size()?;
-                    let cols = size.width.saturating_sub(app.tree_width).max(MIN_TERM_COLS);
-                    let rows = size.height.saturating_sub(2).max(5);
+                    let cols = size
+                        .width
+                        .saturating_sub(app.tree_width + FRAME_X)
+                        .max(MIN_TERM_COLS);
+                    let rows = size.height.saturating_sub(2 + FRAME_Y).max(5);
                     app.on_resize(cols, rows).await?;
                 }
                 Event::Paste(text) => {
@@ -3129,6 +3386,13 @@ async fn loop_inner(
 
         // 3) 推进传输队列（每帧一块，界面不卡）
         app.tick_transfers().await;
+
+        // 3.5) 保活：每 30s ping 一次。daemon 据此区分「TUI 还开着」与
+        // 「TUI 已退出」，才能安全地做 5 分钟空闲自退出。
+        if app.last_heartbeat.elapsed() >= Duration::from_secs(30) {
+            app.last_heartbeat = Instant::now();
+            let _ = app.client.call(methods::PING, json!({})).await;
+        }
 
         // 4) 渲染
         terminal.draw(|f| app.draw(f))?;
@@ -3239,4 +3503,31 @@ fn base64_encode(input: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 表单标签必须能放进固定列宽，否则右侧输入框又会参差不齐
+    #[test]
+    fn form_labels_fit_alignment_column() {
+        let form = HostForm::new(None);
+        for field in &form.fields {
+            let w = display_cols(&format!("▸ {}", field.label));
+            assert!(
+                w <= FORM_LABEL_COLS,
+                "标签 `{}` 占 {w} 列，超过 FORM_LABEL_COLS={FORM_LABEL_COLS}",
+                field.label
+            );
+        }
+    }
+
+    #[test]
+    fn display_cols_counts_cjk_as_two() {
+        assert_eq!(display_cols("abc"), 3);
+        assert_eq!(display_cols("名称"), 4);
+        assert_eq!(display_cols("a名"), 3);
+        assert_eq!(display_cols(""), 0);
+    }
 }

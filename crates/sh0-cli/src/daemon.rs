@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,6 +89,22 @@ pub struct DaemonState {
     rate: RateLimiter,
     /// 广播开关与参与会话（FR-5.1）
     broadcast: Mutex<Broadcast>,
+    /// 凭据存储（钥匙串 / 本地 data-key vault）。TUI 通过 IPC 写入，
+    /// 同时作为 `VaultResolver` 的后端供 SSH 认证取值。
+    creds: Option<Arc<CredentialStore>>,
+    /// 最近一次请求时间：daemon 空闲自退出的依据（TUI 会定期 ping 保活）
+    last_request: std::sync::Mutex<Instant>,
+    /// 正在处理中的请求数：长时间 exec 期间不能被空闲回收掐断
+    in_flight: AtomicUsize,
+}
+
+/// `call` 的 RAII 计数：函数从任一路径返回都会减一
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl DaemonState {
@@ -100,6 +116,7 @@ impl DaemonState {
         factory: Arc<dyn TransportFactory>,
         engine: Arc<RiskEngine>,
         audit: Option<Arc<AuditDb>>,
+        creds: Option<Arc<CredentialStore>>,
     ) -> (Arc<Self>, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
         let budget = if cfg.memory_budget_mb == 0 {
@@ -121,8 +138,33 @@ impl DaemonState {
             confirms: ConfirmStore::new(),
             rate: RateLimiter::new(),
             broadcast: Mutex::new(Broadcast::default()),
+            creds,
+            last_request: std::sync::Mutex::new(Instant::now()),
+            in_flight: AtomicUsize::new(0),
         });
         (state, rx)
+    }
+
+    /// 空闲时长（最近一次 IPC 请求距今）
+    pub fn idle_for(&self) -> Duration {
+        self.last_request.lock().unwrap().elapsed()
+    }
+
+    /// 当前活跃会话数（空闲回收要看它）
+    pub async fn session_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
+    /// 正在处理中的请求数
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// 请求优雅退出（空闲回收 / 隐藏的 daemon stop 都走这里）
+    pub async fn request_shutdown(&self) {
+        if let Some(tx) = self.shutdown.lock().await.take() {
+            let _ = tx.send(());
+        }
     }
 
     fn session_config(&self, cols: u16, rows: u16) -> SessionConfig {
@@ -1801,6 +1843,19 @@ fn grid_view_json(v: &GridView) -> Value {
     })
 }
 
+/// 凭据类 IPC 的字符串参数校验
+fn cred_arg(params: &Value, key: &str) -> std::result::Result<String, ErrorBody> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| ErrorBody {
+            code: "invalid_args".into(),
+            message: format!("缺少 {key} 参数"),
+            data: None,
+        })
+}
+
 #[async_trait]
 impl Handler for DaemonState {
     async fn call(
@@ -1809,8 +1864,58 @@ impl Handler for DaemonState {
         params: Value,
         _hub: &EventHub,
     ) -> std::result::Result<Value, ErrorBody> {
+        // 任何请求都算「daemon 还有人用」——空闲回收靠它，TUI 会定期 ping。
+        // in_flight 兜住长时间的 exec：请求没结束就绝不自动退出。
+        *self.last_request.lock().unwrap() = Instant::now();
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _in_flight = InFlight(&self.in_flight);
         match method {
             methods::PING => Ok(json!({ "pong": true, "pid": std::process::id() })),
+
+            // ---- TUI 凭据写入（AI 侧不暴露）----
+            methods::CREDENTIAL_SET => {
+                let service = cred_arg(&params, "service")?;
+                let account = cred_arg(&params, "account")?;
+                let value = cred_arg(&params, "value")?;
+                let creds = self.creds.as_ref().ok_or_else(|| ErrorBody {
+                    code: "credential_unavailable".into(),
+                    message: "凭据存储不可用（钥匙串与 vault 都没打开）".into(),
+                    data: None,
+                })?;
+                creds.set(&service, &account, &value).map_err(|e| ErrorBody {
+                    code: "credential_unavailable".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
+                // 只回后端名，绝不回显 value
+                Ok(json!({ "backend": creds.backend() }))
+            }
+
+            methods::CREDENTIAL_DELETE => {
+                let service = cred_arg(&params, "service")?;
+                let account = cred_arg(&params, "account")?;
+                let creds = self.creds.as_ref().ok_or_else(|| ErrorBody {
+                    code: "credential_unavailable".into(),
+                    message: "凭据存储不可用".into(),
+                    data: None,
+                })?;
+                let removed = creds.delete(&service, &account).map_err(|e| ErrorBody {
+                    code: "credential_unavailable".into(),
+                    message: e.to_string(),
+                    data: None,
+                })?;
+                Ok(json!({ "removed": removed }))
+            }
+
+            methods::CREDENTIAL_STATUS => {
+                let st = self.creds.as_ref().map(|c| c.status());
+                Ok(json!({
+                    "available": st.is_some(),
+                    "keyring_available": st.map(|s| s.keyring_available).unwrap_or(false),
+                    "vault_ready": st.map(|s| s.vault_ready).unwrap_or(false),
+                    "backend": st.map(|s| s.backend).unwrap_or("none"),
+                }))
+            }
 
             methods::SESSION_LIST => {
                 let sessions = self.snapshot_list().await;
@@ -1855,9 +1960,12 @@ impl Handler for DaemonState {
                     stdout: None,
                     stderr: None,
                 });
-                Ok(
-                    json!({ "id": handle.id, "state": SessionState::Connecting.as_str(), "host": handle.host.name }),
-                )
+                Ok(json!({
+                    "id": handle.id,
+                    "state": SessionState::Connecting.as_str(),
+                    "host": handle.host.name,
+                    "host_id": handle.host.id,
+                }))
             }
 
             methods::SESSION_CLOSE => {
@@ -2349,33 +2457,6 @@ fn sftp_transport_code(e: &sh0_core::transport::TransportError) -> &'static str 
     }
 }
 
-/// 首次使用时生成一个示例主机条目，避免用户面对空配置无从下手
-pub fn seed_example_host(store: &Store) -> anyhow::Result<()> {
-    let mut hosts = store.load_hosts()?;
-    if !hosts.hosts.is_empty() {
-        return Ok(());
-    }
-    hosts.hosts.push(sh0_core::Host {
-        id: sh0_core::new_host_id(),
-        name: "example".into(),
-        group: vec!["demo".into()],
-        addr: "127.0.0.1".into(),
-        port: 22,
-        user: std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "root".into()),
-        auth: sh0_core::CredentialRef::Agent,
-        tags: vec![],
-        note: Some("示例条目：编辑 ~/.config/sh0/hosts.toml 改成你自己的主机".into()),
-        risk_cap: None,
-        proxy_jump: None,
-        jump: None,
-    });
-    store.save_hosts(&hosts)?;
-    tracing::info!("已生成示例主机条目 example");
-    Ok(())
-}
-
 /// 改了必须重启才生效的配置项（热重载提示用）
 const RESTART_ONLY_KEYS: [(&str, &str); 6] = [
     ("term", "term"),
@@ -2440,8 +2521,9 @@ pub async fn run_foreground(
         token: token.clone(),
         started_at: chrono::Utc::now().to_rfc3339(),
     };
-    std::fs::write(paths.daemon_info(), serde_json::to_string_pretty(&info)?)?;
-    std::fs::write(paths.pid_file(), info.pid.to_string())?;
+    // daemon.json 里有 IPC 令牌；M6 起它还能触发凭据写入，必须仅本用户可读
+    write_runtime_file(&paths.daemon_info(), &serde_json::to_string_pretty(&info)?)?;
+    write_runtime_file(&paths.pid_file(), &info.pid.to_string())?;
 
     tracing::info!("daemon 已启动 pid={} addr={}", info.pid, info.addr);
 
@@ -2467,7 +2549,8 @@ pub async fn run_foreground(
     // 2) 风险引擎 + 3) 审计库
     let (engine, audit) = assemble_m2(&store, &cfg);
 
-    let (state, shutdown_rx) = DaemonState::new(store, cfg, hub.clone(), factory, engine, audit);
+    let (state, shutdown_rx) =
+        DaemonState::new(store, cfg, hub.clone(), factory, engine, audit, creds);
 
     // 配置文件监视：改完 config.toml 不必重启（FR-9.3）。
     // 用 mtime 轮询而不是 inotify——跨平台要三套实现，而这里 2 秒一次
@@ -2488,6 +2571,27 @@ pub async fn run_foreground(
                     Ok((true, note)) => tracing::info!("检测到配置变更：{note}"),
                     Ok((false, _)) => {}
                     Err(e) => tracing::warn!("配置重载失败：{}", e.message),
+                }
+            }
+        })
+    };
+
+    // 空闲自退出（M6）：TUI 每 30s ping 一次保活；TUI 退出后若既没有会话、
+    // 也没有新请求，5 分钟后 daemon 自己收工，用户不再需要 `daemon stop`。
+    let idle = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            const IDLE_EXIT_SECS: u64 = 300;
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if state.session_count().await == 0
+                    && state.in_flight() == 0
+                    && state.idle_for() >= Duration::from_secs(IDLE_EXIT_SECS)
+                {
+                    tracing::info!("daemon 空闲超过 {IDLE_EXIT_SECS}s，自动退出");
+                    state.request_shutdown().await;
+                    break;
                 }
             }
         })
@@ -2517,10 +2621,22 @@ pub async fn run_foreground(
             }
         }
     }
+    idle.abort();
     watcher.abort();
 
     let _ = std::fs::remove_file(paths.daemon_info());
     let _ = std::fs::remove_file(paths.pid_file());
+    Ok(())
+}
+
+/// 写运行时文件并收紧权限（daemon.json 含 IPC 令牌）
+fn write_runtime_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -2534,9 +2650,20 @@ pub async fn run_for_test(
     cfg: AppConfig,
     factory: Arc<dyn TransportFactory>,
 ) -> anyhow::Result<(SocketAddr, String, oneshot::Sender<()>)> {
+    run_for_test_with_creds(store, cfg, factory, None).await
+}
+
+/// 带凭据存储的测试入口（`credential.*` 契约测试用）。
+pub async fn run_for_test_with_creds(
+    store: Arc<Store>,
+    cfg: AppConfig,
+    factory: Arc<dyn TransportFactory>,
+    creds: Option<Arc<CredentialStore>>,
+) -> anyhow::Result<(SocketAddr, String, oneshot::Sender<()>)> {
     let (engine, audit) = assemble_m2(&store, &cfg);
     let hub = EventHub::new();
-    let (state, shutdown_rx) = DaemonState::new(store, cfg, hub.clone(), factory, engine, audit);
+    let (state, shutdown_rx) =
+        DaemonState::new(store, cfg, hub.clone(), factory, engine, audit, creds);
 
     let probe = TcpListener::bind("127.0.0.1:0").await?;
     let addr: SocketAddr = probe.local_addr()?;
@@ -2556,6 +2683,10 @@ pub async fn run_for_test(
             _ = stop_rx => {}
         }
     });
+
+    // 让 serve 任务先跑到 bind/accept：connect 对已关闭的回环端口会在首次 poll
+    // 就返回 ECONNREFUSED，若这里不让出调度点，客户端会抢在监听之前失败。
+    tokio::task::yield_now().await;
 
     Ok((addr, client_token, stop_tx))
 }

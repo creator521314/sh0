@@ -49,6 +49,13 @@ pub enum CredentialRef {
         #[serde(default)]
         passphrase: Option<SecretRef>,
     },
+    /// 私钥 PEM 已导入本地加密库（路径无关；`secret` 指向 PEM 值，
+    /// `passphrase` 指向私钥口令）。TUI 的「导入认证文件」走这条。
+    Key {
+        secret: SecretRef,
+        #[serde(default)]
+        passphrase: Option<SecretRef>,
+    },
     /// 密码认证
     Password { secret: SecretRef },
     /// keyboard-interactive，含 2FA/OTP 交互应答
@@ -60,6 +67,8 @@ pub enum CredentialRef {
 /// 一台远程主机的连接配置（需求 FR-1.1）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Host {
+    /// 主机 id。手写 hosts.toml 时可省略，加载时自动生成（TUI 新建仍显式生成）。
+    #[serde(default = "crate::ids::new_host_id")]
     pub id: HostId,
     pub name: String,
     /// 分组面包屑，如 ["prod", "web"]

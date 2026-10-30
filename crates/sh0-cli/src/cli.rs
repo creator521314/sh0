@@ -1,25 +1,34 @@
-//! 顶层命令路由（W0.2）
+//! 顶层命令路由。
+//!
+//! 用户入口：`tui` / `ai` / `help`，外加运维命令 `daemon`（run / stop）。
+//! daemon 平时由 `ensure` 自动拉起；把它暴露出来是为了调试与排障时能手动
+//! 前台运行或优雅停止，而不是只能 kill 进程。
 
 use clap::{Parser, Subcommand};
 use sh0_ai::AiObject;
 
 #[derive(Debug, Parser)]
-#[command(name = "sh0", version, about = "轻量级跨平台 TUI SSH/SFTP 管理工具")]
+#[command(
+    name = "sh0",
+    version,
+    about = "轻量级跨平台 TUI SSH/SFTP 管理工具",
+    disable_help_subcommand = true,
+    after_help = "后台 daemon：首次运行 tui/ai 时自动拉起，持有 SSH 会话、风险判定与审计；\
+                 无需手动管理，空闲 5 分钟自动退出。详见 `sh0 help`。"
+)]
 pub struct Cli {
+    /// 省略子命令时等价于 `sh0 help`
     #[command(subcommand)]
-    pub command: Cmd,
+    pub command: Option<Cmd>,
 }
 
+// 只在进程启动时解析一次，枚举大小无所谓；Box 反而让 clap derive 更绕
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
-    /// 常驻后端进程（通常由 sh0 自动拉起，无需手动执行）
-    Daemon {
-        #[command(subcommand)]
-        cmd: DaemonCmd,
-    },
     /// 启动 TUI 界面
     Tui {
-        /// 主机名称或 ID；省略时若只有一台主机则自动使用
+        /// 主机名称或 ID；省略时进入主机树选择
         host: Option<String>,
     },
     /// 面向 AI 的结构化接口
@@ -51,38 +60,13 @@ pub enum Cmd {
         #[arg(long, global = true)]
         quiet: bool,
     },
-    /// 主机清单管理
-    Host {
+    /// 显示帮助（含配置/数据目录与快速开始）
+    Help,
+    /// 常驻后端进程（通常自动拉起；调试/排障时可手动 run / stop）
+    Daemon {
         #[command(subcommand)]
-        cmd: HostCmd,
+        cmd: DaemonCmd,
     },
-    /// 凭据管理（OS 钥匙串 / 加密 vault，FR-1.4~FR-1.7）
-    Secret {
-        #[command(subcommand)]
-        cmd: SecretCmd,
-    },
-    /// 配置目录与校验
-    Config {
-        #[command(subcommand)]
-        cmd: ConfigCmd,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum SecretCmd {
-    /// 存入一条秘密（--stdin 从标准输入读，避免进入 shell 历史）
-    Set {
-        service: String,
-        account: String,
-        #[arg(long)]
-        stdin: bool,
-    },
-    /// 取出一条秘密（明文打印到 stdout，小心管道）
-    Get { service: String, account: String },
-    /// 列出 vault 中的条目名（钥匙串无法枚举）
-    List,
-    /// 删除一条秘密
-    Rm { service: String, account: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -95,49 +79,4 @@ pub enum DaemonCmd {
     },
     /// 优雅停止
     Stop,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum HostCmd {
-    /// 列出主机
-    List {
-        /// 输出结构化 JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// 导入既有配置（只读源文件，FR-1.10）
-    Import {
-        /// 来源：ssh（~/.ssh/config）或 xsh（Xshell 会话文件/目录）
-        #[arg(long, value_name = "ssh|xsh")]
-        from: String,
-        /// 源文件路径；ssh 缺省用 ~/.ssh/config
-        #[arg(long)]
-        path: Option<String>,
-        /// 只打印将要导入什么，不写入 hosts.toml
-        #[arg(long)]
-        dry_run: bool,
-        /// 输出结构化 JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ConfigCmd {
-    /// 打印配置、数据、运行时目录
-    Path,
-    /// 打印当前生效的配置（TOML）
-    Show {
-        /// 输出结构化 JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// 取一项配置，如 `sh0 config get limits.exec_timeout_sec`
-    Get { key: String },
-    /// 写一项配置，如 `sh0 config set limits.exec_timeout_sec 60`
-    Set { key: String, value: String },
-    /// 让运行中的 daemon 重新加载配置与主机清单
-    Reload,
-    /// 校验配置文件能否解析（不给改动就报错退出）
-    Check,
 }

@@ -1412,6 +1412,9 @@ async fn broadcast_fans_out_to_all_sessions() {
         .await
         .unwrap();
     assert_eq!(r["sent"].as_u64().unwrap(), 2, "两台都该收到: {r}");
+    // `sent` 只代表已投递到会话通道；mock 传输层的 send 在会话任务里异步执行，
+    // 这里让出一次调度再断言实际收到的字节。
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let hits = fx.factory.sends.lock().unwrap()[before..]
         .iter()
         .filter(|s| *s == "ls -la\n")
@@ -1428,6 +1431,7 @@ async fn broadcast_fans_out_to_all_sessions() {
         .await
         .unwrap();
     assert_eq!(r2["sent"].as_u64().unwrap(), 1);
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let hits2 = fx.factory.sends.lock().unwrap()[before2..]
         .iter()
         .filter(|s| *s == "whoami\n")
@@ -2674,4 +2678,204 @@ async fn host_import_from_xsh() {
     assert!(merged.skipped.iter().any(|(n, _)| n == "old-switch"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// M6：TUI 凭据写入（credential.* IPC）
+// ---------------------------------------------------------------------------
+
+/// 密码经 IPC 写入本地 data-key vault：落盘为密文、应答不回显、可删可查状态
+#[tokio::test]
+async fn credential_set_status_delete_over_ipc() {
+    // 强制走 vault，避免测试机钥匙串可用性影响断言
+    unsafe { std::env::set_var("SH0_DISABLE_KEYRING", "1") };
+
+    let dir = std::env::temp_dir().join(format!("sh0-cred-ipc-{}", sh0_core::new_host_id()));
+    let paths = Paths {
+        config_dir: dir.join("config"),
+        data_dir: dir.join("data"),
+        runtime_dir: dir.join("data").join("run"),
+    };
+    let store = Arc::new(Store::with_paths(paths.clone()).unwrap());
+    store
+        .save_hosts(&HostsFile {
+            version: 1,
+            hosts: vec![],
+        })
+        .unwrap();
+    let creds = Arc::new(CredentialStore::open(&paths).unwrap());
+    let cfg = AppConfig::default();
+
+    let (addr, token, _stop) = daemon::run_for_test_with_creds(
+        store,
+        cfg,
+        Arc::new(sh0_core::mock::MockFactory::repeating(vec![], 0)),
+        Some(creds.clone()),
+    )
+    .await
+    .expect("测试 daemon 启动失败");
+    let conn = sh0_ipc::IpcClient::connect(&addr.to_string(), &token)
+        .await
+        .expect("IPC 连接失败");
+    let client = conn.client;
+
+    let r = client
+        .call(
+            methods::CREDENTIAL_SET,
+            json!({ "service": "sh0", "account": "acc-1", "value": "s3cr3t" }),
+        )
+        .await
+        .expect("credential.set 失败");
+    assert_eq!(r["backend"], "vault");
+    assert!(
+        !r.to_string().contains("s3cr3t"),
+        "IPC 应答不能回显明文: {r}"
+    );
+    assert_eq!(
+        creds.get("sh0", "acc-1").unwrap().as_deref(),
+        Some("s3cr3t")
+    );
+
+    // SSH 认证走的就是这条解析路径：SecretRef::Keyring -> VaultResolver -> 加密库
+    let resolver = sh0::creds_bridge::VaultResolver {
+        store: creds.clone(),
+    };
+    let resolved = sh0_core::SecretResolver::resolve(
+        &resolver,
+        &sh0_core::SecretRef::Keyring {
+            service: "sh0".into(),
+            account: "acc-1".into(),
+        },
+        "密码",
+    )
+    .unwrap();
+    assert_eq!(resolved, "s3cr3t");
+
+    let st = client
+        .call(methods::CREDENTIAL_STATUS, json!({}))
+        .await
+        .expect("credential.status 失败");
+    assert_eq!(st["available"], true);
+    assert_eq!(st["vault_ready"], true);
+
+    let vault = std::fs::read_to_string(paths.vault_file()).unwrap();
+    assert!(!vault.contains("s3cr3t"), "vault 落盘必须是密文");
+
+    let d = client
+        .call(
+            methods::CREDENTIAL_DELETE,
+            json!({ "service": "sh0", "account": "acc-1" }),
+        )
+        .await
+        .expect("credential.delete 失败");
+    assert_eq!(d["removed"], true);
+    assert_eq!(creds.get("sh0", "acc-1").unwrap(), None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// M6：终端区边框与焦点标识
+// ---------------------------------------------------------------------------
+
+fn buffer_to_text(buf: &ratatui::buffer::Buffer) -> String {
+    let area = *buf.area();
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            if let Some(cell) = buf.cell((x, y)) {
+                out.push_str(cell.symbol());
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[tokio::test]
+async fn tui_terminal_area_has_border_and_focus_marker() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let text = buffer_to_text(term.backend().buffer());
+    // 宽字符在 buffer 里占两格，第二格是空 symbol；比对前去掉空白
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("终端[焦点]"),
+        "焦点在终端时标题应带焦点标识:\n{text}"
+    );
+    assert!(
+        text.contains('┌') && text.contains('┐') && text.contains('└'),
+        "终端区应有边框:\n{text}"
+    );
+
+    // Ctrl+B 把焦点交给主机树：终端标题不再带 [焦点]
+    app.on_key(key(
+        crossterm::event::KeyCode::Char('b'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ))
+    .await
+    .unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let text = buffer_to_text(term.backend().buffer());
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("主机"), "树标题应在:\n{text}");
+    assert!(
+        !compact.contains("终端[焦点]"),
+        "焦点移走后不应再显示 [焦点]:\n{text}"
+    );
+}
+
+/// 删除主机时必须同时关掉它的连接，不能留下“主机没了、会话还在”的右栏标签
+#[tokio::test]
+async fn deleting_host_closes_its_tabs() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[]), host_named("h2", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    app.open("h2").await.unwrap();
+    assert_eq!(app.tab_count(), 2);
+
+    // 焦点交给主机树（默认选中第一台 h1），d → y 删除
+    app.on_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    app.on_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.on_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(app.tab_count(), 1, "只该关掉 h1 的连接，h2 要保留");
+    assert_eq!(app.tab_host_names(), vec!["h2"], "留下的必须是 h2");
+    assert!(
+        app.notice().contains("关闭 1 个连接"),
+        "notice 应说明关了几个连接: {}",
+        app.notice()
+    );
+    assert!(
+        fx.store
+            .load_hosts()
+            .unwrap()
+            .hosts
+            .iter()
+            .all(|h| h.name != "h1"),
+        "h1 应从 hosts.toml 删除"
+    );
 }

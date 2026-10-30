@@ -695,7 +695,7 @@ async fn dispatch(
                     ));
                 }
                 if text.is_empty() {
-                    text = "（无匹配主机，可用编辑器编辑 hosts.toml 添加）\n".to_string();
+                    text = "（无匹配主机，可在 `sh0 tui` 里按 n 新建）\n".to_string();
                 }
 
                 Ok((text, json!({ "hosts": hosts })))
@@ -759,6 +759,7 @@ async fn dispatch(
                 let auth_kind = match &h.auth {
                     sh0_core::CredentialRef::Agent => "agent",
                     sh0_core::CredentialRef::KeyFile { .. } => "keyfile",
+                    sh0_core::CredentialRef::Key { .. } => "key",
                     sh0_core::CredentialRef::Password { .. } => "password",
                     sh0_core::CredentialRef::Interactive => "interactive",
                     sh0_core::CredentialRef::None => "none",

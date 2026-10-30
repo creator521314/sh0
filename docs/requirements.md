@@ -92,11 +92,11 @@
 | --- | --- | --- |
 | FR-1.1 | 主机配置字段：`id / 名称 / 分组 / 地址 / 端口 / 用户名 / 认证引用 / 标签 / 备注 / 跳板机 / 启动时自动连接` | P0 |
 | FR-1.2 | 分组树形组织（可嵌套），支持按名称/地址/标签模糊搜索 | P0 |
-| FR-1.3 | 主机增删改查（TUI 内表单 + `sh0 host ...` 子命令） | P0 |
+| FR-1.3 | 主机增删改查：TUI 内表单（新建 / 编辑 / 删除 / 连接）；查询与导入走 `sh0 ai host list/import`（M6 移除了 `sh0 host` 子命令） | P0 |
 | FR-1.4 | 认证方式全支持：密码、私钥文件（OpenSSH / PEM）、ssh-agent、keyboard-interactive、2FA/OTP 交互应答 | P0 |
 | FR-1.5 | 凭据与主机解耦：同一凭据可被多台主机引用 | P0 |
-| FR-1.6 | 凭据存储：优先 OS 钥匙串（Keychain / DPAPI / Secret Service）；不可用或用户选择时回落到主密码加密的本地文件（ChaCha20-Poly1305 + Argon2 派生） | P0 |
-| FR-1.7 | 配置文件中**绝不出现明文密码**；私钥只存路径，不内嵌内容 | P0 |
+| FR-1.6 | 凭据存储：优先 OS 钥匙串（Keychain / DPAPI / Secret Service）；不可用时回落到本地 data-key 加密文件（`creds.key` 0600 + ChaCha20-Poly1305） | P0 |
+| FR-1.7 | 配置文件中**绝不出现明文密码**；外部私钥只存路径，导入模式的私钥内容存加密库 | P0 |
 | FR-1.8 | 首次连接指纹确认（trust-on-first-use），指纹存于 `known_hosts` 兼容格式 | P0 |
 | FR-1.9 | 跳板机 / ProxyJump 链式连接 ✅ | P1 |
 | FR-1.10 | 配置导入导出（Xshell `.xsh`、OpenSSH `~/.ssh/config` 只读导入）✅ 导入侧已交付（W5.3），导出未做 | P2 |
@@ -232,7 +232,7 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 | FR-9.1 | 主机/分组/偏好配置：TOML，位于平台配置目录（Linux `~/.config/sh0/`、macOS `~/Library/Application Support/sh0/`、Windows `%APPDATA%\sh0\`） | P0 |
 | FR-9.2 | 日志与审计：SQLite 单文件，与配置同目录 | P0 |
 | FR-9.3 | 配置热重载：文件变更时自动生效，不打断已有会话 ✅ daemon 每 2 秒比对 mtime；`term.*`、`keepalive_secs`、`cols/rows`、`memory_budget_mb`、`audit.enabled` 属"必须重启"键，改动时日志提示 | P1 |
-| FR-9.4 | `sh0 config` 子命令：打印路径、校验、迁移版本 ✅ `show` / `get` / `set` / `reload` / `check` | P1 |
+| FR-9.4 | 配置路径与校验：`sh0 help` 打印路径；任意 `sh0` 启动解析配置（等效校验）；配置直接编辑文件（M6 移除了 `sh0 config` 子命令） | P1 |
 | FR-9.5 | 配置文件版本号，跨版本自动迁移 ✅ 版本号字段已在，未知键保留不丢；尚未出现过破坏性改版，故迁移逻辑只做了"保留未知键 + 缺键填默认"这一层 | P1 |
 
 ---
@@ -287,7 +287,8 @@ OQ-5（W3.5，`batch_run` / `batch_result` 落 SQLite + `ai batch list/show` 回
 | M2 | AI 接口 MVP ✅ | `ai` 子命令全套（session/exec/screen/input/log）、`--json` 输出、风险三档引擎、审计入库、凭据无明文 |
 | M3 | 批量与广播 ✅ | 广播输入、批量执行与结果汇总视图、批量风险与配额、批量历史持久化 |
 | M4 | SFTP 落地 ✅ | 双栏文件管理、传输队列、进度与重试、`ai file *` 全套子命令 |
-| M5 | 打磨 ✅ | 命令面板与多主题、配置热重载与 `sh0 config`、主机导入（ssh / xsh）、ProxyJump 跳板机、日志轮转、体积与启动实测（5.77 MB / ~90 ms）；端口转发与 MCP adapter 两项 P2 未做，跨平台 CI 产物未提供 |
+| M5 | 打磨 ✅ | 命令面板与多主题、配置热重载、主机导入（ssh / xsh）、ProxyJump 跳板机、日志轮转、体积与启动实测（5.77 MB / ~90 ms）；端口转发与 MCP adapter 两项 P2 未做，跨平台 CI 产物未提供 |
+| M6 | 简化 ✅ | 顶层收敛为 `tui / ai / help`；主机 CRUD 与新建即连接回到 TUI；密码/私钥就地录入并写入本地 data-key 加密库；daemon 空闲自退出 |
 
 ---
 

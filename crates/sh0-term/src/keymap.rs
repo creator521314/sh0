@@ -116,13 +116,13 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Action::Quit => "退出",
-            Action::NewTab => "新建会话",
+            Action::NewTab => "选择主机开新会话",
             Action::CloseTab => "关闭会话",
             Action::NextTab => "下一个会话",
             Action::PrevTab => "上一个会话",
             Action::ToggleFocus => "切换焦点",
             Action::HostSearch => "搜索主机",
-            Action::HostNew => "新建主机",
+            Action::HostNew => "新建主机并连接",
             Action::HostEdit => "编辑主机",
             Action::HostDelete => "删除主机",
             Action::ScrollUp => "向上翻页",
