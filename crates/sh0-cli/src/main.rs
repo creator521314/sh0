@@ -13,16 +13,25 @@ use sh0::daemon;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // 只有后台 daemon 才落文件日志；其余命令保持"输出到 stdout"的命令行习惯
+    // 后台 daemon 与 TUI 都落文件日志：TUI 占着整屏，日志打到 stdout 会把界面打花；
+    // 其余命令保持"输出到 stdout"的命令行习惯。
     let file_log = match &cli.command {
         Some(Cmd::Daemon {
             cmd: DaemonCmd::Run { background: true },
-        }) => Some(()),
+        }) => Some(false),
+        Some(Cmd::Tui { .. }) => Some(true),
         _ => None,
     };
     let store = Arc::new(Store::new()?);
     let cfg = store.load_config()?;
-    init_logging(file_log.map(|_| (store.paths().daemon_log(), cfg.log.clone())));
+    init_logging(file_log.map(|tui| {
+        let path = if tui {
+            store.paths().tui_log()
+        } else {
+            store.paths().daemon_log()
+        };
+        (path, cfg.log.clone())
+    }));
 
     match cli.command {
         None | Some(Cmd::Help) => print_help(&store),
@@ -125,7 +134,7 @@ sh0 —— 轻量级跨平台 TUI SSH/SFTP 连接管理工具
   风险判定、确认令牌与审计；TUI 退出后会话仍由它保持。
   无需手动管理；没有会话且 5 分钟无请求时自动退出。
   调试 / 排障：sh0 daemon run 前台运行，sh0 daemon stop 优雅停止。
-  日志：{}/daemon.log
+  日志：{}/daemon.log（daemon）、tui.log（TUI）
 
 快速开始：
   1) sh0 tui                按 n 新建，填地址/用户/密码（默认 password，←/→ 切 agent/key）
@@ -133,6 +142,7 @@ sh0 —— 轻量级跨平台 TUI SSH/SFTP 连接管理工具
   3) sh0 ai exec run --host web-01 --cmd \"uname -a\" --json
 
 凭据：密码与导入的私钥加密保存在数据目录的 creds.vault（本地 data-key）。
+高亮：终端输出正则高亮在配置目录的 highlight.toml（首次进 TUI 时生成默认规则）。
 故障排查：先看后台 daemon 的日志（见上）。",
         p.config_dir.display(),
         p.data_dir.display(),
@@ -147,8 +157,11 @@ sh0 —— 轻量级跨平台 TUI SSH/SFTP 连接管理工具
 /// 一直追加到把磁盘写满是最难排查的一类故障。前台运行仍写 stdout，
 /// 免得 `sh0 daemon run` 调试时看不到东西。
 fn init_logging(log_file: Option<(std::path::PathBuf, sh0_store::LogConfig)>) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // arboard 在 Wayland 缺 data-control 时会 WARN 再回退 X11；这是预期行为，
+        // 但它的默认 target 会进日志。TUI 已落 tui.log，这里再默认静音，避免噪音。
+        tracing_subscriber::EnvFilter::new("info,arboard=off,wl_clipboard_rs=off")
+    });
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false);

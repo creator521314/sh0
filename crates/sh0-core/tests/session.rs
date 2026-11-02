@@ -21,6 +21,7 @@ fn host() -> Host {
         port: 22,
         user: "u".into(),
         auth: CredentialRef::None,
+        highlight: None,
         tags: vec![],
         note: None,
         risk_cap: None,

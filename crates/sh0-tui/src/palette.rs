@@ -25,6 +25,8 @@ pub enum PaletteCmd {
     Connect(String),
     /// 切换配色主题
     Theme(&'static str),
+    /// 设置全局默认高亮方案（只影响新会话）
+    Highlight(String),
 }
 
 /// 面板状态：输入框 + 当前选中行
@@ -62,7 +64,12 @@ impl Palette {
 }
 
 /// 候选集：内置动作 + 全部主机 + 主题。动作顺序按使用频率手排过。
-pub fn items(hosts: &[(String, String)], current_theme: &str) -> Vec<PaletteItem> {
+pub fn items(
+    hosts: &[(String, String)],
+    current_theme: &str,
+    highlights: &[String],
+    current_highlight: &str,
+) -> Vec<PaletteItem> {
     const ACTIONS: [Action; 21] = [
         Action::HostSearch,
         Action::HostNew,
@@ -87,7 +94,7 @@ pub fn items(hosts: &[(String, String)], current_theme: &str) -> Vec<PaletteItem
         Action::Quit,
     ];
 
-    let mut out = Vec::with_capacity(ACTIONS.len() + hosts.len() + 3);
+    let mut out = Vec::with_capacity(ACTIONS.len() + hosts.len() + highlights.len() + 3);
     for a in ACTIONS {
         out.push(PaletteItem {
             title: a.label().to_string(),
@@ -111,6 +118,15 @@ pub fn items(hosts: &[(String, String)], current_theme: &str) -> Vec<PaletteItem
             hint: "主题".to_string(),
             kind: "主题",
             cmd: PaletteCmd::Theme(t),
+        });
+    }
+    for name in highlights {
+        let cur = name == current_highlight;
+        out.push(PaletteItem {
+            title: format!("全局高亮：{name}{}", if cur { "（当前）" } else { "" }),
+            hint: "新会话默认".to_string(),
+            kind: "高亮",
+            cmd: PaletteCmd::Highlight(name.clone()),
         });
     }
     out
@@ -174,7 +190,7 @@ mod tests {
 
     #[test]
     fn empty_query_returns_everything_in_order() {
-        let all = items(&hosts(), "dark");
+        let all = items(&hosts(), "dark", &[], "default");
         let got = filter(&all, "");
         assert_eq!(got.len(), all.len());
         assert_eq!(got[0].title, all[0].title);
@@ -182,7 +198,7 @@ mod tests {
 
     #[test]
     fn host_name_matches() {
-        let all = items(&hosts(), "dark");
+        let all = items(&hosts(), "dark", &[], "default");
         let got = filter(&all, "web");
         assert!(!got.is_empty());
         assert!(got.iter().any(|i| i.title == "连接 web-01"));
@@ -191,14 +207,31 @@ mod tests {
 
     #[test]
     fn action_id_matches_through_hint() {
-        let all = items(&hosts(), "dark");
+        let all = items(&hosts(), "dark", &[], "default");
         let got = filter(&all, "reconnect");
         assert_eq!(got[0].title, "重新连接");
     }
 
     #[test]
+    fn highlight_entry_marks_the_current_one() {
+        let all = items(
+            &hosts(),
+            "dark",
+            &["default".to_string(), "logs".to_string()],
+            "logs",
+        );
+        assert!(
+            all.iter()
+                .any(|i| i.title == "全局高亮：logs（当前）"),
+            "当前高亮方案应带标记"
+        );
+        assert!(all.iter().any(|i| i.cmd
+            == PaletteCmd::Highlight("default".to_string())));
+    }
+
+    #[test]
     fn theme_entry_marks_the_current_one() {
-        let all = items(&[], "light");
+        let all = items(&[], "light", &[], "default");
         let light = all.iter().find(|i| i.title.contains("light")).unwrap();
         assert!(light.title.contains("当前"));
         let dark = all.iter().find(|i| i.title.contains("dark")).unwrap();
@@ -207,7 +240,7 @@ mod tests {
 
     #[test]
     fn no_match_returns_empty() {
-        let all = items(&hosts(), "dark");
+        let all = items(&hosts(), "dark", &[], "default");
         assert!(filter(&all, "zzzqqq").is_empty());
     }
 

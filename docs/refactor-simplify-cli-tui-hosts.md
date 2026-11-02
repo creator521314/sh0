@@ -9,7 +9,7 @@
 
 ## 实施状态（v0.4，2026-10-30）
 
-本文的 P0–P5 已全部落地，`cargo test --workspace` 171 条通过、clippy 零警告。
+本文的 P0–P5 已全部落地，`cargo test --workspace` 195 条通过、clippy 零警告。
 落地时与设计稿的少量偏差，均已按「体验不变、实现更简」处理：
 
 - **表单形态**：TUI 用**单张条件表单**（新建默认 `password`，认证方式用 `←/→` 切换，password/key 字段按需显示），

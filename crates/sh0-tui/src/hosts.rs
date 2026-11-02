@@ -242,6 +242,7 @@ const F_PASSWORD: usize = 6;
 const F_KEY_PATH: usize = 7;
 const F_KEY_PASS: usize = 8;
 const F_JUMP: usize = 9;
+const F_SCHEME: usize = 10;
 
 /// 表单校验通过后的产物：主机 + 待写入加密库的明文凭据。
 ///
@@ -323,6 +324,11 @@ impl HostForm {
                 FormField {
                     label: "跳板机(可空)",
                     value: host.and_then(|h| h.proxy_jump.clone()).unwrap_or_default(),
+                    secret: false,
+                },
+                FormField {
+                    label: "高亮方案(空=全局)",
+                    value: host.and_then(|h| h.highlight.clone()).unwrap_or_default(),
                     secret: false,
                 },
             ],
@@ -504,6 +510,10 @@ impl HostForm {
                 let j = self.fields[F_JUMP].value.trim();
                 if j.is_empty() { None } else { Some(j.to_string()) }
             },
+            highlight: {
+                let h = self.fields[F_SCHEME].value.trim();
+                if h.is_empty() { None } else { Some(h.to_string()) }
+            },
             jump: None,
         };
 
@@ -583,6 +593,7 @@ mod tests {
             port: 22,
             user: "root".into(),
             auth,
+            highlight: None,
             tags: vec![],
             note: None,
             risk_cap: None,
@@ -702,6 +713,15 @@ mod tests {
         assert_eq!(d.host.tags, vec!["prod".to_string()]);
         assert_eq!(d.host.note.as_deref(), Some("别删我"));
         assert_eq!(d.host.risk_cap, Some(sh0_core::RiskLevel::Confirm));
+    }
+
+    #[test]
+    fn highlight_scheme_roundtrips_through_form() {
+        let mut f = base_form();
+        f.fields[F_AUTH].value = "agent".into();
+        f.fields[F_SCHEME].value = "logs".into();
+        let d = f.to_host().unwrap();
+        assert_eq!(d.host.highlight.as_deref(), Some("logs"));
     }
 
     #[test]

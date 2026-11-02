@@ -1,9 +1,12 @@
 //! TUI 主应用：布局、键盘、事件循环（需求 FR-3.1~FR-3.4，W1.4 / W1.5 / W1.7）
 
+use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -29,6 +32,7 @@ use sh0_store::Store;
 use sh0_term::{Keymap, Screen, ScreenOptions};
 
 use crate::files::{FilePane, entry_line};
+use crate::highlight::Highlighter;
 use crate::hosts::{CRED_SERVICE, HostDraft, HostForm, HostTree, Row, accounts_of_host};
 use crate::render::{render_line, render_line_with_cursor};
 use crate::palette;
@@ -57,12 +61,17 @@ const FORM_LABEL_COLS: usize = 22;
 /// 终端区边框占用的列/行（左右各 1 列、上下各 1 行）
 const FRAME_X: u16 = 2;
 const FRAME_Y: u16 = 2;
+/// 光标闪烁：输入后先实心 400ms，再 500ms 亮 / 500ms 灭
+const CURSOR_SOLID_MS: u128 = 400;
+const CURSOR_BLINK_MS: u128 = 500;
 
 /// 一个标签页 = 一个远端会话 + 本地一份 Screen
 pub struct Tab {
     pub id: String,
     /// 会话对应的主机 id（删除主机时按它精确关连接；空 = 旧会话，退回按名字匹配）
     pub host_id: String,
+    /// 该标签使用的高亮方案名（host 覆盖或全局默认）
+    pub highlight_scheme: String,
     pub name: String,
     pub host: String,
     pub screen: Screen,
@@ -200,6 +209,39 @@ pub enum Drag {
     Select,
 }
 
+/// 选区右键菜单里的动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextAction {
+    Copy,
+    Clear,
+}
+
+impl ContextAction {
+    const ALL: [ContextAction; 2] = [ContextAction::Copy, ContextAction::Clear];
+
+    fn label(self) -> &'static str {
+        match self {
+            ContextAction::Copy => "复制",
+            ContextAction::Clear => "取消选择",
+        }
+    }
+}
+
+/// 选区右键菜单（位置是按下右键时的屏幕坐标）
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    x: u16,
+    y: u16,
+    selected: usize,
+}
+
+/// 悬停分隔条时要设置的终端鼠标指针形状（OSC 22，支持与否取决于终端）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerShape {
+    Default,
+    EwResize,
+}
+
 /// 待人工确认的 exec 请求（daemon 广播 confirm.requested，FR-7.4）
 ///
 /// 会话型调用带 session  id，一键式 `--host` 调用不带——所以确认事件
@@ -310,6 +352,16 @@ pub struct App {
     pane_right_area: Cell<Rect>,
     /// 鼠标正在拖什么：`None` 表示没在拖
     drag: Option<Drag>,
+    /// 鼠标当前是否悬停在主机树/终端之间的分隔条上
+    hover_divider: bool,
+    /// 选区是否由 Alt+V 键盘选择模式发起（决定方向键/p 是否归选区）
+    selection_keyboard: bool,
+    /// 选区右键菜单；Some 时拦截鼠标/键盘
+    context_menu: Option<ContextMenu>,
+    /// 最近一次绘制的右键菜单位置（鼠标命中测试用）
+    context_menu_area: Cell<Rect>,
+    /// 已经写给终端的指针形状，避免每个 Moved 事件都重复写 OSC 22
+    pointer: PointerShape,
     /// 上一次点击 `(时刻, 行号)`，用于双击判定
     last_click: Option<(Instant, usize)>,
     /// 命令面板（FR-3.6 / W5.1）；Some 时拦截全部按键
@@ -318,6 +370,16 @@ pub struct App {
     theme_name: String,
     /// 最近一次 ping 的时间：TUI 活着就定期保活，daemon 才能安全地空闲自退出
     last_heartbeat: Instant,
+    /// 最近一次键盘/鼠标输入：光标闪烁以此为相位基准（打字时光标不闪）
+    last_input: Instant,
+    /// 系统剪贴板句柄（X11 下需要长期持有才能保持选区）
+    clipboard: crate::clipboard::Clipboard,
+    /// 全部高亮方案（name → 编译后的 Highlighter）
+    highlighters: HashMap<String, Rc<Highlighter>>,
+    /// 新建会话默认使用的高亮方案
+    default_highlight: String,
+    highlight_mtime: Option<SystemTime>,
+    last_highlight_check: Instant,
 }
 
 impl App {
@@ -340,6 +402,30 @@ impl App {
         };
         let _ = budget; // TUI 侧每个标签各自持有 Screen，预算在 daemon 侧统一约束
 
+        let (highlighters, mut highlight_notice) = match store.load_highlight_schemes() {
+            Ok(schemes) => (build_highlighters(schemes), String::new()),
+            Err(e) => {
+                tracing::warn!("highlight.toml 加载失败，使用内置方案: {e}");
+                (
+                    build_highlighters(sh0_store::builtin_highlight_schemes()),
+                    format!("高亮配置有误，已用内置方案：{e}"),
+                )
+            }
+        };
+        let mut default_highlight = cfg.default_highlight.clone();
+        if !highlighters.contains_key(&default_highlight) {
+            let fallback = "default".to_string();
+            highlight_notice = if highlight_notice.is_empty() {
+                format!("全局高亮方案 `{default_highlight}` 不存在，已改用 `default`")
+            } else {
+                format!(
+                    "{highlight_notice}；全局高亮方案 `{default_highlight}` 不存在，已改用 `default`"
+                )
+            };
+            default_highlight = fallback;
+        }
+        let highlight_mtime = store.highlight_mtime();
+
         Self {
             client,
             events,
@@ -353,7 +439,7 @@ impl App {
             query: None,
             form: None,
             pending_delete: None,
-            notice: String::new(),
+            notice: highlight_notice,
             show_tree: true,
             should_quit: false,
             term_size: (cfg.cols, cfg.rows),
@@ -382,10 +468,21 @@ impl App {
             pane_left_area: Cell::new(Rect::default()),
             pane_right_area: Cell::new(Rect::default()),
             drag: None,
+            hover_divider: false,
+            selection_keyboard: false,
+            context_menu: None,
+            context_menu_area: Cell::new(Rect::default()),
+            pointer: PointerShape::Default,
             last_click: None,
             palette: None,
             theme_name: cfg.theme.clone(),
             last_heartbeat: Instant::now(),
+            last_input: Instant::now(),
+            clipboard: crate::clipboard::Clipboard::new(),
+            highlighters,
+            default_highlight,
+            highlight_mtime,
+            last_highlight_check: Instant::now(),
         }
     }
 
@@ -397,6 +494,10 @@ impl App {
 
     /// 鼠标事件入口。目前只处理左侧主机树：单击选中、双击连接、滚轮滚动。
     pub async fn on_mouse(&mut self, m: MouseEvent) -> anyhow::Result<()> {
+        // 纯移动事件不算“输入”，否则鼠标一动光标就永远不闪
+        if !matches!(m.kind, MouseEventKind::Moved) {
+            self.last_input = Instant::now();
+        }
         if !self.mouse {
             return Ok(());
         }
@@ -405,6 +506,33 @@ impl App {
             self.suspend_mouse();
             return Ok(());
         }
+        // 右键菜单是模态的：点击菜单项执行，点外面关闭
+        if self.context_menu.is_some() {
+            // 只有左键按下才处理菜单；右键的 Up / 鼠标移动 / 滚轮都不该关闭菜单：
+            // 否则 Down(Right) 刚弹出来，紧随其后的 Up(Right) 就把它关掉了。
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                let hit = self.context_menu_hit(m.column, m.row);
+                if let Some(idx) = hit {
+                    let action = ContextAction::ALL
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(ContextAction::Clear);
+                    self.context_menu = None;
+                    match action {
+                        ContextAction::Copy => self.copy_selection().await?,
+                        ContextAction::Clear => {
+                            self.selection = None;
+                            self.selection_keyboard = false;
+                            self.notice = "已取消选择".into();
+                        }
+                    }
+                } else {
+                    self.context_menu = None;
+                }
+            }
+            return Ok(());
+        }
+
         // 表单 / 确认弹窗 / 输入提示期间不接受点击——这些界面是键盘模态的，
         // 点半下就可能把正在填的东西弄丢
         if self.form.is_some()
@@ -417,13 +545,38 @@ impl App {
             return Ok(());
         }
 
+        // 只在移动时更新悬停态：终端是否真的把指针变成 ↔ 取决于它是否支持
+        // OSC 22；不支持时至少还有分隔条高亮 + 状态栏提示。
+        if matches!(m.kind, MouseEventKind::Moved) {
+            let on = self.on_divider(m.column, m.row);
+            self.hover_divider = on;
+            self.set_pointer(if on {
+                PointerShape::EwResize
+            } else {
+                PointerShape::Default
+            });
+            return Ok(());
+        }
+
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // 点终端以外（或开始新选区）时清掉旧选区，避免高亮残留
+                if self.selection.is_some()
+                    && !(self.view == View::Terminal
+                        && self.view_cell_at(m.column, m.row).is_some())
+                {
+                    self.selection = None;
+                }
+                self.context_menu = None;
                 // 1) 分隔条：压在主机树与主区的缝上，最容易误触，优先级给最高
                 if self.on_divider(m.column, m.row) {
+                    self.hover_divider = true;
+                    self.set_pointer(PointerShape::EwResize);
                     self.drag = Some(Drag::Divider);
                     return Ok(());
                 }
+                self.hover_divider = false;
+                self.set_pointer(PointerShape::Default);
                 // 2) 标签栏：点主体切过去，点 × 关掉（FR-3.9）
                 if let Some(target) = self.tab_hit_at(m.column, m.row) {
                     match target {
@@ -432,7 +585,7 @@ impl App {
                     }
                     return Ok(());
                 }
-                // 3) 主区终端：按下即定选区起点，拖到哪选到哪，松手复制
+                // 3) 主区终端：按下即定选区起点，拖到哪选到哪，松手保留选区
                 if self.view == View::Terminal
                     && self.tabs.get(self.active).is_some()
                     && let Some(cell) = self.view_cell_at(m.column, m.row)
@@ -441,6 +594,7 @@ impl App {
                         anchor: cell,
                         head: cell,
                     });
+                    self.selection_keyboard = false;
                     self.drag = Some(Drag::Select);
                     self.focus = Focus::Terminal;
                     return Ok(());
@@ -488,6 +642,19 @@ impl App {
                     }
                 }
             }
+            // 右键选区：弹出「复制 / 取消选择」菜单
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.view == View::Terminal
+                    && let Some(cell) = self.view_cell_at(m.column, m.row)
+                    && self.selection_contains(cell)
+                {
+                    self.context_menu = Some(ContextMenu {
+                        x: m.column,
+                        y: m.row,
+                        selected: 0,
+                    });
+                }
+            }
             // 中键关标签：浏览器的习惯，比精准点那个 × 省事
             MouseEventKind::Down(MouseButton::Middle) => {
                 if let Some(target) = self.tab_hit_at(m.column, m.row) {
@@ -498,7 +665,10 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => match self.drag {
-                Some(Drag::Divider) => self.drag_divider_to(m.column),
+                Some(Drag::Divider) => {
+                    self.hover_divider = true;
+                    self.drag_divider_to(m.column)
+                }
                 Some(Drag::Select) => {
                     if let (Some(cell), Some(sel)) =
                         (self.view_cell_at(m.column, m.row), self.selection.as_mut())
@@ -516,10 +686,29 @@ impl App {
                         let (c, r) = self.term_size;
                         self.on_resize(c, r).await?;
                     }
-                    Some(Drag::Select) => self.finish_mouse_select().await?,
+                    Some(Drag::Select) => {
+                        // 有些终端不发 Drag，只在松手时给最终坐标；补一次。
+                        if let Some(cell) = self.view_cell_at(m.column, m.row)
+                            && let Some(sel) = self.selection.as_mut()
+                        {
+                            sel.head = cell;
+                        }
+                        // 拖选结束后**保留高亮**，不自动复制；复制走右键菜单/Alt+C。
+                        if self.selection.is_some_and(|s| s.anchor == s.head) {
+                            self.selection = None;
+                        } else {
+                            self.notice = "已选中文本：右键复制 · Alt+C 复制 · Esc 取消".into();
+                        }
+                    }
                     None => {}
                 }
                 self.drag = None;
+                self.hover_divider = self.on_divider(m.column, m.row);
+                self.set_pointer(if self.hover_divider {
+                    PointerShape::EwResize
+                } else {
+                    PointerShape::Default
+                });
             }
             MouseEventKind::ScrollUp => self.on_wheel(WHEEL_LINES, m.column, m.row).await,
             MouseEventKind::ScrollDown => self.on_wheel(-WHEEL_LINES, m.column, m.row).await,
@@ -681,24 +870,13 @@ impl App {
             (self.term_size.0 as isize - delta).clamp(MIN_TERM_COLS as isize, total as isize) as u16;
     }
 
-    /// 鼠标框选松手：真拖过就复制，只点一下就当取消
-    async fn finish_mouse_select(&mut self) -> anyhow::Result<()> {
-        let Some(sel) = self.selection else {
-            return Ok(());
-        };
-        if sel.anchor == sel.head {
-            // 没有拖动：清掉选区就好，别往剪贴板里塞一个字符
-            self.selection = None;
-            return Ok(());
-        }
-        self.copy_selection().await
-    }
-
     /// 切到第 idx 个标签，并把焦点给终端——点标签的人就是要去打字
     async fn switch_to_tab(&mut self, idx: usize) -> anyhow::Result<()> {
         if idx >= self.tabs.len() {
             return Ok(());
         }
+        self.selection = None;
+        self.context_menu = None;
         // 点标签的人是要去操作那个会话：终端视图给终端，文件视图给文件区
         self.focus = if self.view == View::Files {
             Focus::Files
@@ -718,6 +896,8 @@ impl App {
         if idx >= self.tabs.len() {
             return Ok(());
         }
+        self.selection = None;
+        self.context_menu = None;
         let tab = self.tabs.remove(idx);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -757,9 +937,34 @@ impl App {
         (idx < visible).then_some(idx)
     }
 
+    /// 设置终端鼠标指针形状（OSC 22）。
+    ///
+    /// 这是**尽力而为**：WezTerm / kitty 等支持 `ew-resize`，xterm / 部分终端
+    /// 会忽略。不支持时用户仍能看到分隔条高亮与状态栏提示，功能不受影响。
+    fn set_pointer(&mut self, shape: PointerShape) {
+        if self.pointer == shape {
+            return;
+        }
+        self.pointer = shape;
+        if !self.mouse_captured {
+            return;
+        }
+        use std::io::Write;
+        let mut out = io::stdout();
+        let _ = out.write_all(pointer_sequence(shape).as_bytes());
+        let _ = out.flush();
+    }
+
+    /// 测试用：当前是否悬停在分隔条上
+    pub fn hover_divider(&self) -> bool {
+        self.hover_divider
+    }
+
     /// 挂起鼠标捕获（Shift 拖选用）。失败只告警——捕获态错了最多是鼠标不灵，
     /// 不该让 TUI 崩掉。
     fn suspend_mouse(&mut self) {
+        self.hover_divider = false;
+        self.set_pointer(PointerShape::Default);
         if self.mouse_captured {
             let _ = execute!(io::stdout(), DisableMouseCapture);
             self.mouse_captured = false;
@@ -783,6 +988,11 @@ impl App {
     /// 最近一次渲染记下的主机树内区（测试用）
     pub fn tree_area(&self) -> Rect {
         self.tree_area.get()
+    }
+
+    /// 最近一次渲染记下的终端内区（边框以内，测试用）
+    pub fn term_area(&self) -> Rect {
+        self.term_area.get()
     }
 
     /// 测试与宿主注入布局用：标签栏画在哪
@@ -819,6 +1029,39 @@ impl App {
     /// 当前选区（测试用）
     pub fn selection(&self) -> Option<Selection> {
         self.selection
+    }
+
+    /// 右键菜单是否打开（测试用）
+    pub fn context_menu_open(&self) -> bool {
+        self.context_menu.is_some()
+    }
+
+    /// 进备用屏幕前初始化系统剪贴板，避免 arboard 的 Wayland 回退日志画进 TUI
+    pub fn warm_clipboard(&mut self) {
+        self.clipboard.warm();
+    }
+
+    fn selection_contains(&self, cell: (usize, usize)) -> bool {
+        let Some(sel) = self.selection else {
+            return false;
+        };
+        sel.cols_for(cell.0)
+            .is_some_and(|(c0, c1)| cell.1 >= c0 && cell.1 <= c1)
+    }
+
+    fn context_menu_hit(&self, col: u16, row: u16) -> Option<usize> {
+        let a = self.context_menu_area.get();
+        if a.width == 0 || a.height == 0 {
+            return None;
+        }
+        let x0 = a.x.saturating_add(1);
+        let x1 = a.x.saturating_add(a.width).saturating_sub(1);
+        let y0 = a.y.saturating_add(1);
+        let y1 = y0.saturating_add(ContextAction::ALL.len() as u16);
+        if col < x0 || col >= x1 || row < y0 || row >= y1 {
+            return None;
+        }
+        Some((row - y0) as usize)
     }
 
     /// 测试与宿主注入用：往第 idx 个会话的屏幕塞几行（模拟 daemon 推送输出）。
@@ -881,6 +1124,68 @@ impl App {
         self.tab_indices_for_host(host).len()
     }
 
+    /// 每隔约 2 秒检查一次 `highlight.toml`；改了自动重载，失败时保留旧规则。
+    pub fn reload_highlight_if_changed(&mut self) {
+        if self.last_highlight_check.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_highlight_check = Instant::now();
+        let mtime = self.store.highlight_mtime();
+        if mtime == self.highlight_mtime {
+            return;
+        }
+        self.highlight_mtime = mtime;
+        match self.store.load_highlight_schemes() {
+            Ok(schemes) => {
+                self.highlighters = build_highlighters(schemes);
+                if !self.highlighters.contains_key(&self.default_highlight) {
+                    self.default_highlight = "default".into();
+                }
+                self.notice = "高亮方案已重载".into();
+            }
+            Err(e) => {
+                self.notice = format!("高亮规则有误，继续用旧方案：{e}");
+            }
+        }
+    }
+
+    /// 某台主机该用哪个高亮方案：host 覆盖 > 全局默认。
+    fn scheme_for_selector(&self, selector: &str) -> String {
+        self.store
+            .find_host(selector)
+            .ok()
+            .and_then(|h| h.highlight)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.default_highlight.clone())
+    }
+
+    /// 已存在会话（只有 host_id / 名字）用哪个高亮方案
+    fn scheme_for_host(&self, host_id: &str, name: &str) -> String {
+        let host = self
+            .store
+            .find_host(host_id)
+            .or_else(|_| self.store.find_host(name))
+            .ok();
+        host.and_then(|h| h.highlight)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.default_highlight.clone())
+    }
+
+    fn highlighter_for(&self, tab: &Tab) -> Option<&Highlighter> {
+        self.highlighters
+            .get(&tab.highlight_scheme)
+            .or_else(|| self.highlighters.get(&self.default_highlight))
+            .or_else(|| self.highlighters.get("default"))
+            .map(|h| h.as_ref())
+    }
+
+    fn highlight_line<'a>(&self, tab: &Tab, line: &'a sh0_term::cell::Line) -> Cow<'a, sh0_term::cell::Line> {
+        match self.highlighter_for(tab) {
+            Some(h) => h.highlight(line),
+            None => Cow::Borrowed(line),
+        }
+    }
+
     /// 当前标签页显示的主机名（测试用）
     pub fn tab_host_names(&self) -> Vec<&str> {
         self.tabs.iter().map(|t| t.name.as_str()).collect()
@@ -919,9 +1224,15 @@ impl App {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            let scheme = self.scheme_for_host(&host_id, &name);
             let state = s.get("state").and_then(|v| v.as_str()).unwrap_or("closed");
-            let mut tab =
-                self.new_tab(id.to_string(), name.clone(), name.clone(), host_id);
+            let mut tab = self.new_tab(
+                id.to_string(),
+                name.clone(),
+                name.clone(),
+                host_id,
+                scheme,
+            );
             tab.state = parse_state(state);
             tab.screen.push_notice(
                 "已接入 daemon 中的既有会话（历史输出请用 `sh0 ai screen read` 查看）",
@@ -931,13 +1242,21 @@ impl App {
         Ok(())
     }
 
-    fn new_tab(&self, id: String, name: String, host: String, host_id: String) -> Tab {
+    fn new_tab(
+        &self,
+        id: String,
+        name: String,
+        host: String,
+        host_id: String,
+        highlight_scheme: String,
+    ) -> Tab {
         let (cols, rows) = self.term_size;
         let mut opts = ScreenOptions::new(cols.max(20) as usize, rows.max(5) as usize);
         opts.scrollback_lines = 5000;
         Tab {
             id,
             host_id,
+            highlight_scheme,
             name,
             host,
             screen: Screen::new(opts),
@@ -948,6 +1267,8 @@ impl App {
 
     /// 打开一个会话并建立标签页
     pub async fn open(&mut self, host: &str) -> anyhow::Result<()> {
+        self.selection = None;
+        self.context_menu = None;
         let (cols, rows) = self.term_size;
         let res = self
             .client
@@ -971,8 +1292,14 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        self.tabs
-            .push(self.new_tab(id, name.clone(), host.to_string(), host_id));
+        let scheme = self.scheme_for_selector(host);
+        self.tabs.push(self.new_tab(
+            id,
+            name.clone(),
+            host.to_string(),
+            host_id,
+            scheme,
+        ));
         self.active = self.tabs.len() - 1;
         if self.view != View::Files {
             self.focus = Focus::Terminal;
@@ -997,6 +1324,20 @@ impl App {
             .any(|h| h.name == draft.host.name && h.id != draft.host.id)
         {
             self.notice = format!("名称 `{}` 已被另一台主机使用", draft.host.name);
+            self.form = Some(HostForm::new(Some(&draft.host)));
+            return Ok(());
+        }
+
+        // 0.1) 高亮方案必须是已加载的方案（留空 = 跟随全局）
+        if let Some(name) = &draft.host.highlight
+            && !self.highlighters.contains_key(name)
+        {
+            let mut names: Vec<_> = self.highlighters.keys().cloned().collect();
+            names.sort();
+            self.notice = format!(
+                "未知高亮方案 `{name}`；可用：{}",
+                names.join(", ")
+            );
             self.form = Some(HostForm::new(Some(&draft.host)));
             return Ok(());
         }
@@ -1075,6 +1416,8 @@ impl App {
 
     /// 按键入口。pub 是为了让契约测试能直接喂按键，不必真的跑一个终端。
     pub async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // 打字时让光标保持实心，不要刚敲一个字就闪没了
+        self.last_input = Instant::now();
         // 鼠标捕获可能因为 Shift 拖选被挂起，按键回来时顺手恢复
         self.restore_mouse();
         // 0) 风险确认弹窗优先：AI 在等一个"人"拍板，此刻任何键都属于这次决定
@@ -1107,6 +1450,46 @@ impl App {
                         )
                         .await;
                     self.notice = "已拒绝该命令".into();
+                }
+            }
+            return Ok(());
+        }
+
+        // 0.5) 选区右键菜单：上下选择，Enter 执行，Esc 关闭
+        if self.context_menu.is_some() {
+            let mut action = None;
+            let mut close = false;
+            {
+                let menu = self.context_menu.as_mut().expect("context menu is some");
+                match key.code {
+                    KeyCode::Esc => close = true,
+                    KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
+                    KeyCode::Down => {
+                        menu.selected =
+                            (menu.selected + 1).min(ContextAction::ALL.len() - 1);
+                    }
+                    KeyCode::Enter => {
+                        action = Some(menu.selected);
+                        close = true;
+                    }
+                    _ => {}
+                }
+            }
+            if close {
+                self.context_menu = None;
+            }
+            if let Some(idx) = action {
+                match ContextAction::ALL
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(ContextAction::Clear)
+                {
+                    ContextAction::Copy => self.copy_selection().await?,
+                    ContextAction::Clear => {
+                        self.selection = None;
+                        self.selection_keyboard = false;
+                        self.notice = "已取消选择".into();
+                    }
                 }
             }
             return Ok(());
@@ -1261,24 +1644,58 @@ impl App {
             return Ok(());
         }
 
-        // 5) 选择模式：方向键用来移动选区，不发给远端
+        // 5) 有选区时：Enter/y/Alt+C 复制，Esc 取消；键盘选择模式额外支持
+        //    方向键扩选与 p 粘贴。其它按键先清掉选区，再走正常路径——
+        //    鼠标拖选后直接打字不该被选区卡住。
         if self.selection.is_some() {
+            if is_hard_quit(key) {
+                self.should_quit = true;
+                return Ok(());
+            }
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                self.copy_selection().await?;
+                return Ok(());
+            }
+            let keyboard = self.selection_keyboard;
             match key.code {
                 KeyCode::Esc => {
                     self.selection = None;
+                    self.selection_keyboard = false;
                     self.notice = "已取消选择".into();
+                    return Ok(());
                 }
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.copy_selection().await?;
+                    return Ok(());
                 }
-                KeyCode::Up | KeyCode::Char('k') => self.move_selection_head(-1, 0),
-                KeyCode::Down | KeyCode::Char('j') => self.move_selection_head(1, 0),
-                KeyCode::Left | KeyCode::Char('h') => self.move_selection_head(0, -1),
-                KeyCode::Right | KeyCode::Char('l') => self.move_selection_head(0, 1),
-                KeyCode::Char('p') => self.paste_last_copy().await?,
-                _ => {}
+                KeyCode::Up | KeyCode::Char('k') if keyboard => {
+                    self.move_selection_head(-1, 0);
+                    return Ok(());
+                }
+                KeyCode::Down | KeyCode::Char('j') if keyboard => {
+                    self.move_selection_head(1, 0);
+                    return Ok(());
+                }
+                KeyCode::Left | KeyCode::Char('h') if keyboard => {
+                    self.move_selection_head(0, -1);
+                    return Ok(());
+                }
+                KeyCode::Right | KeyCode::Char('l') if keyboard => {
+                    self.move_selection_head(0, 1);
+                    return Ok(());
+                }
+                KeyCode::Char('p') if keyboard => {
+                    self.paste_last_copy().await?;
+                    return Ok(());
+                }
+                _ => {
+                    // 退出选区，继续走键位映射 / 终端输入
+                    self.selection = None;
+                    self.selection_keyboard = false;
+                }
             }
-            return Ok(());
         }
 
         // 6) 键位映射（命中的按键不会发给远端）
@@ -1536,6 +1953,7 @@ impl App {
                 };
                 if self.selection.is_some() {
                     self.selection = None;
+                    self.selection_keyboard = false;
                     self.notice = "已退出选择模式".into();
                 } else {
                     // 选择的是终端里的文字：文件视图下先退回去，否则选了个寂寞
@@ -1544,6 +1962,7 @@ impl App {
                         self.leave_files();
                     }
                     self.selection = Some(Selection { anchor: head, head });
+                    self.selection_keyboard = true;
                     self.focus = Focus::Terminal;
                     self.notice = "选择模式：方向键移动，Enter/y 复制，Esc 取消".into();
                 }
@@ -1637,6 +2056,7 @@ impl App {
 
     /// 打开命令面板
     pub fn open_palette(&mut self) {
+        self.context_menu = None;
         self.palette = Some(Palette::new());
     }
 
@@ -1665,7 +2085,14 @@ impl App {
             .into_iter()
             .map(|h| (h.name.clone(), h.endpoint()))
             .collect();
-        let all = palette::items(&hosts, &self.theme_name);
+        let mut highlights: Vec<String> = self.highlighters.keys().cloned().collect();
+        highlights.sort();
+        let all = palette::items(
+            &hosts,
+            &self.theme_name,
+            &highlights,
+            &self.default_highlight,
+        );
         palette::filter(&all, query).into_iter().cloned().collect()
     }
 
@@ -1677,6 +2104,27 @@ impl App {
             }
             palette::PaletteCmd::Connect(name) => {
                 self.open(&name).await?;
+            }
+            palette::PaletteCmd::Highlight(name) => {
+                if !self.highlighters.contains_key(&name) {
+                    self.notice = format!("未知高亮方案 `{name}`");
+                    return Ok(());
+                }
+                self.default_highlight = name.clone();
+                match self.store.load_config() {
+                    Ok(mut cfg) => {
+                        cfg.default_highlight = name.clone();
+                        if let Err(e) = self.store.save_config(&cfg) {
+                            self.notice = format!("高亮方案已切换，但写回配置失败：{e}");
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        self.notice = format!("高亮方案已切换，但读配置失败：{e}");
+                        return Ok(());
+                    }
+                }
+                self.notice = format!("新会话默认高亮：{name}（已打开的会话不变）");
             }
             palette::PaletteCmd::Theme(t) => {
                 self.theme = Theme::preset(t);
@@ -1701,11 +2149,10 @@ impl App {
         Ok(())
     }
 
-    /// 把选区内容送出：先写父终端剪贴板（OSC 52），失败则发回会话。
+    /// 把选区内容送出：OSC 52 + 本机剪贴板（arboard / 命令行工具）。
     ///
-    /// 用 OSC 52 而不是引入剪贴板库：我们跑在用户的终端里，让父终端去写
-    /// 系统剪贴板才是最省依赖、也最符合终端惯例的做法（arboard 之类的库
-    /// 在 Linux 上会拖进 X11/Wayland 依赖，与"轻量"冲突）。
+    /// 两条路都走：本地终端可能禁用 OSC 52（VTE 系），而 SSH 远程运行 sh0 时
+    /// 本机剪贴板又只能写远端；同时尝试才能覆盖两种场景。
     async fn copy_selection(&mut self) -> anyhow::Result<()> {
         let Some(sel) = self.selection else {
             self.notice = "没有选区，先用 Alt+V 进入选择模式".into();
@@ -1720,22 +2167,21 @@ impl App {
             return Ok(());
         }
         self.last_copy = text.clone();
-        self.write_clipboard(&text);
+        let native = self.write_clipboard(&text);
         self.selection = None;
+        self.selection_keyboard = false;
         let n = text.lines().count();
-        self.notice = format!("已复制 {n} 行");
+        self.notice = if native {
+            format!("已复制 {n} 行")
+        } else {
+            format!("已复制 {n} 行（若剪贴板为空，可用 p 粘回）")
+        };
         Ok(())
     }
 
-    /// OSC 52：把内容交给父终端写入系统剪贴板
-    fn write_clipboard(&self, text: &str) {
-        use std::io::Write;
-        let b64 = base64_encode(text.as_bytes());
-        // ]52;c;<base64>\ —— c 表示系统剪贴板
-        let seq = format!("\x1b]52;c;{b64}\x1b\\");
-        let mut out = std::io::stdout();
-        let _ = out.write_all(seq.as_bytes());
-        let _ = out.flush();
+    /// 复制到剪贴板：OSC 52 + 本机剪贴板；返回本机是否成功
+    fn write_clipboard(&mut self, text: &str) -> bool {
+        self.clipboard.copy(text)
     }
 
     /// 把最近复制的内容粘回当前会话（剪贴板不可用时的兜底路径）
@@ -1794,6 +2240,8 @@ impl App {
         if self.tabs.is_empty() {
             return Ok(());
         }
+        self.selection = None;
+        self.context_menu = None;
         let tab = self.tabs.remove(self.active);
         if self.active >= self.tabs.len() && !self.tabs.is_empty() {
             self.active = self.tabs.len() - 1;
@@ -1810,6 +2258,8 @@ impl App {
 
     /// 终端尺寸变化：同步本地 Screen 并通知远端（需求 FR-2.4）
     async fn on_resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        self.selection = None;
+        self.context_menu = None;
         for tab in &mut self.tabs {
             tab.screen.resize(cols as usize, rows as usize);
             let _ = self
@@ -1974,6 +2424,8 @@ impl App {
     }
 
     pub async fn enter_files(&mut self) {
+        self.selection = None;
+        self.context_menu = None;
         self.view = View::Files;
         self.focus = Focus::Files;
         self.notice =
@@ -1982,6 +2434,8 @@ impl App {
     }
 
     pub fn leave_files(&mut self) {
+        self.selection = None;
+        self.context_menu = None;
         self.view = View::Terminal;
         self.focus = Focus::Terminal;
         self.notice.clear();
@@ -2557,6 +3011,7 @@ impl App {
         } else {
             self.draw_terminal(f, body);
         }
+        self.draw_divider_hint(f, body);
         self.draw_status(f, chunks[2]);
 
         // 搜索框浮在底部状态栏之上
@@ -2606,6 +3061,9 @@ impl App {
         // 命令面板压在最上层
         if let Some(p) = &self.palette {
             self.draw_palette(f, p);
+        }
+        if let Some(menu) = &self.context_menu {
+            self.draw_context_menu(f, menu);
         }
     }
 
@@ -3099,28 +3557,106 @@ impl App {
 
         for i in 0..rows {
             match lines.get(i) {
-                Some(line) => out.push(render_line(
-                    line,
-                    cols,
-                    &self.theme,
-                    self.selection.as_ref().and_then(|s| s.cols_for(i)),
-                )),
+                Some(line) => {
+                    let highlighted = self.highlight_line(tab, line);
+                    out.push(render_line(
+                        highlighted.as_ref(),
+                        cols,
+                        &self.theme,
+                        self.selection.as_ref().and_then(|s| s.cols_for(i)),
+                    ));
+                }
                 None => out.push(Line::raw("")),
             }
         }
 
-        // 光标：只在贴着最新输出、且焦点在终端时显示
+        // 光标：只在贴着最新输出、焦点在终端、且处于闪烁的「亮」相位时显示
         if let (Some((cy, cx)), true) = (
             tab.screen.view_cursor(),
-            tab.state == SessionState::Ready && self.focus == Focus::Terminal,
+            tab.state == SessionState::Ready
+                && self.focus == Focus::Terminal
+                && self.selection.is_none()
+                && cursor_blink_on(self.last_input.elapsed()),
         ) && cy < rows
         {
             let src = lines.get(cy).copied();
             if let Some(line) = src {
-                out[cy] = render_line_with_cursor(line, cols, cx, &self.theme);
+                let highlighted = self.highlight_line(tab, line);
+                out[cy] =
+                    render_line_with_cursor(highlighted.as_ref(), cols, cx, &self.theme);
             }
         }
         f.render_widget(Paragraph::new(out), inner);
+    }
+
+    /// 悬停/拖拽分隔条时，把主机树与终端之间的两条边框刷成强调色。
+    ///
+    /// 终端应用改不了系统的指针形状；支持的终端会额外通过 OSC 22 变成 ↔，
+    /// 不支持的终端至少能靠这条高亮看出「这里可以拖」。
+    fn draw_divider_hint(&self, f: &mut ratatui::Frame, body: Rect) {
+        if !self.show_tree || (!self.hover_divider && self.drag != Some(Drag::Divider)) {
+            return;
+        }
+        let x = self.tree_width.saturating_sub(1);
+        if x >= body.x.saturating_add(body.width) {
+            return;
+        }
+        let width = (body.x.saturating_add(body.width) - x).min(2);
+        let area = Rect {
+            x,
+            y: body.y,
+            width,
+            height: body.height,
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        f.render_widget(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(self.theme.accent)),
+            area,
+        );
+    }
+
+    /// 选区右键菜单（复制 / 取消选择）
+    fn draw_context_menu(&self, f: &mut ratatui::Frame, menu: &ContextMenu) {
+        let width = 22.min(f.area().width);
+        let height = (ContextAction::ALL.len() as u16 + 2).min(f.area().height);
+        let max_x = f.area().width.saturating_sub(width);
+        let max_y = f.area().height.saturating_sub(height);
+        let area = Rect {
+            x: menu.x.min(max_x),
+            y: menu.y.min(max_y),
+            width,
+            height,
+        };
+        self.context_menu_area.set(area);
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.accent))
+            .title(" 操作 ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let mut lines = Vec::new();
+        for (i, action) in ContextAction::ALL.iter().enumerate() {
+            let style = if i == menu.selected {
+                Style::default()
+                    .fg(self.theme.status_fg)
+                    .bg(self.theme.accent)
+            } else {
+                Style::default().fg(self.theme.fg)
+            };
+            lines.push(Line::from(Span::styled(
+                format!(" {} ", action.label()),
+                style,
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_status(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -3162,15 +3698,22 @@ impl App {
                 Style::default().fg(self.theme.warn),
             ));
         }
-        let right = if self.view == View::Files {
+        let right = if self.context_menu.is_some() {
+            "↑↓ 选择 · Enter 执行 · Esc 关闭"
+        } else if self.selection.is_some() {
+            "右键复制 · Alt+C 复制 · Esc 取消"
+        } else if self.hover_divider || self.drag == Some(Drag::Divider) {
+            "↔ 拖动调整栏宽"
+        } else if self.view == View::Files {
             "Tab 切栏 · ↑↓ 选择 · Space 标记 · F5 传走 · F6 改名 · F7 建目录 · F8 删除 · p 权限 · F9 回终端"
         } else if self.focus == Focus::Tree {
             "n 新建并连接 · e 编辑 · d 删除 · / 搜索 · Enter 连接 · Ctrl+Q 退出"
         } else {
             "Ctrl+Q 退出 · Ctrl+T 选主机 · Ctrl+W 关闭 · Ctrl+B 焦点"
         };
-        let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let pad = (area.width as usize).saturating_sub(left_len + right.chars().count());
+        // 状态栏左右都可能含中文/箭头，必须按显示列宽算，不能按 char 数
+        let left_len: usize = spans.iter().map(|s| display_cols(&s.content)).sum();
+        let pad = (area.width as usize).saturating_sub(left_len + display_cols(right));
         let mut all = spans;
         if pad > 1 {
             all.push(Span::raw(" ".repeat(pad)));
@@ -3188,7 +3731,7 @@ impl App {
         let visible = (0..form.fields.len())
             .filter(|i| form.field_visible(*i))
             .count() as u16;
-        let area = centered_rect(64, visible + 7, f.area());
+        let area = centered_rect(64, visible + 8, f.area());
         let title = if form.editing.is_some() {
             " 编辑主机 "
         } else {
@@ -3235,6 +3778,13 @@ impl App {
             "Enter 保存并连接 · Ctrl+S 仅保存 · ←/→ 切换认证 · Tab/↑↓ 换字段 · Esc 取消",
             Style::default().fg(self.theme.border),
         )));
+        let mut names: Vec<&str> = self.highlighters.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let hint = format!("高亮方案：{}（留空=全局）", names.join(" / "));
+        lines.push(Line::from(Span::styled(
+            truncate(&hint, inner.width as usize),
+            Style::default().fg(self.theme.border),
+        )));
         if !self.notice.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!(" ! {}", self.notice),
@@ -3272,6 +3822,12 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// 光标闪烁相位：输入后先实心 400ms，之后 500ms 亮 / 500ms 灭
+fn cursor_blink_on(elapsed: Duration) -> bool {
+    let ms = elapsed.as_millis();
+    ms < CURSOR_SOLID_MS || ms % (CURSOR_BLINK_MS * 2) < CURSOR_BLINK_MS
 }
 
 /// 字符串在终端里占多少列（CJK/emoji 算 2，组合字符算 0）
@@ -3313,6 +3869,10 @@ pub async fn run(
         app.open(h).await?;
     }
 
+    // 必须在 raw mode / 备用屏幕之前：arboard 初始化失败会打日志，
+    // 这时还落在正常终端上，随后 terminal.clear() 会清掉。
+    app.warm_clipboard();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -3328,6 +3888,8 @@ pub async fn run(
 
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    // 指针形状也还原，避免退出后仍停在 ↔
+    reset_pointer_shape();
     // 捕获态必须还原，否则退出后父终端的鼠标选择还是坏的
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, LeaveAlternateScreen);
@@ -3393,6 +3955,9 @@ async fn loop_inner(
             app.last_heartbeat = Instant::now();
             let _ = app.client.call(methods::PING, json!({})).await;
         }
+
+        // 3.6) highlight.toml 热重载（内部按 2 秒节流）
+        app.reload_highlight_if_changed();
 
         // 4) 渲染
         terminal.draw(|f| app.draw(f))?;
@@ -3478,6 +4043,32 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
+/// 把「方案名 → 规则」编译成「方案名 → Highlighter」
+fn build_highlighters(
+    schemes: HashMap<String, Vec<sh0_store::HighlightRule>>,
+) -> HashMap<String, Rc<Highlighter>> {
+    schemes
+        .into_iter()
+        .map(|(name, rules)| (name, Rc::new(Highlighter::new(rules))))
+        .collect()
+}
+
+/// OSC 22 的指针形状序列（终端不支持时会被忽略）
+fn pointer_sequence(shape: PointerShape) -> &'static str {
+    match shape {
+        PointerShape::Default => "\x1b]22;default\x1b\\",
+        PointerShape::EwResize => "\x1b]22;ew-resize\x1b\\",
+    }
+}
+
+/// 退出时把 OSC 22 指针形状还原成默认值
+fn reset_pointer_shape() {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(pointer_sequence(PointerShape::Default).as_bytes());
+    let _ = out.flush();
+}
+
 /// 极简 base64 编码：只为 OSC 52 服务，不值得为它引入一个依赖
 fn base64_encode(input: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -3529,5 +4120,28 @@ mod tests {
         assert_eq!(display_cols("名称"), 4);
         assert_eq!(display_cols("a名"), 3);
         assert_eq!(display_cols(""), 0);
+    }
+
+    #[test]
+    fn pointer_osc22_sequences() {
+        assert_eq!(
+            pointer_sequence(PointerShape::EwResize),
+            "\x1b]22;ew-resize\x1b\\"
+        );
+        assert_eq!(
+            pointer_sequence(PointerShape::Default),
+            "\x1b]22;default\x1b\\"
+        );
+    }
+
+    #[test]
+    fn cursor_blink_phases() {
+        // 输入后先实心，随后 500ms 亮 / 500ms 灭
+        assert!(cursor_blink_on(Duration::from_millis(0)));
+        assert!(cursor_blink_on(Duration::from_millis(399)));
+        assert!(cursor_blink_on(Duration::from_millis(450)));
+        assert!(!cursor_blink_on(Duration::from_millis(700)));
+        assert!(cursor_blink_on(Duration::from_millis(1100)));
+        assert!(!cursor_blink_on(Duration::from_millis(1600)));
     }
 }

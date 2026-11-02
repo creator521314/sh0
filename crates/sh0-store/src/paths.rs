@@ -59,6 +59,12 @@ impl Paths {
         self.runtime_dir.join("daemon.log")
     }
 
+    /// TUI 的日志。TUI 占着整屏，任何 stdout/stderr 日志都会把界面打花，
+    /// 所以 `sh0 tui` 的 tracing 输出单独落这里。
+    pub fn tui_log(&self) -> PathBuf {
+        self.runtime_dir.join("tui.log")
+    }
+
     /// 兜底日志：进程启动早期（tracing 还没接管）的 stdout/stderr 与 panic。
     ///
     /// 与 `daemon_log` 分开是因为这边是**覆盖写**、每次启动归零，
@@ -70,6 +76,11 @@ impl Paths {
     /// 审计库（SQLite 单文件，需求 FR-9.2：与配置同目录 → 放 data_dir）
     pub fn audit_db(&self) -> PathBuf {
         self.data_dir.join("audit.db")
+    }
+
+    /// 终端输出正则高亮规则（可选；缺省时首次 TUI 启动会生成默认文件）
+    pub fn highlight_file(&self) -> PathBuf {
+        self.config_dir.join("highlight.toml")
     }
 
     /// 凭据加密 vault（钥匙串不可用时的回落，需求 FR-1.6 / FR-1.7）

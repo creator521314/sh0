@@ -261,6 +261,7 @@ fn test_host() -> Host {
         port: 22,
         user: "u".into(),
         auth: CredentialRef::None,
+        highlight: None,
         tags: vec![],
         note: None,
         risk_cap: None,
@@ -306,6 +307,7 @@ fn host_named(name: &str, group: &[&str], tags: &[&str]) -> Host {
         port: 22,
         user: "u".into(),
         auth: CredentialRef::None,
+        highlight: None,
         tags: tags.iter().map(|s| s.to_string()).collect(),
         note: None,
         risk_cap: None,
@@ -1664,8 +1666,12 @@ async fn tui_mouse_shift_hands_back_to_terminal() {
 
 /// 直接构造 App（几个鼠标用例都要，省得每个都抄一遍）
 fn new_app(fx: &Fixture) -> sh0_tui::App {
+    new_app_with_config(fx, AppConfig::default())
+}
+
+fn new_app_with_config(fx: &Fixture, cfg: AppConfig) -> sh0_tui::App {
     let events = tokio::sync::mpsc::unbounded_channel().1;
-    sh0_tui::App::new(fx.client.clone(), events, fx.store.clone(), AppConfig::default())
+    sh0_tui::App::new(fx.client.clone(), events, fx.store.clone(), cfg)
 }
 
 /// 标签栏：点主体切会话、点 × 关会话、中键也关（FR-3.9）
@@ -1803,7 +1809,7 @@ async fn tui_mouse_wheel_scrolls_terminal() {
 /// 终端里拖选文本，松手即复制（FR-3.9）
 #[tokio::test]
 async fn tui_mouse_drag_selects_text_and_copies() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
     let fx = fixture_with_hosts(EchoShellFactory::default(), vec![host_named("h1", &[], &[])])
@@ -1834,8 +1840,24 @@ async fn tui_mouse_drag_selects_text_and_copies() {
     ))
     .await
     .unwrap();
-    assert!(app.selection().is_none(), "松手复制完该清掉选区");
-    assert_eq!(app.last_copy(), "hello", "拖到哪就该复制到哪");
+    assert!(app.selection().is_some(), "松手后高亮应保留");
+    assert!(app.last_copy().is_empty(), "松手不应自动复制");
+
+    // 右键高亮区域 → 菜单 → Enter 复制
+    app.on_mouse(mouse_event(
+        MouseEventKind::Down(MouseButton::Right),
+        2,
+        1,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.context_menu_open(), "右键选区应弹出菜单");
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.last_copy(), "hello", "菜单复制应拿到 hello");
+    assert!(app.selection().is_none(), "复制后选区应清掉");
 }
 
 /// 文件视图：点条目选中并把焦点给那一栏，双击进入目录（FR-3.9 的鼠标一侧）
@@ -2878,4 +2900,387 @@ async fn deleting_host_closes_its_tabs() {
             .all(|h| h.name != "h1"),
         "h1 应从 hosts.toml 删除"
     );
+}
+
+/// 终端有边框后，鼠标坐标要映射到边框内区；且只发 down/up 的终端也能拖选
+#[tokio::test]
+async fn mouse_drag_selects_text_inside_terminal_border() {
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    app.feed_lines(0, &["hello world"]);
+
+    // 真实渲染一帧，让 term_area 记下边框以内的位置
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let a = app.term_area();
+    assert!(a.width >= 5 && a.height >= 1, "终端内区应有效: {a:?}");
+
+    app.on_mouse(mouse_down(a.x, a.y)).await.unwrap();
+    app.on_mouse(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        a.x + 4,
+        a.y,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+
+    // 拖动过程中必须有高亮：选中格的前景/背景应与普通格互换
+    term.draw(|f| app.draw(f)).unwrap();
+    let buf = term.backend().buffer();
+    let selected = buf.cell((a.x, a.y)).expect("选中格应存在");
+    let normal = buf.cell((a.x + 10, a.y)).expect("普通格应存在");
+    assert_eq!(
+        selected.fg, normal.bg,
+        "选中格前景应等于普通格背景（反显高亮）"
+    );
+    assert_eq!(
+        selected.bg, normal.fg,
+        "选中格背景应等于普通格前景（反显高亮）"
+    );
+    assert_ne!(selected.bg, normal.bg, "选区背景必须与普通格不同");
+
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        a.x + 4,
+        a.y,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.selection().is_some(), "松手后高亮应保留");
+    assert!(app.last_copy().is_empty(), "松手不应自动复制");
+
+    // 右键选区 → Enter 复制
+    app.on_mouse(mouse_event(
+        MouseEventKind::Down(MouseButton::Right),
+        a.x + 2,
+        a.y,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.context_menu_open(), "右键选区应弹出菜单");
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.last_copy(),
+        "hello",
+        "边框内从 h 拖到 o 应复制 hello，实际 {:?}",
+        app.last_copy()
+    );
+
+    // 再验证只发 down/up 的终端：从 w 到 d（不发 Drag）
+    app.on_mouse(mouse_down(a.x + 6, a.y)).await.unwrap();
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        a.x + 10,
+        a.y,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.selection().is_some(), "只发 down/up 也应保留选区");
+    app.on_mouse(mouse_event(
+        MouseEventKind::Down(MouseButton::Right),
+        a.x + 8,
+        a.y,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.last_copy(),
+        "world",
+        "只发 down/up 的终端也应能复制 world，实际 {:?}",
+        app.last_copy()
+    );
+}
+
+/// 悬停分隔条：进入/离开要更新高亮状态，但不能意外改变树宽
+#[tokio::test]
+async fn hovering_divider_sets_visual_affordance() {
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+    app.set_main_area(Rect::new(28, 1, 52, 20));
+    let w0 = app.tree_width();
+
+    app.on_mouse(mouse_event(
+        MouseEventKind::Moved,
+        w0 - 1,
+        5,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.hover_divider(), "悬停在缝上应进入 hover 态");
+    assert_eq!(app.tree_width(), w0, "只是悬停，不能改树宽");
+
+    // 状态栏应出现拖拽提示（终端不支持 OSC 22 时这是唯一的可见反馈）
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let text = buffer_to_text(term.backend().buffer());
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("拖动调整栏宽"),
+        "悬停时状态栏应提示可拖拽:\n{text}"
+    );
+
+    app.on_mouse(mouse_event(
+        MouseEventKind::Moved,
+        40,
+        5,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(!app.hover_divider(), "移开后应退出 hover 态");
+    assert_eq!(app.tree_width(), w0);
+}
+
+/// 默认高亮规则应真正作用到终端渲染：ERROR 变红加粗，普通文字不变
+#[tokio::test]
+async fn default_highlight_colors_error_output() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    app.feed_lines(0, &["ERROR something failed"]);
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let a = app.term_area();
+    let buf = term.backend().buffer();
+    let error = buf.cell((a.x, a.y)).expect("ERROR 首字符");
+    let normal = buf.cell((a.x + 5, a.y)).expect("ERROR 后的空格");
+
+    let (r, g, b) = sh0_term::cell::Color::Indexed(1).to_rgb().unwrap();
+    assert_eq!(
+        error.fg,
+        ratatui::style::Color::Rgb(r, g, b),
+        "ERROR 应使用默认规则的红色"
+    );
+    assert!(
+        error.modifier.contains(ratatui::style::Modifier::BOLD),
+        "ERROR 规则应带 bold"
+    );
+    assert_ne!(error.fg, normal.fg, "普通文字不能被误伤");
+}
+
+// ---------------------------------------------------------------------------
+// 高亮方案：全局默认 / 单主机覆盖 / 用户新增方案
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn global_default_highlight_scheme_applies_to_new_sessions() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[])],
+    )
+    .await;
+    let cfg = AppConfig {
+        default_highlight: "none".into(),
+        ..Default::default()
+    };
+    let mut app = new_app_with_config(&fx, cfg);
+    app.open("h1").await.unwrap();
+    app.feed_lines(0, &["ERROR something failed"]);
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let a = app.term_area();
+    let buf = term.backend().buffer();
+    let error = buf.cell((a.x, a.y)).unwrap();
+    let normal = buf.cell((a.x + 5, a.y)).unwrap();
+    assert_eq!(
+        error.fg, normal.fg,
+        "全局方案为 none 时不应给 ERROR 上色"
+    );
+}
+
+#[tokio::test]
+async fn per_host_highlight_scheme_can_use_custom_rules() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut host = host_named("h1", &[], &[]);
+    host.highlight = Some("custom".into());
+    let fx = fixture_with_hosts(EchoShellFactory::default(), vec![host]).await;
+
+    // 用户在配置文件里新增一个方案
+    std::fs::write(
+        fx.store.paths().highlight_file(),
+        r##"
+[[scheme]]
+name = "custom"
+[[scheme.rule]]
+name = "magic"
+pattern = "MAGIC"
+fg = "#123456"
+bold = true
+"##,
+    )
+    .unwrap();
+
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    app.feed_lines(0, &["MAGIC value"]);
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let a = app.term_area();
+    let buf = term.backend().buffer();
+    let magic = buf.cell((a.x, a.y)).unwrap();
+    let normal = buf.cell((a.x + 6, a.y)).unwrap();
+    assert_eq!(
+        magic.fg,
+        ratatui::style::Color::Rgb(0x12, 0x34, 0x56),
+        "主机指定的 custom 方案应生效"
+    );
+    assert_ne!(magic.fg, normal.fg);
+}
+
+/// 命令面板里的「全局高亮」入口要写回 config.toml
+#[tokio::test]
+async fn palette_sets_global_highlight_and_persists() {
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+
+    app.run_palette_cmd(sh0_tui::palette::PaletteCmd::Highlight("logs".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fx.store.load_config().unwrap().default_highlight,
+        "logs",
+        "全局默认高亮应写回 config.toml"
+    );
+    assert!(
+        app.notice().contains("logs"),
+        "应提示已切换: {}",
+        app.notice()
+    );
+}
+
+/// 鼠标选区不是模态：拖完保留高亮；右键可取消；直接打字会清掉选区
+#[tokio::test]
+async fn mouse_selection_is_not_modal_and_menu_can_cancel() {
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    let fx = fixture_with_hosts(
+        EchoShellFactory::default(),
+        vec![host_named("h1", &[], &[])],
+    )
+    .await;
+    let mut app = new_app(&fx);
+    app.open("h1").await.unwrap();
+    app.feed_lines(0, &["hello world"]);
+    app.set_main_area(Rect::new(0, 1, 80, 20));
+
+    app.on_mouse(mouse_down(0, 1)).await.unwrap();
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        4,
+        1,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.selection().is_some(), "拖完应保留选区");
+    assert!(app.last_copy().is_empty(), "拖完不应复制");
+
+    // 右键 → 菜单第二项「取消选择」
+    app.on_mouse(mouse_event(
+        MouseEventKind::Down(MouseButton::Right),
+        2,
+        1,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.context_menu_open());
+    // 右键松开事件不能把菜单关掉（真实终端会紧跟一个 Up(Right)）
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Right),
+        2,
+        1,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.context_menu_open(), "右键松开不应关闭菜单");
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let text = buffer_to_text(term.backend().buffer());
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("复制"), "菜单应显示复制:\n{text}");
+    assert!(compact.contains("取消选择"), "菜单应显示取消选择:\n{text}");
+
+    app.on_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.selection().is_none(), "取消选择应清掉选区");
+    assert!(app.last_copy().is_empty(), "取消选择不应复制");
+
+    // 再拖一次，然后直接打字：选区应让路，不能被卡住
+    // 渲染过一帧后命中区以 term_area（边框内）为准
+    let a = app.term_area();
+    assert!(a.width > 4 && a.height > 0);
+    app.on_mouse(mouse_down(a.x, a.y)).await.unwrap();
+    app.on_mouse(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        a.x + 4,
+        a.y,
+        KeyModifiers::NONE,
+    ))
+    .await
+    .unwrap();
+    assert!(app.selection().is_some());
+    app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.selection().is_none(), "打字应清掉选区");
+    assert!(app.last_copy().is_empty(), "打字不应触发复制");
 }

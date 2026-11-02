@@ -80,6 +80,9 @@ pub struct Host {
     pub user: String,
     #[serde(default)]
     pub auth: CredentialRef,
+    /// 该主机的终端高亮方案；None = 跟随全局 `default_highlight`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]

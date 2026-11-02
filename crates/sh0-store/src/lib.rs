@@ -7,6 +7,7 @@ pub mod config;
 pub mod creds;
 pub mod db;
 pub mod error;
+pub mod highlight;
 pub mod import;
 pub mod log;
 pub mod paths;
@@ -18,6 +19,10 @@ pub use db::{
     BatchRunSummary, redact,
 };
 pub use error::{Result, StoreError};
+pub use highlight::{
+    BUILTIN_SCHEMES, DEFAULT_HIGHLIGHT_TOML, HighlightColor, HighlightRule, HighlightStyle,
+    builtin_highlight_schemes, default_highlight_rules, load_or_init_schemes,
+};
 pub use import::{
     ImportReport, ImportSource, ImportedHost, import_xsh_dir, merge_into, parse_ssh_config, parse_xsh,
 };

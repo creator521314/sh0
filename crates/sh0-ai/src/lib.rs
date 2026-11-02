@@ -773,17 +773,19 @@ async fn dispatch(
                     "port": h.port,
                     "user": h.user,
                     "auth": auth_kind,
+                    "highlight": h.highlight,
                     "tags": h.tags,
                     "note": h.note,
                     "risk_cap": h.risk_cap,
                 });
                 let text = format!(
-                    "{}  {}\n  分组: {}  标签: {}  认证: {}  风险上限: {}\n",
+                    "{}  {}\n  分组: {}  标签: {}  认证: {}  高亮: {}  风险上限: {}\n",
                     h.name,
                     h.endpoint(),
                     if h.group.is_empty() { "（无）".into() } else { h.group_path() },
                     if h.tags.is_empty() { "（无）".into() } else { h.tags.join(",") },
                     auth_kind,
+                    h.highlight.as_deref().unwrap_or("（跟随全局）"),
                     h.risk_cap
                         .map(|r| format!("{r:?}").to_lowercase())
                         .unwrap_or_else(|| "无".into()),

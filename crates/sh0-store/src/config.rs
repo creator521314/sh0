@@ -46,6 +46,9 @@ pub struct AppConfig {
     /// 配色主题：dark / light / high-contrast（需求 FR-3.7）
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 新建会话默认使用的高亮方案（`highlight.toml` 里的 scheme 名）
+    #[serde(default = "default_highlight_scheme")]
+    pub default_highlight: String,
     /// 键位覆盖表，形如 `quit = "ctrl+x"`，优先级高于预设
     #[serde(default)]
     pub keys: HashMap<String, String>,
@@ -112,6 +115,9 @@ fn default_mouse() -> bool {
 }
 fn default_theme() -> String {
     "dark".to_string()
+}
+fn default_highlight_scheme() -> String {
+    "default".to_string()
 }
 fn default_max_attempts() -> Option<u32> {
     Some(10)
@@ -262,6 +268,7 @@ impl Default for AppConfig {
             keymap: default_keymap(),
             mouse: default_mouse(),
             theme: default_theme(),
+            default_highlight: default_highlight_scheme(),
             keys: HashMap::new(),
             reconnect: ReconnectConfig::default(),
             audit: AuditConfig::default(),
@@ -632,6 +639,7 @@ fn parse_jump_spec(spec: &str) -> Option<sh0_core::Host> {
         port,
         user,
         auth: sh0_core::CredentialRef::Agent,
+        highlight: None,
         tags: vec![],
         note: Some("由 proxy_jump 内联生成的跳板".to_string()),
         risk_cap: None,

@@ -16,7 +16,7 @@ M4 补上文件这一半（双栏 + 传输队列），M5 把"能用"打磨成"�
 
 | 能力 | 说明 |
 | --- | --- |
-| 终端仿真 | `vte` 解析器 + 字符网格（256 色 / truecolor / 粗斜体下划线反显），CJK 双宽与 emoji、组合字符 |
+| 终端仿真 | `vte` 解析器 + 字符网格（256 色 / truecolor / 粗斜体下划线反显），CJK 双宽与 emoji、组合字符；光标按 500ms 闪烁，输入时保持实心 |
 | 滚动缓冲 | 默认 10000 行环形缓冲 + 全局内存预算淘汰，PageUp / PageDown 回看 |
 | TUI 布局 | 左侧主机树 + 顶部标签栏 + 带边框与焦点标识的主区终端 + 底部状态栏，主题配色 |
 | 主机管理 | TUI 内新建 / 编辑 / 删除 / 连接；新建时可直接输入密码或导入私钥，`Enter` 保存并连接、`Ctrl+S` 仅保存；删除主机时会一并关闭它的连接并清理凭据 |
@@ -25,7 +25,7 @@ M4 补上文件这一半（双栏 + 传输队列），M5 把"能用"打磨成"�
 | 保活 | SSH keepalive，间隔可在配置里改 |
 | resize | 窗口变化同步到远端（`window_change`），本地网格同步重建 |
 | 按键编码 | 方向键 / F1-F12 / Ctrl-Alt 组合编码，键位映射三套预设（default / vim / xshell） |
-| 文本选择与剪贴板 | 选择模式（Alt+V）方向键扩选，Enter/y 复制，OSC 52 写父终端剪贴板 |
+| 文本选择与剪贴板 | 鼠标拖选保留高亮，右键菜单复制；Alt+V 键盘选择，Enter/y 复制；OSC 52 + arboard 本机剪贴板 |
 | AI 接口 | `ai host list/show`、`ai session open/close/list/status/reconnect`、`ai exec run`、`ai screen read`、`ai input send`、`ai log query`、`ai batch exec/list/show`、`ai broadcast enable/disable/status/send`、`ai ping`，默认纯文本 + `--json`，12 类语义化退出码 |
 | 命令执行 | 双模式：`shell`（默认，复用交互 shell + 哨兵截取）/ `exec`（独立通道，stdout/stderr 分离）；一键式 `--host X --cmd Y` 自动建连→执行→关闭 |
 | 风险引擎 | 三档 `auto / confirm / deny`：shell 词法切分 + 分段判定 + 内置规则集 + 用户 `risk.toml` + 主机 `risk_cap`；默认档是 `confirm`（宁拦勿放） |
@@ -34,16 +34,17 @@ M4 补上文件这一半（双栏 + 传输队列），M5 把"能用"打磨成"�
 | 双栏文件管理 | `F9` 切到文件视图：左本机 / 右远端，各自独立 cwd、排序与选中行；`Space` 标记多项、`F5` 传走、`F6` 改名、`F7` 建目录、`F8` 删除、`p` 改权限、`g` 跳路径。远端列目录复用会话已有的 SSH 连接，不新开 TCP |
 | 传输队列 | 每帧推进 256 KB 的块，底部面板显示进度条 / 速度 / 失败原因；单块失败自动重试 3 次（`R` 重排、`c` 清理）。二进制自动 base64，逐字节一致 |
 | AI 文件接口 | `ai file list/stat/read/write/mkdir/rm/rename/chmod/upload/download`，`--session`（复用连接）与 `--host`（一键式）两种用法；`upload/download` 同样分块搬运 |
-| 鼠标操作 | 主机树（单击选中 / 双击连接 / 滚轮）、标签栏（单击切换 / 点 `×` 或中键关闭）、分隔条（拖拽调整树宽）、终端区（拖选文本即复制 / 滚轮回看历史）、文件视图（单击选中 / 双击进入）；`Shift + 鼠标` 把鼠标交回父终端，保住系统自带的拖选复制。配置 `mouse = false` 可完全关闭 |
+| 鼠标操作 | 主机树（单击选中 / 双击连接 / 滚轮）、标签栏（单击切换 / 点 `×` 或中键关闭）、分隔条（悬停高亮、拖拽调整树宽）、终端区（拖选保留高亮、右键菜单复制 / 滚轮回看历史；复制走 OSC 52 + 本机剪贴板 arboard）、文件视图（单击选中 / 双击进入）；`Shift + 鼠标` 把鼠标交回父终端，保住系统自带的拖选复制。配置 `mouse = false` 可完全关闭 |
 | 广播输入 | `Alt+B` 开广播、`Alt+M` 逐台勾选；开着时终端输入同时发到所有参与会话，状态栏常驻 `广播×N`、参与的标签带 `*`。AI 侧 `ai broadcast enable/disable/status/send` |
 | 批量执行 | `ai batch exec (--hosts a,b \| --group G \| --tag T \| --all) --cmd C`：并发池（默认 16）+ 逐台超时，`--fail-fast` 提前收尾；结果汇总支持 `--out table/json/csv` 与 `--output` 导出。`ai batch list/show` 回看历史 |
 | 批量风险与配额 | 整批只判一次风险（多台 `risk_cap` 取最严）、只扣一次速率配额；confirm 档签发批量令牌，带令牌重放校验命令一致 |
-| 命令面板 | `Ctrl+Shift+P` 唤出，列出全部可用动作（连接 / 断开 / 搜索 / 主题 / 视图 / 批量…），输入即过滤，`Enter` 执行、`Esc` 取消；三套键位预设都绑了同一个组合键 |
+| 命令面板 | `Ctrl+Shift+P` 唤出，列出全部可用动作（连接 / 断开 / 搜索 / 主题 / 全局高亮 / 视图 / 批量…），输入即过滤，`Enter` 执行、`Esc` 取消；三套键位预设都绑了同一个组合键 |
 | 多主题 | `theme = "dark" \| "light" \| "high-contrast"`（默认 `dark`，`high-contrast` 是纯黑白 + 高饱和语义色，给强光 / 弱视环境）；主机树 / 标签栏 / 状态栏 / 边框共用一套配色表，命令面板里也能随时切 |
+| 输出高亮 | 正则高亮支持命名方案：内置 `default / minimal / logs / none`，全局 `default_highlight` 决定新会话默认，单主机 `highlight` 可覆盖；用户可在 `highlight.toml` 新增方案，约 2 秒热重载，只影响 TUI 显示 |
 | 配置热重载 | 改完 `config.toml` 约 2 秒内 daemon 自动生效，无需重启；少数必须重启的键（`term.*`、`keepalive_secs` 等）在日志里明确提示 |
 | 主机导入 | `sh0 ai host import --from ssh`（读 `~/.ssh/config`，含 `Include` 展开）或 `--from xsh`（Xshell 会话文件，UTF-16 自动回退）；**只读不写源**、重名不覆盖，先用 `--dry-run` 预览 |
 | ProxyJump 跳板机 | 主机配 `proxy_jump = "bastion"` 或内联 `"user@host:port"`，可链式；走 `direct-tcpip` 通道，链深上限 5（`MAX_JUMP_DEPTH`）防成环 |
-| 日志轮转 | `daemon.log` 按 `max_mb` 切分并保留 `keep` 个，再按 `retention_days` 清旧；启动期的 `daemon.boot.log` 单独覆盖写，不参与轮转 |
+| 日志轮转 | `daemon.log`、`tui.log` 按 `max_mb` 切分并保留 `keep` 个，再按 `retention_days` 清旧；启动期的 `daemon.boot.log` 单独覆盖写，不参与轮转 |
 | AI 接口 | `sh0 ai host import --from ssh\|xsh [--path P] [--dry-run]`（与 TUI 导入同一套实现，`--json` 输出）；AI 侧不暴露配置与凭据写入——那是人类运维动作 |
 
 尚未实现（后续里程碑）：`keyboard-interactive` / 2FA 交互应答（M5 清单里的 P2 项）；
@@ -58,7 +59,7 @@ M4 补上文件这一半（双栏 + 传输队列），M5 把"能用"打磨成"�
 | v0.1 | M0~M2：终端、会话、AI 接口、风险引擎、审计。已在真实 Debian / aarch64 主机上端到端验证 |
 | v0.2 | M3 + M4：批量与广播（`ai batch exec` + `ai broadcast *`）、SFTP 文件管理（双栏 UI + 传输队列 + `ai file *`）。112 条测试 + clippy 零警告；M4 已在真机（Debian 13 / aarch64）跑通 600 KB 分块上传下载逐字节一致 |
 | v0.3 | M5 打磨：命令面板与多主题、配置热重载、主机导入（ssh / xsh）、ProxyJump 跳板机、daemon 日志轮转、鼠标补齐（标签栏 / 分隔条 / 终端拖选 / 文件视图）。151 条契约测试 + clippy 零警告 |
-| **v0.4（当前工作区）** | M6 简化：核心命令收敛为 `tui / ai / help`，`daemon` 作为可见运维命令；主机 CRUD 与「新建即连接」回到 TUI；密码/私钥就地录入并写入本地 data-key 加密库；daemon 5 分钟空闲自退出；171 条测试 + clippy 零警告 |
+| **v0.4（当前工作区）** | M6 简化：核心命令收敛为 `tui / ai / help`，`daemon` 作为可见运维命令；主机 CRUD 与「新建即连接」回到 TUI；密码/私钥就地录入并写入本地 data-key 加密库；daemon 5 分钟空闲自退出；195 条测试 + clippy 零警告 |
 
 **实测（Windows x86_64 / MSVC，2026-10-26）**：release 二进制 **5.77 MB**（NFR-1 上限 15 MB）、
 `sh0 --version` 冷启动 **82~94 ms**（首次冷页 182 ms，NFR-2 上限 200 ms）。
@@ -142,6 +143,7 @@ addr = "10.0.0.11"
 port = 22
 user = "root"
 auth = "agent"                    # agent | { key_file = {...} } | { key = {...} } | { password = {...} }
+highlight = "logs"                # 该主机的高亮方案；省略 = 跟随全局 default_highlight
 tags = ["nginx"]
 note = "主站"
 

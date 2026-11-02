@@ -14,7 +14,7 @@ sh0 是单个二进制，无运行时依赖（SQLite 与 crypto 已静态编译�
 ```bash
 cargo build                      # 调试构建
 cargo build --release            # 发布构建（已用 lto="thin"，见 §11）
-cargo test --workspace           # 171 条测试
+cargo test --workspace           # 195 条测试
 cargo clippy --workspace --all-targets   # 应零警告
 ```
 
@@ -63,7 +63,8 @@ sh0 ai exec run --host web-01 --cmd "df -h /" --json
 <config_dir>/sh0/
 ├── config.toml      # 全局偏好（键位、缓冲、并发、超时、审计、限速、风险）
 ├── hosts.toml       # 主机与分组（不含任何明文口令）
-└── risk.toml        # 自定义风险规则（可选，缺省时用内置规则集）
+├── risk.toml        # 自定义风险规则（可选，缺省时用内置规则集）
+└── highlight.toml   # 终端输出正则高亮（首次进 TUI 时生成默认规则）
 <data_dir>/sh0/
 ├── known_hosts      # OpenSSH 兼容格式，TOFU 自动记录
 ├── creds.key        # 本地 data-key（0600，首次使用自动生成）
@@ -72,6 +73,7 @@ sh0 ai exec run --host web-01 --cmd "df -h /" --json
 └── run/
     ├── daemon.json  # daemon 存活时的 IPC 端点 + token
     ├── daemon.log   # 后台 daemon 的日志（后台进程无控制台，出错靠它）
+    ├── tui.log      # TUI 的日志（TUI 占整屏，stdout 日志会打花界面）
     └── sh0.pid
 ```
 
@@ -94,6 +96,7 @@ memory_budget_mb = 64        # 全部会话共享的 scrollback 内存预算，0
 keymap = "default"           # default | vim | xshell
 mouse = true                 # 鼠标：主机树单击选中 / 双击连接 / 滚轮滚动（false = 完全不用鼠标）
 theme = "dark"               # dark | light | high-contrast（high-contrast 给强光/弱视环境）
+default_highlight = "default" # 新会话默认高亮方案（highlight.toml 里的 scheme 名）
 
 [keys]                       # 单键覆盖，优先级高于预设
 quit = "ctrl+x"
@@ -112,7 +115,7 @@ retention_days = 30
 max_db_mb = 512              # 超限从最旧记录开始淘汰
 
 [log]                        # daemon 运行日志（与上面 [audit] 的审计库是两套策略）
-max_mb = 8                   # 单个 daemon.log 的大小上限，超出即切新文件
+max_mb = 8                   # 单个 daemon.log / tui.log 的大小上限，超出即切新文件
 keep = 3                     # 保留的历史文件个数（.1 ~ .keep）
 retention_days = 30          # 超期的历史文件直接删
 
@@ -149,6 +152,7 @@ auth = "agent"                      # agent | key_file | key | password
 tags = ["nginx"]
 note = "主站"
 risk_cap = "confirm"                # 该主机允许的最高档位，省略 = 不限制
+highlight = "logs"                  # 该主机的高亮方案；省略 = 跟随全局 default_highlight
 
 [[hosts]]
 name = "db-01"
@@ -195,6 +199,71 @@ reason = "删除根目录"
 group = "prod"
 max_level = "confirm"
 ```
+
+### 3.4 `highlight.toml`
+
+可选。定义终端输出的**命名高亮方案**；首次进入 TUI 时自动生成一份
+`default` 方案，改完约 2 秒内热重载。只影响 TUI 里看到的输出，不改远端文本、
+也不影响 `sh0 ai screen read` 返回的纯文本。
+
+**内置方案**（始终可用）：`default`（完整规则）、`minimal`（只保留错误/警告）、
+`logs`（面向日志：时间戳 + 级别 + IP/URL）、`none`（关闭高亮）。
+用户文件里同名方案会覆盖内置方案，新名字则新增。
+
+```toml
+version = 1
+
+[[scheme]]
+name = "default"
+
+[[scheme.rule]]
+name = "error"                    # 仅用于排障
+pattern = '(?i)\b(?:errors?|fatal|panic|exception|traceback|fail(?:ed|ure|ing)?)\b'
+fg = "red"
+bold = true
+priority = 100                    # 越高越先占位；同优先级按文件顺序
+# enabled = true                  # 省略 = 启用
+
+# 新增一个只给自己用的方案
+[[scheme]]
+name = "deploy"
+
+[[scheme.rule]]
+name = "release"
+pattern = '(?i)\b(?:release|deploy|rollback)\b'
+fg = "#ff8800"
+bold = true
+priority = 120
+```
+
+字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pattern` | Rust `regex` 语法；大小写不敏感用内联 `(?i)`。写错时保留旧方案并在状态栏提示 |
+| `fg` / `bg` | `black/red/green/yellow/blue/magenta/cyan/white`、`bright*` / `light*`、`gray`，或 `#RGB` / `#RRGGBB` |
+| `bold` / `italic` / `underline` / `dim` | 叠加到原有样式上（不覆盖远端已有的粗体/下划线） |
+| `priority` | 默认 0；重叠时高优先级先占位，低优先级不会覆盖 |
+| `enabled` | 默认 true；设 false 可临时关掉一条规则 |
+
+**选哪个方案**（优先级从高到低）：
+
+1. 主机自己的 `hosts.toml` / TUI 表单里的「高亮方案」；
+2. 全局 `config.toml` 的 `default_highlight`；
+3. 兜底 `default`。
+
+TUI 新建/编辑主机的表单里有一行 `高亮方案(空=全局)`，直接填方案名（如 `logs`、`none`），
+保存后**下一次连接**生效；已经打开的会话保持原方案，重连后切换。表单底部会列出
+当前可用方案。
+
+**全局入口**：
+- 命令面板 `Ctrl+Shift+P` → `全局高亮：default / minimal / logs / none / 自定义`，
+  选中后会写回 `config.toml` 的 `default_highlight`，只影响**新会话**；
+- 也可以直接编辑 `config.toml` 的 `default_highlight`（重启 TUI 后生效）。
+- `highlight.toml` 本身约 2 秒热重载。
+
+> 旧版扁平的 `[[rule]]` 仍然兼容：整份文件会被当作 `default` 方案。
+> 想彻底关掉高亮，把主机方案设为 `none`，或把全局 `default_highlight = "none"`。
 
 ---
 
@@ -292,12 +361,14 @@ max_level = "confirm"
 
 ### 5.2.1 命令面板（Ctrl+Shift+P）
 
-面板里能搜到三类东西：
+面板里能搜到四类东西：
 
 - **动作**：全部内置命令（搜索主机、新建会话、广播开关、清屏……）。动作名也能搜，
   输 `reconnect` 能命中"重新连接"。
 - **主机**：`连接 web-01` 这类条目，回车直连，右侧显示 `user@addr:port`。
 - **主题**：`主题：dark / light / high-contrast`，回车切换并**写回 config.toml**。
+- **全局高亮**：`全局高亮：default / minimal / logs / none / 自定义方案`，
+  回车设置**新会话**的默认方案并**写回 config.toml**；已打开的会话不变。
 
 `↑↓` 选择、`Enter` 执行、`Esc` 取消、直接打字过滤（模糊子序列匹配，不用连着打）。
 执行完面板关闭，焦点回到原来的地方。
@@ -332,15 +403,22 @@ max_level = "confirm"
 
 | 操作 | 效果 |
 | --- | --- |
+| 悬停 | 分隔条高亮，状态栏提示 `↔ 拖动调整栏宽`；支持 OSC 22 的终端（WezTerm / kitty 等）指针变为左右调整 |
 | 按住左键左右拖 | 调整主机树宽度，松手后终端尺寸同步到远端 |
 | 拖到最左 | 树宽最小 12 列；再窄 `[名字]` 就显示不下了 |
 | 拖到最右 | 终端至少留 20 列，否则远端 shell 的折行会乱 |
+
+> 终端应用不能强制改变系统鼠标指针——指针形状归终端模拟器管。sh0 会尝试发
+> OSC 22（`ew-resize`）；不支持的终端会忽略它，指针保持默认箭头，但分隔条高亮与
+> 状态栏提示仍然生效。这是正常现象，不是拖拽失效。
 
 **终端区**
 
 | 操作 | 效果 |
 | --- | --- |
-| 按住左键拖 | 框选文本，松手即复制（走 OSC 52 写剪贴板，与 `Alt+V` 同一条路） |
+| 按住左键拖 | 框选文本，松手**保留高亮**（不自动复制）；只发 down/up 的终端也能用松手坐标作为终点 |
+| 右键选区 | 弹出「复制 / 取消选择」菜单；`↑↓` 选择、`Enter` 执行、`Esc` 关闭 |
+| 复制 | 右键菜单选「复制」，或按 `Alt+C`；内容同时走 OSC 52 与 arboard 本机剪贴板 |
 | 单击（没拖动） | 只是取消选区，不会复制出东西 |
 | 滚轮 | 回看历史输出，一次 3 行；往下滚到底会贴回最新输出 |
 
@@ -362,6 +440,9 @@ max_level = "confirm"
 > 按一次 Shift+鼠标即挂起捕获，之后按任意键恢复。
 > 完全不需要鼠标就在配置里写 `mouse = false`，捕获从头到尾不开。
 
+终端光标：焦点在终端且会话 ready 时按 500ms 亮 / 500ms 灭闪烁；有键盘或鼠标输入后
+先保持实心 400ms；正在框选时隐藏光标，避免盖住选区。
+
 表单 / 确认弹窗 / 输入提示 / 命令面板期间不接受点击——那些界面是键盘模态的，
 点半下可能把正在填的东西弄丢。
 
@@ -370,9 +451,13 @@ max_level = "confirm"
 
 ### 5.4 文本选择与复制
 
-`Alt+V` 进入选择模式，方向键或 hjkl 扩选，`Enter` / `y` 复制，`p` 把复制内容粘回会话，
-`Esc` 取消。复制走 OSC 52 写父终端剪贴板——需要父终端支持（Windows Terminal / iTerm2 /
-kitty / Alacritty 均支持）；不支持时内容仍留在 sh0 内部，可用 `p` 粘回会话。
+鼠标拖选后高亮会**保留**，不会松手即复制：右键选区弹出「复制 / 取消选择」菜单，
+或按 `Alt+C` 复制。`Alt+V` 是键盘选择模式：方向键/hjkl 扩选，`Enter` / `y` 复制，
+`p` 粘回，`Esc` 取消。鼠标选区下直接打字会先清掉选区，不会把输入卡住。
+
+复制会同时尝试 OSC 52（父终端支持时最通用，能穿透 SSH）和本机剪贴板
+（`arboard`，X11/Wayland/Windows/macOS；失败再回退 pbcopy / clip / wl-copy / xclip / xsel）。
+两条都不支持时内容仍留在 sh0 内部，用 `p` 粘回。
 
 ### 5.5 双栏文件视图（F9）
 
@@ -708,7 +793,8 @@ sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| 复制后剪贴板没有内容 | OSC 52 需要父终端支持。不支持时内容仍在 sh0 内，用 `p` 粘回会话 |
+| 复制后剪贴板没有内容 | sh0 会同时尝试 OSC 52 和本机剪贴板（arboard；失败再试 pbcopy/clip/wl-copy/xclip/xsel）。若仍为空，多半是终端禁用了 OSC 52 且 sh0 跑在 SSH 远端；可用 `p` 粘回，或在本机桌面运行 sh0 |
+| 全局高亮在哪里改 | `Ctrl+Shift+P` → `全局高亮：logs`（会写回 `config.toml`）；或直接改 `config.toml` 的 `default_highlight`，重启 TUI 后对新会话生效 |
 | TUI 新建主机时密码框没反应 | 先用 `←/→` 把认证方式切到 `password`，密码字段才会出现；输入显示为 `*` |
 | 密码登录报认证失败 | 编辑主机时密码留空表示"保持原密码"，新主机则必须输入；也检查是否误选了 `agent` |
 | 私钥读不到 | 外部 `key_file` 路径不支持 `~` 展开，写绝对路径；TUI 导入模式会把 PEM 存进加密库，不依赖原路径 |
@@ -717,6 +803,7 @@ sh0 ai log query --actor ai --risk confirm --since "2026-10-20" --json
 | 没法用鼠标拖选复制 | 鼠标捕获开着时父终端收不到鼠标。按一次 **Shift + 鼠标** 挂起捕获，或配置 `mouse = false` |
 | 首次连不上 / 指纹变更被拒 | TOFU：首次自动记录指纹，指纹变更时拒绝连接。确认主机身份后删掉 `<data_dir>/sh0/known_hosts` 里对应行 |
 | daemon 起不来 / 行为异常 | 看 `<data_dir>/sh0/run/daemon.log`；`sh0 daemon stop` 后重试（失效的 `daemon.json` 会自动清理）。没有会话时 daemon 也会在 5 分钟空闲后自退出 |
+| TUI 里出现 arboard/Wayland 警告 | 已把 TUI 日志改到 `<data_dir>/sh0/run/tui.log` 并默认过滤 `arboard` 警告。该警告表示 Wayland 缺 `data-control`，arboard 自动回退 X11，通常不影响复制 |
 | shell 模式拿到半截输出 | 远端改写 `PS1`、`clear` 刷屏、回显折行会让哨兵退化为部分输出。切 `--mode exec` |
 | `ai` 报 `ipc_unreachable` | daemon 没起来。看 `<data_dir>/sh0/run/` 与 daemon 日志；必要时 `sh0 daemon stop` 后重试 |
 | 报 `session_unavailable` | 会话没了，重新 `session open`。**不要**去重启 daemon |

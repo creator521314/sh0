@@ -5,7 +5,9 @@
 //! 渲染在自己进程里做，避免每帧跨进程传整个网格。
 
 pub mod app;
+pub mod clipboard;
 pub mod files;
+pub mod highlight;
 pub mod hosts;
 pub mod palette;
 pub mod render;
@@ -14,6 +16,7 @@ pub mod theme;
 pub use app::{
     App, Drag, Focus, Tab, TabHit, TabSegment, TabTarget, View, dispatch_key, run, should_handle_key,
 };
+pub use highlight::Highlighter;
 pub use hosts::{HostForm, HostTree};
 pub use palette::Palette;
 pub use theme::Theme;
